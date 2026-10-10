@@ -519,7 +519,7 @@ if command -v docker >/dev/null 2>&1; then
         pooler_user=""
     fi
     if [ -n "$pooler_user" ]; then
-        pooler_result=$(docker exec -e PGPASSWORD="$pg_password" supabase-db \
+        pooler_result=$(docker exec -e PGPASSWORD="$pg_password" capstone-supabase-db \
             psql "host=$pooler_host port=$pooler_port user=$pooler_user dbname=postgres sslmode=disable" \
             -tAc "select 'pooler_ok';" 2>/dev/null | tr -d '[:space:]')
         check "Pooler transaction-mode query (as postgres)" "pooler_ok" "$pooler_result"

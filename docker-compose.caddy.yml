@@ -10,7 +10,7 @@ services:
     #  KONG_PORT_MAPS: "443:8000,443:8443"
 
   caddy:
-    container_name: supabase-caddy
+    container_name: capstone-supabase-caddy
     image: caddy:2
     restart: unless-stopped
     ports:

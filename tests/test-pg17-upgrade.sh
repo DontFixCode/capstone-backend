@@ -18,7 +18,7 @@
 
 set -eu
 
-DB_CONTAINER="supabase-db"
+DB_CONTAINER="capstone-supabase-db"
 
 if [ ! -f .env ]; then
     echo "Error: .env file not found. Run from the docker/ directory."

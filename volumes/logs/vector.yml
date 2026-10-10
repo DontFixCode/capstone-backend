@@ -5,8 +5,10 @@ api:
 sources:
   docker_host:
     type: docker_logs
+    include_labels:
+      - com.docker.compose.project=capstone
     exclude_containers:
-      - supabase-vector
+      - capstone-supabase-vector
 
 transforms:
   project_logs:
@@ -30,13 +32,13 @@ transforms:
     inputs:
       - project_logs
     route:
-      kong: '.appname == "supabase-kong" || .appname == "supabase-envoy"'
-      auth: '.appname == "supabase-auth"'
-      rest: '.appname == "supabase-rest"'
-      realtime: '.appname == "realtime-dev.supabase-realtime"'
-      storage: '.appname == "supabase-storage"'
-      functions: '.appname == "supabase-edge-functions"'
-      db: '.appname == "supabase-db"'
+      kong: '.appname == "capstone-supabase-kong" || .appname == "capstone-supabase-envoy"'
+      auth: '.appname == "capstone-supabase-auth"'
+      rest: '.appname == "capstone-supabase-rest"'
+      realtime: '.appname == "capstone-supabase-realtime"'
+      storage: '.appname == "capstone-supabase-storage"'
+      functions: '.appname == "capstone-supabase-edge-functions"'
+      db: '.appname == "capstone-supabase-db"'
   # Ignores non nginx errors since they are related with kong booting up
   kong_logs:
     type: remap

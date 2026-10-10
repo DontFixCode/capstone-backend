@@ -62,9 +62,9 @@ PG17_SCRIPTS_REF="17.6.1.063"
 # target's postgres UID, and running the post-upgrade migrations.
 PG17_TARGET_IMAGE="supabase/postgres:17.6.1.136"
 
-DB_CONTAINER="supabase-db"
-UPGRADE_CONTAINER="supabase-pg-upgrade"
-COMPLETE_CONTAINER="supabase-pg-complete"
+DB_CONTAINER="capstone-supabase-db"
+UPGRADE_CONTAINER="capstone-supabase-pg-upgrade"
+COMPLETE_CONTAINER="capstone-supabase-pg-complete"
 
 DATA_DIR="./volumes/db/data"
 BACKUP_DIR="./volumes/db/data.bak.pg15"

@@ -10,7 +10,7 @@ services:
     #  KONG_PORT_MAPS: "443:8000,443:8443"
 
   nginx:
-    container_name: supabase-nginx
+    container_name: capstone-supabase-nginx
     image: jonasal/nginx-certbot:6.2.0-nginx1.31.5
     restart: unless-stopped
     ports:

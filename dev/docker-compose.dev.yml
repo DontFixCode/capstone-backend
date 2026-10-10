@@ -7,7 +7,7 @@ services:
       dockerfile: apps/studio/Dockerfile
       target: dev
     ports:
-      - 8082:8082
+      - 8182:8082
     develop:
       watch:
         - action: sync
@@ -19,19 +19,23 @@ services:
           path: package.json
 
   mail:
-    container_name: supabase-mail
+    container_name: capstone-supabase-mail
+    networks:
+      default:
+        aliases:
+          - supabase-mail
     image: inbucket/inbucket:3.0.3
     ports:
-      - '2500:2500' # SMTP
-      - '9000:9000' # web interface
-      - '1100:1100' # POP3
+      - '2600:2500' # SMTP
+      - '9100:9000' # web interface
+      - '1200:1100' # POP3
   auth:
     environment:
       - GOTRUE_SMTP_USER=
       - GOTRUE_SMTP_PASS=
   meta:
     ports:
-      - 5555:8080
+      - 5655:8080
   db:
     restart: 'no'
     volumes:

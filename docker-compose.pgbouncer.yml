@@ -22,7 +22,7 @@ services:
   #    - ${POSTGRES_PORT}:${POSTGRES_PORT}
 
   pgbouncer:
-    container_name: supabase-pgbouncer
+    container_name: capstone-supabase-pgbouncer
     image: edoburu/pgbouncer:v1.25.2-p0
     restart: unless-stopped
     ports:

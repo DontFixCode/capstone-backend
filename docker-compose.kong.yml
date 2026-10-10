@@ -10,7 +10,7 @@
 
 services:
   api-gw:
-    container_name: supabase-kong
+    container_name: capstone-supabase-kong
     image: kong/kong:3.9.3
     healthcheck:
       test: !override ["CMD", "kong", "health"]
