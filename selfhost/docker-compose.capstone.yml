@@ -1,0 +1,14 @@
+# 캡스톤 서버용 오버라이드 (공식 docker-compose.yml 위에 덧씌움)
+# setup.sh가 ~/supabase-project 로 복사하고 `sh run.sh config add capstone`으로 활성화합니다.
+#
+# - Postgres 직접 접속: 서버 내부(127.0.0.1)에서만, 기본 5000번
+#   (공식 문서 "Accessing Postgres"의 direct connection 방식)
+# - Supavisor 풀러는 서버 외부에 포트를 열지 않음 (서버 5432번은 이미 다른 PostgreSQL이 사용 중)
+# - API 게이트웨이(Studio·Auth·REST, 기본 8000번)는 공식 설정 그대로 둠
+services:
+  db:
+    ports:
+      - "127.0.0.1:${CAPSTONE_DB_PORT:-5000}:${POSTGRES_PORT}"
+
+  supavisor:
+    ports: !reset []

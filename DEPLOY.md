@@ -1,5 +1,9 @@
 # 서버 배포 가이드
 
+> **현재 팀 방식: 팀 서버에 Supabase 셀프호스팅** → [`selfhost/README.md`](selfhost/README.md)
+> 서버에서 `bash selfhost/setup.sh` 한 번이면 DB·로그인(Auth)·Studio가 함께 설치됩니다.
+> 아래 내용은 Supabase 없이 PostgreSQL만 띄우던 이전 방식(B)과 공통 운영 팁입니다.
+
 ## 먼저 정할 것: DB를 어디서 돌릴까?
 
 | 방식 | 설명 | 추천 상황 |
