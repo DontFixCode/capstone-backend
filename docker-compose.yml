@@ -1,0 +1,41 @@
+services:
+  db:
+    image: postgres:16
+    container_name: capstone-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?.env에 POSTGRES_PASSWORD를 설정하세요}
+      POSTGRES_DB: ${POSTGRES_DB:-capstone}
+      TZ: Asia/Seoul
+      PGTZ: Asia/Seoul
+    ports:
+      # 기본값 127.0.0.1: 서버 외부에서 DB 포트로 직접 접속 불가 (보안)
+      - "${DB_BIND:-127.0.0.1}:${DB_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data          # 데이터는 컨테이너를 지워도 유지
+      - ./docker/db/init:/docker-entrypoint-initdb.d:ro
+      - ./docker/db/migrate.sh:/docker/migrate.sh:ro
+      - ./supabase:/supabase:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-capstone}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # FastAPI 코드가 레포에 추가되면 주석을 풀어 같은 서버에서 함께 실행합니다.
+  # api:
+  #   build: .
+  #   container_name: capstone-api
+  #   restart: unless-stopped
+  #   env_file: .env
+  #   environment:
+  #     DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-capstone}
+  #   ports:
+  #     - "8000:8000"
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+
+volumes:
+  db-data:
