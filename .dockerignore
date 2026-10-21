@@ -1,0 +1,10 @@
+*
+!pyproject.toml
+!uv.lock
+!app/
+!app/**
+app/**/__pycache__/
+app/**/*.py[cod]
+app/**/.env
+app/**/.env.*
+app/README.md

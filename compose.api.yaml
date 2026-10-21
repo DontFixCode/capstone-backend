@@ -1,0 +1,19 @@
+name: capstone-backend
+
+services:
+  api:
+    build: .
+    ports:
+      - "8001:8001"
+    env_file:
+      - path: .env.api
+        required: false
+
+  worker:
+    build: .
+    profiles: ["worker"]
+    command: ["python", "-m", "app.workers.main"]
+    env_file:
+      - path: .env.api
+        required: false
+    restart: "no"
