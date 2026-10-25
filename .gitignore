@@ -12,9 +12,13 @@ volumes/functions/hello/**
 !volumes/functions/hello/index.ts
 # Local environment files; keep shareable examples
 .env
+.env.api
 .env.*
 !.env.example
 !.env.*.example
+
+# Transit API inspection outputs (scripts/inspect_transit.py)
+/artifacts/transit-inspection/
 
 # Private keys and machine-specific credentials
 *.key
