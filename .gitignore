@@ -86,3 +86,7 @@ test.http
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# 시·도 행정경계 원본 N3A_G0010000(사용자 제공 ZIP, 변환 입력). 런타임은 data/service_area/daejeon.geojson을 쓴다.
+/N3A_G0010000/
+/daejeon.geojson

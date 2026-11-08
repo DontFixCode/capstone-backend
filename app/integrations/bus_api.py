@@ -120,6 +120,28 @@ class Attempt:
     http_status: int | None
 
 
+@dataclass(frozen=True)
+class AttemptRecord:
+    """on_attempt 콜백에 전달하는 실제 HTTP 시도 하나의 전체 기록.
+
+    params에는 인증키가 없고 body는 인증키를 가린 응답 원문 전체다(응답을 받지 못하면 None).
+    Page·Attempt의 기존 형식은 바꾸지 않으며, 원본 보존이 필요한 호출자만 콜백으로 받는다.
+    """
+
+    endpoint: Endpoint
+    params: dict[str, str]
+    attempt_no: int
+    started_at: str
+    received_at: str | None
+    http_status: int | None
+    outcome: str
+    provider_code: str | None
+    total_count: int | None
+    item_count: int | None
+    error: TagoError | None
+    body: str | None
+
+
 @dataclass
 class Page:
     """요청 하나(재시도 포함)의 결과. params에는 인증키를 넣지 않는다."""
@@ -184,6 +206,9 @@ class TagoClient:
         max_requests: int | None = None,
         transport: httpx.BaseTransport | None = None,
         sleep: Callable[[float], None] = time.sleep,
+        on_attempt: Callable[[AttemptRecord], None] | None = None,
+        session_retries: int = 0,
+        session_retry_wait: float = 0.0,
     ) -> None:
         key = (service_key or "").strip()
         if not key:
@@ -204,6 +229,12 @@ class TagoClient:
         self.request_count = 0
         self.stats: dict[str, dict[str, int]] = {}
         self._sleep = sleep
+        # 실제 HTTP 시도마다 호출한다. 콜백 오류는 수집을 중단시키며, 기록하지 못한 응답을 정상 처리하지 않는다.
+        self.on_attempt = on_attempt
+        # 제공기관의 '가용한 세션이 존재하지 않습니다'(resultCode 99) 응답만 기다렸다 다시 요청하는 선택 기능.
+        # 기본은 꺼져 있어 기존 재시도 기준(01·05와 일시 HTTP 오류)은 그대로다. 대기 후 시도도 모두 예산·통계에 포함한다.
+        self.session_retries = session_retries
+        self.session_retry_wait = session_retry_wait
         self._last_request_end: float | None = None
         self._http = httpx.Client(base_url=BASE_URL, timeout=timeout, transport=transport)
 
@@ -364,6 +395,7 @@ class TagoClient:
         attempts: list[Attempt] = []
         parsed = _Parsed()
         budget_exhausted = False
+        session_waits = 0
         while True:
             if self.max_requests is not None and self.request_count >= self.max_requests:
                 budget_exhausted = True
@@ -376,6 +408,7 @@ class TagoClient:
             started_at = _utc_now()
             received_at = None
             http_status = None
+            body: str | None = None
             self.request_count += 1
             stats["http_attempts"] += 1
             if attempts:
@@ -393,11 +426,19 @@ class TagoClient:
                 received_at = _utc_now()
                 http_status = response.status_code
                 parsed = self._interpret(response)
+                if self.on_attempt is not None:
+                    body = self.redact(response.text)
             finally:
                 self._last_request_end = time.monotonic()
             outcome = parsed.error.category if parsed.error else "ok"
             attempts.append(Attempt(started_at, received_at, outcome, http_status))
-            if parsed.error is None or not parsed.error.retryable or len(attempts) > self.max_retries:
+            if self.on_attempt is not None:
+                self.on_attempt(self._attempt_record(endpoint, params, len(attempts), attempts[-1], parsed, body))
+            if parsed.error is not None and _session_exhausted(parsed.error) and session_waits < self.session_retries:
+                session_waits += 1
+                self._sleep(self.session_retry_wait)
+                continue
+            if parsed.error is None or not parsed.error.retryable or len(attempts) - session_waits > self.max_retries:
                 break
 
         if parsed.error is None:
@@ -421,6 +462,32 @@ class TagoClient:
             error=parsed.error,
             budget_exhausted=budget_exhausted,
             raw=parsed.raw,
+        )
+
+    @staticmethod
+    def _attempt_record(
+        endpoint: Endpoint, params: dict[str, str], attempt_no: int, attempt: Attempt, parsed: _Parsed,
+        body: str | None,
+    ) -> AttemptRecord:
+        if parsed.error is not None:
+            provider_code = parsed.error.code
+        elif isinstance(parsed.header, dict) and "resultCode" in parsed.header:
+            provider_code = _normalize_code(parsed.header["resultCode"])
+        else:
+            provider_code = None
+        return AttemptRecord(
+            endpoint=endpoint,
+            params=dict(params),
+            attempt_no=attempt_no,
+            started_at=attempt.started_at,
+            received_at=attempt.received_at,
+            http_status=attempt.http_status,
+            outcome=attempt.outcome,
+            provider_code=provider_code,
+            total_count=to_int(parsed.meta.get("totalCount")),
+            item_count=None if parsed.error else len(parsed.items),
+            error=parsed.error,
+            body=body,
         )
 
     def _pause(self, retry_number: int) -> None:
@@ -509,6 +576,11 @@ def to_int(value: Any) -> int | None:
     if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
         return int(value.strip())
     return None
+
+
+def _session_exhausted(error: TagoError) -> bool:
+    """제공기관 세션 고갈 응답. 2026-11-07 대전 정류소 목록 실수집에서 확인한 문구다(포털 공통표상 99는 기타 오류)."""
+    return error.category == "provider" and error.code == "99" and "가용한 세션" in error.message
 
 
 def _clean_params(params: dict[str, Any]) -> dict[str, str]:

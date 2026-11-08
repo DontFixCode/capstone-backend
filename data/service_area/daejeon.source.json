@@ -1,0 +1,44 @@
+{
+  "file": "daejeon.geojson",
+  "sha256": "4672f96a131f181c629bb565534fd8b16ae2eb648d2d8101db462de368646b60",
+  "bytes": 161445,
+  "feature": {
+    "BJCD": "3000000000",
+    "NAME": "대전광역시",
+    "geometry": "MultiPolygon (1 part, 4926 vertices)",
+    "crs": "EPSG:4326 (RFC 7946, 경도·위도)"
+  },
+  "source": {
+    "archive": "N3A_G0010000.zip (사용자 제공, 84,140,352 bytes)",
+    "files": {
+      "N3A_G0010000.shp": 144753396,
+      "N3A_G0010000.shx": 236,
+      "N3A_G0010000.dbf": 3082,
+      "N3A_G0010000.prj": 435,
+      "N3A_G0010000.shp.xml": 29083
+    },
+    "layer": "N3A_G0010000 (시·도 17건, 속성 BJCD·NAME, CP949)",
+    "source_crs": ".prj Korea_2000_Korea_Unified_Coordinate_System (TM, 중앙경선 127.5, 원점위도 38, FE 1000000, FN 2000000, k 0.9996, GRS80)",
+    "metadata_dates": {
+      "CreaDate": "2023-02-16",
+      "ModDate": "2025-09-09",
+      "SyncDate": "2025-09-09",
+      "DBF_DATE_LAST_UPDATE": "2025-09-10"
+    },
+    "provider": "파일·메타데이터에 제공기관 표기 없음(확인 못 함)"
+  },
+  "conversion": {
+    "tool": "GDAL 3.10.3 (Docker ghcr.io/osgeo/gdal:ubuntu-small-3.10.3)",
+    "command": "ogr2ogr -f GeoJSON -oo ENCODING=CP949 -where \"BJCD = '3000000000'\" -select BJCD,NAME -t_srs EPSG:4326 -makevalid -nlt MULTIPOLYGON -nln daejeon -lco RFC7946=YES -lco COORDINATE_PRECISION=9 daejeon.geojson N3A_G0010000/N3A_G0010000.shp",
+    "note": "같은 명령을 GDAL 3.9.3으로 실행하면 -makevalid 결과가 Polygon으로 남아 MultiPolygon 조건을 만족하지 않아 쓰지 않았다.",
+    "converted_on": "2026-11-08"
+  },
+  "validation": {
+    "feature_count": 1,
+    "is_valid": true,
+    "is_empty": false,
+    "geometry_type": "MULTIPOLYGON",
+    "covers_127.3845_36.3504": true,
+    "covers_127.0_37.5": false
+  }
+}
