@@ -39,6 +39,7 @@ UTC = timezone.utc
 SETTINGS = dict(
     search_max_boardings=3, search_access_radius_meters=300, search_transfer_radius_meters=150,
     search_egress_radius_meters=300, search_max_candidates=50, search_max_states=100000, search_budget_ms=60000,
+    search_round_pool_size=50, search_walk_cost_weight=3,
     eval_search_horizon_seconds=3600, eval_budget_ms=60000, eval_max_timed_candidates=1000,
     eval_boarding_buffer_seconds=60, eval_max_data_age_seconds=900, eval_min_segment_samples=1,
     eval_min_probability_samples=1, eval_min_joint_scenes=1, eval_min_improvement_seconds=120,

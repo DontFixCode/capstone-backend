@@ -83,6 +83,8 @@ class Settings(BaseSettings):
     search_transfer_radius_meters: float | None = None
     search_egress_radius_meters: float | None = None
     search_max_candidates: int | None = None
+    search_round_pool_size: int | None = None
+    search_walk_cost_weight: float | None = None
     search_max_states: int | None = None
     search_budget_ms: int | None = None
     eval_search_horizon_seconds: float | None = None
@@ -143,7 +145,8 @@ class Settings(BaseSettings):
 
     @field_validator(
         "search_max_boardings", "search_access_radius_meters", "search_transfer_radius_meters",
-        "search_egress_radius_meters", "search_max_candidates", "search_max_states", "search_budget_ms",
+        "search_egress_radius_meters", "search_max_candidates", "search_round_pool_size", "search_walk_cost_weight",
+        "search_max_states", "search_budget_ms",
         "eval_search_horizon_seconds", "eval_budget_ms", "eval_max_timed_candidates", "eval_boarding_buffer_seconds",
         "eval_max_data_age_seconds", "eval_min_segment_samples", "eval_min_probability_samples",
         "eval_min_joint_scenes", "eval_min_improvement_seconds", "eval_max_horizon_difference_seconds",

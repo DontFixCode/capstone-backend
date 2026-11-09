@@ -1,4 +1,4 @@
-"""정적 스냅샷의 탐색 인덱스 구성과 깊이 제한 DFS 후보 생성을 담당한다. 장소 검색 연동은 후속 구현 위치다.
+"""정적 스냅샷의 탐색 인덱스 구성과 후보 생성(직행 + 반복 심화 DFS·분기 한정)을 담당한다. 장소 검색 연동은 후속 구현 위치다.
 
 입력으로 받은 정적 정보만 사용하며 DB·TMAP·실시간 API를 호출하지 않는다. 좌표 근접은 도보 후보의 범위일 뿐
 실제 보행 가능 여부가 아니고, 차량·탑승시각·도보시간은 평가 단계에서 정한다.
@@ -10,7 +10,7 @@ import hashlib
 import json
 import math
 import time
-from bisect import bisect_left, bisect_right
+from bisect import bisect_left, bisect_right, insort
 from collections.abc import Callable, Collection, Iterator, Sequence
 from itertools import pairwise
 
@@ -157,11 +157,16 @@ def generate_candidates(
     from_stop_id: str | None = None,
     monotonic: Callable[[], float] = time.monotonic,
 ) -> CandidateSearchResult:
-    """최대 탑승 횟수 안의 직행·다중 환승 후보를 깊이 제한 DFS로 생성한다.
+    """직행을 먼저 찾고, 환승 후보는 탑승 횟수를 하나씩 늘리는 반복 심화 DFS와 라운드별 분기 한정법으로 찾는다.
 
-    첫 후보를 찾아도 탐색을 끝내지 않고 다른 노선·하차·환승 조합을 유지한다. 전역 visited[stop_id]를 쓰지 않고
-    순환은 경로 내부에서 이미 승하차한 정류소로 되돌아가는 경우만 제거한다. 한도에 닿으면 멈추고 잘린 범위를
-    반환하며, 결과는 식별자 순서라 발견 순서가 순위로 쓰이지 않는다.
+    정적 비용은 승차 구간의 정류소 간 직선거리 합에 접근·환승·하차 도보 직선거리 × walk_cost_weight를 더한 값이다.
+    탑승 2회부터 max_boardings까지 라운드마다 독립적인 탐색 예산과 round_pool_size개짜리 보관함을 두고, 보관함이 찬 뒤
+    미완성 경로의 누적 비용이 보관함에서 가장 비싼 완성 경로보다 크면 그 분기만 자른다. 비용은 모두 0 이상이므로
+    누적 비용은 완성 비용의 하한이다. 마지막에 탑승 횟수별 최저 비용 경로와 새로운 노선 패턴 조합을 우선해 최대
+    max_candidates개를 ETA 평가 대상으로 고른다.
+
+    전역 visited[stop_id]를 쓰지 않고 순환은 경로 내부에서 이미 승하차한 정류소로 되돌아가는 경우만 제거한다. 라운드
+    예산을 다 쓰면 그때까지 찾은 후보를 보관하고 다음 라운드로 넘어가며, 잘린 범위를 반환한다.
 
     from_stop_id를 주면 출발지 좌표 대신 그 정류소와 환승 반경 안의 정류소에서 출발한다(실패 대응 재탐색).
     """
@@ -179,124 +184,193 @@ def generate_candidates(
         stop.stop_id: stop for stop in find_stops_within(index, context.destination, policy.egress_radius_meters)
     }
     reach = _boarding_reach(index, goal_stops, policy.max_boardings)
+    walk_weight = policy.walk_cost_weight
+    ride_meters: dict[str, tuple[float, ...]] = {}
 
-    found: dict[str, StaticCandidate] = {}
     expanded = [0] * policy.max_boardings
     completed = [0] * policy.max_boardings
     pruned_cycles = 0
     pruned_splits = 0
-    stop_reason: str | None = None
-    deadline = monotonic() + policy.search_budget_ms / 1000
 
-    def emit(start: NearbyStop, rides: tuple[StaticRide, ...], links: tuple[NearbyStop, ...]) -> None:
-        nonlocal stop_reason
+    def cumulative_meters(pattern_id: str) -> tuple[float, ...]:
+        if pattern_id not in ride_meters:
+            ride_meters[pattern_id] = _cumulative_ride_meters(index, index.pattern_stops[pattern_id])
+        return ride_meters[pattern_id]
+
+    def keep(
+        pool: _RoundPool,
+        start: NearbyStop,
+        rides: tuple[StaticRide, ...],
+        links: tuple[NearbyStop, ...],
+        score: float,
+    ) -> None:
+        if pool.above_cutoff(score):
+            return
         candidate = build_static_candidate(
             rides,
             transfer_meters=[link.straight_line_meters for link in links],
             access_straight_line_meters=start.straight_line_meters,
             egress_straight_line_meters=goal_stops[rides[-1].alight_stop_id].straight_line_meters,
         )
-        if candidate.static_candidate_id in found:
-            return
-        if len(found) >= policy.max_candidates:
-            stop_reason = "max_candidates"
-            return
-        found[candidate.static_candidate_id] = candidate
-        completed[len(rides) - 1] += 1
+        if pool.keep_best_unique(score, candidate):
+            completed[len(rides) - 1] += 1
+
+    def direct(pool: _RoundPool) -> None:
+        """같은 패턴에서 하차 경유 순번이 승차 경유 순번보다 뒤인 목적지 인근 하차 위치를 모두 직행 후보로 둔다."""
+        nonlocal pruned_cycles
+        for start in start_stops:
+            start_cost = walk_weight * start.straight_line_meters
+            for pattern_id, board_index in index.boardings_by_stop.get(start.stop_id, ()):
+                pattern = index.pattern_stops[pattern_id]
+                meters = cumulative_meters(pattern_id)
+                for alight_index in _alight_positions(pattern, board_index):
+                    expanded[0] += 1
+                    alight = pattern.stops[alight_index]
+                    if alight.stop_id == start.stop_id:
+                        pruned_cycles += 1
+                        continue
+                    goal = goal_stops.get(alight.stop_id)
+                    if goal is None:
+                        continue
+                    score = (start_cost + meters[alight_index] - meters[board_index]
+                             + walk_weight * goal.straight_line_meters)
+                    keep(pool, start, (_ride(pattern, board_index, alight_index),), (), score)
+
+    def transfer_boardings(
+        alight_stop_id: str,
+        pattern_id: str,
+        alight_position: int,
+        visited: frozenset[str],
+        remaining: int,
+    ) -> list[tuple[NearbyStop, str, int]]:
+        """하차 정류소에서 이어 탈 수 있는 (환승 정류소, 패턴, 위치). 순환·같은 탑승을 나눈 경우·목적지에 닿을 수 없는
+        정류소는 뺀다."""
+        nonlocal pruned_cycles, pruned_splits
+        boardings: list[tuple[NearbyStop, str, int]] = []
+        for option in _transfer_options(index, alight_stop_id):
+            if option.stop_id in visited:
+                pruned_cycles += 1
+                continue
+            if option.stop_id not in reach[remaining]:
+                continue
+            for next_pattern_id, board_index in index.boardings_by_stop.get(option.stop_id, ()):
+                board_order = index.pattern_stops[next_pattern_id].stops[board_index].stop_order
+                # 같은 경유 위치에서 내려 같은 패턴을 다시 타는 것은 한 탑승을 나눈 것과 같다.
+                if next_pattern_id == pattern_id and board_order == alight_position:
+                    pruned_splits += 1
+                    continue
+                boardings.append((option, next_pattern_id, board_index))
+        return boardings
 
     def dfs(
         start: NearbyStop,
-        board_stop_id: str,
+        pattern_id: str,
+        board_index: int,
         rides: tuple[StaticRide, ...],
         links: tuple[NearbyStop, ...],
+        cost: float,
         visited: frozenset[str],
+        target: int,
+        pool: _RoundPool,
+        budget: _RoundBudget,
     ) -> None:
-        nonlocal stop_reason, pruned_cycles, pruned_splits
-        if sum(expanded) >= policy.max_search_states:
-            stop_reason = "max_search_states"
+        # cost에는 앞서 탄 버스와 현재 승차 지점까지의 도보 비용이 포함된다.
+        nonlocal pruned_cycles
+        if budget.exhausted() or pool.above_cutoff(cost):
             return
-        if monotonic() >= deadline:
-            stop_reason = "search_budget"
-            return
+        pattern = index.pattern_stops[pattern_id]
+        meters = cumulative_meters(pattern_id)
         level = len(rides)
-        expanded[level] += 1
-        remaining_after_ride = policy.max_boardings - level - 1
-
-        for pattern_id, board_index in index.boardings_by_stop.get(board_stop_id, ()):
-            pattern = index.pattern_stops[pattern_id]
-            board_order = pattern.stops[board_index].stop_order
-            # 같은 경유 위치에서 내려 같은 패턴을 다시 타는 것은 한 탑승을 나눈 것과 같다.
-            if rides and rides[-1].pattern_id == pattern_id and rides[-1].alight_position == board_order:
-                pruned_splits += 1
+        remaining_after_ride = target - level - 1
+        for alight_index in _alight_positions(pattern, board_index):
+            if not budget.try_take_one():
+                return
+            expanded[level] += 1
+            arrival_cost = cost + meters[alight_index] - meters[board_index]
+            # 승차 비용은 경유 순번을 따라 줄지 않으므로 더 뒤의 하차 위치도 함께 건너뛴다.
+            if pool.above_cutoff(arrival_cost):
+                break
+            alight = pattern.stops[alight_index]
+            if alight.stop_id in visited:
+                pruned_cycles += 1
                 continue
-            for alight_index in _alight_positions(pattern, board_index):
-                alight = pattern.stops[alight_index]
-                if alight.stop_id in visited:
-                    pruned_cycles += 1
-                    continue
-                next_stops: list[NearbyStop] = []
-                if remaining_after_ride > 0:
-                    for option in _transfer_options(index, alight.stop_id):
-                        if option.stop_id in visited:
-                            pruned_cycles += 1
-                        elif option.stop_id in reach[remaining_after_ride]:
-                            next_stops.append(option)
-                if alight.stop_id not in goal_stops and not next_stops:
-                    continue
-                ride = StaticRide(
-                    route_id=pattern.route_id,
-                    pattern_id=pattern_id,
-                    direction=pattern.direction,
-                    board_stop_id=board_stop_id,
-                    board_position=board_order,
-                    alight_stop_id=alight.stop_id,
-                    alight_position=alight.stop_order,
-                )
-                next_rides = (*rides, ride)
-                if alight.stop_id in goal_stops:
-                    emit(start, next_rides, links)
-                    if stop_reason is not None:
-                        return
-                next_visited = visited | {alight.stop_id}
-                for next_stop in next_stops:
-                    dfs(start, next_stop.stop_id, next_rides, (*links, next_stop), next_visited | {next_stop.stop_id})
-                    if stop_reason is not None:
-                        return
+            if remaining_after_ride == 0:
+                goal = goal_stops.get(alight.stop_id)
+                if goal is not None:
+                    score = arrival_cost + walk_weight * goal.straight_line_meters
+                    keep(pool, start, (*rides, _ride(pattern, board_index, alight_index)), links, score)
+                continue
+            boardings = transfer_boardings(alight.stop_id, pattern_id, alight.stop_order, visited,
+                                           remaining_after_ride)
+            if not boardings:
+                continue
+            next_rides = (*rides, _ride(pattern, board_index, alight_index))
+            next_visited = visited | {alight.stop_id}
+            for option, next_pattern_id, next_board_index in boardings:
+                if budget.exhausted():
+                    return
+                dfs(start, next_pattern_id, next_board_index, next_rides, (*links, option),
+                    arrival_cost + walk_weight * option.straight_line_meters, next_visited | {option.stop_id},
+                    target, pool, budget)
 
-    completed_starts: list[str] = []
+    direct_pool = _RoundPool(None)
+    direct(direct_pool)
+    pools: dict[int, _RoundPool] = {1: direct_pool}
+
+    truncation_reasons: list[str] = []
+    finished_by_round: list[set[str]] = []
     partial_start: str | None = None
-    unexplored: list[str] = []
-    for position, start in enumerate(start_stops):
-        if start.stop_id in reach[policy.max_boardings]:
-            dfs(start, start.stop_id, (), (), frozenset({start.stop_id}))
-        if stop_reason is not None:
-            partial_start = start.stop_id
-            unexplored = [stop.stop_id for stop in start_stops[position + 1:]]
-            break
-        completed_starts.append(start.stop_id)
+    unexplored: set[str] = set()
+    for target in range(2, policy.max_boardings + 1):
+        pool = _RoundPool(policy.round_pool_size)
+        budget = _RoundBudget(policy.max_search_states, policy.search_budget_ms, monotonic)
+        finished: set[str] = set()
+        for position, start in enumerate(start_stops):
+            if start.stop_id in reach[target]:
+                cost = walk_weight * start.straight_line_meters
+                visited = frozenset({start.stop_id})
+                for pattern_id, board_index in index.boardings_by_stop.get(start.stop_id, ()):
+                    dfs(start, pattern_id, board_index, (), (), cost, visited, target, pool, budget)
+            if budget.reason is not None:
+                if budget.reason not in truncation_reasons:
+                    truncation_reasons.append(budget.reason)
+                if partial_start is None:
+                    partial_start = start.stop_id
+                unexplored.update(stop.stop_id for stop in start_stops[position + 1:])
+                break
+            finished.add(start.stop_id)
+        pools[target] = pool
+        finished_by_round.append(finished)
+
+    selected = _select_for_eta(pools, policy.max_candidates)
+    truncated = bool(truncation_reasons)
+    completed_starts = [
+        stop.stop_id for stop in start_stops if all(stop.stop_id in finished for finished in finished_by_round)
+    ]
+    unexplored.discard(partial_start)
 
     reasons: list[str] = []
     if not start_stops:
         reasons.append("no_access_stops")
     if not goal_stops:
         reasons.append("no_egress_stops")
-    if start_stops and goal_stops and not found and stop_reason is None:
+    if start_stops and goal_stops and not selected and not truncated:
         reasons.append("no_candidate_within_limits")
-    if stop_reason is not None:
+    if truncated:
         reasons.append("search_truncated")
 
     return CandidateSearchResult(
         static_snapshot_id=index.snapshot_id,
-        candidates=tuple(found[key] for key in sorted(found)),
+        candidates=tuple(sorted(selected, key=lambda candidate: candidate.static_candidate_id)),
         access_stops=tuple(start_stops),
         egress_stops=tuple(goal_stops.values()),
         reason_codes=tuple(reasons),
         coverage=SearchCoverage(
-            truncated=stop_reason is not None,
-            truncation_reasons=(stop_reason,) if stop_reason is not None else (),
+            truncated=truncated,
+            truncation_reasons=tuple(truncation_reasons),
             completed_start_stops=tuple(completed_starts),
             partial_start_stop=partial_start,
-            unexplored_start_stops=tuple(unexplored),
+            unexplored_start_stops=tuple(stop.stop_id for stop in start_stops if stop.stop_id in unexplored),
             expanded_states_by_level=tuple(expanded),
             completed_candidates_by_level=tuple(completed),
             pruned_cycle_count=pruned_cycles,
@@ -304,6 +378,122 @@ def generate_candidates(
         ),
         index_issues=index.issues,
     )
+
+
+class _RoundPool:
+    """라운드에서 찾은 완성 경로를 (정적 비용, 후보 ID) 오름차순으로 보관한다. capacity가 None이면 모두 보관한다."""
+
+    def __init__(self, capacity: int | None) -> None:
+        self.capacity = capacity
+        self.items: list[tuple[float, str, StaticCandidate]] = []
+        self._ids: set[str] = set()
+
+    def is_full(self) -> bool:
+        return self.capacity is not None and len(self.items) >= self.capacity
+
+    def above_cutoff(self, lower_bound: float) -> bool:
+        """보관함이 찼고 하한이 가장 비싼 완성 경로의 비용보다 크면 그 분기의 경로는 보관함에 들어갈 수 없다."""
+        return self.is_full() and lower_bound > self.items[-1][0]
+
+    def keep_best_unique(self, score: float, candidate: StaticCandidate) -> bool:
+        """같은 경로는 한 번만 보관한다. 가득 찼으면 (비용, 후보 ID)가 가장 큰 경로보다 작을 때만 바꿔 넣는다."""
+        candidate_id = candidate.static_candidate_id
+        if candidate_id in self._ids:
+            return False
+        if self.is_full():
+            if (score, candidate_id) >= self.items[-1][:2]:
+                return False
+            self._ids.discard(self.items.pop()[1])
+        insort(self.items, (score, candidate_id, candidate), key=lambda item: item[:2])
+        self._ids.add(candidate_id)
+        return True
+
+
+class _RoundBudget:
+    """라운드 하나의 탐색 예산. 하차 위치 하나를 확인할 때마다 한 단위를 쓰고, 다 쓰면 이유를 남긴다."""
+
+    def __init__(self, max_states: int, budget_ms: int, monotonic: Callable[[], float]) -> None:
+        self._remaining = max_states
+        self._monotonic = monotonic
+        self._deadline = monotonic() + budget_ms / 1000
+        self.reason: str | None = None
+
+    def exhausted(self) -> bool:
+        if self.reason is None and self._monotonic() >= self._deadline:
+            self.reason = "search_budget"
+        return self.reason is not None
+
+    def try_take_one(self) -> bool:
+        if self.exhausted():
+            return False
+        if self._remaining <= 0:
+            self.reason = "max_search_states"
+            return False
+        self._remaining -= 1
+        return True
+
+
+def _select_for_eta(pools: dict[int, _RoundPool], limit: int) -> list[StaticCandidate]:
+    """ETA 평가 대상을 최대 limit개 고른다.
+
+    후보가 있는 탑승 횟수마다 최저 비용 경로를 하나씩 확보하고, 나머지는 탑승 횟수 → 비용 순으로 살피면서 새로운
+    노선 패턴 조합을 먼저 고른 뒤 남은 자리를 같은 순서로 채운다. 조합의 범위는 라운드별 보관함에 남은 후보로 한정된다.
+    """
+    selected: dict[str, StaticCandidate] = {}
+    for boardings in sorted(pools):
+        if len(selected) == limit:
+            return list(selected.values())
+        items = pools[boardings].items
+        if items:
+            selected[items[0][1]] = items[0][2]
+
+    # 보관함은 이미 (비용, 후보 ID) 순이므로 이어 붙이면 탑승 횟수 → 비용 순서가 된다.
+    remaining = [item for boardings in sorted(pools) for item in pools[boardings].items if item[1] not in selected]
+    sequences = {_pattern_sequence(candidate) for candidate in selected.values()}
+    for _, candidate_id, candidate in remaining:
+        if len(selected) == limit:
+            return list(selected.values())
+        sequence = _pattern_sequence(candidate)
+        if sequence not in sequences:
+            selected[candidate_id] = candidate
+            sequences.add(sequence)
+    for _, candidate_id, candidate in remaining:
+        if len(selected) == limit:
+            break
+        selected.setdefault(candidate_id, candidate)
+    return list(selected.values())
+
+
+def _pattern_sequence(candidate: StaticCandidate) -> tuple[str, ...]:
+    return tuple(ride.pattern_id for ride in candidate.rides)
+
+
+def _ride(pattern: RoutePattern, board_index: int, alight_index: int) -> StaticRide:
+    board, alight = pattern.stops[board_index], pattern.stops[alight_index]
+    return StaticRide(
+        route_id=pattern.route_id,
+        pattern_id=pattern.pattern_id,
+        direction=pattern.direction,
+        board_stop_id=board.stop_id,
+        board_position=board.stop_order,
+        alight_stop_id=alight.stop_id,
+        alight_position=alight.stop_order,
+    )
+
+
+def _cumulative_ride_meters(index: SearchIndex, pattern: RoutePattern) -> tuple[float, ...]:
+    """패턴 위치별 누적 승차 직선거리. 좌표를 쓸 수 없는 정류소는 건너뛰고 앞뒤 정류소를 이어 누적값이 줄지 않게 한다."""
+    totals: list[float] = []
+    total = 0.0
+    previous: StopRecord | None = None
+    for item in pattern.stops:
+        stop = index.stops.get(item.stop_id)
+        if stop is not None and _has_usable_coordinate(stop):
+            if previous is not None:
+                total += haversine_meters(previous.lat, previous.lon, stop.lat, stop.lon)
+            previous = stop
+        totals.append(total)
+    return tuple(totals)
 
 
 def _has_usable_coordinate(stop: StopRecord) -> bool:

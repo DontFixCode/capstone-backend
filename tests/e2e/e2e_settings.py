@@ -6,6 +6,7 @@ from app.core.config import Settings
 POLICY = dict(
     search_max_boardings=2, search_access_radius_meters=300, search_transfer_radius_meters=150,
     search_egress_radius_meters=300, search_max_candidates=50, search_max_states=100000, search_budget_ms=5000,
+    search_round_pool_size=50, search_walk_cost_weight=3,
     eval_search_horizon_seconds=3600, eval_budget_ms=5000, eval_max_timed_candidates=300,
     eval_boarding_buffer_seconds=60, eval_max_data_age_seconds=900, eval_min_segment_samples=5,
     eval_min_probability_samples=30, eval_min_joint_scenes=30, eval_min_improvement_seconds=120,

@@ -97,6 +97,8 @@ _REQUIRED = {
     "search_transfer_radius_meters": "BACKEND_SEARCH_TRANSFER_RADIUS_METERS",
     "search_egress_radius_meters": "BACKEND_SEARCH_EGRESS_RADIUS_METERS",
     "search_max_candidates": "BACKEND_SEARCH_MAX_CANDIDATES",
+    "search_round_pool_size": "BACKEND_SEARCH_ROUND_POOL_SIZE",
+    "search_walk_cost_weight": "BACKEND_SEARCH_WALK_COST_WEIGHT",
     "search_max_states": "BACKEND_SEARCH_MAX_STATES",
     "search_budget_ms": "BACKEND_SEARCH_BUDGET_MS",
     "eval_search_horizon_seconds": "BACKEND_EVAL_SEARCH_HORIZON_SECONDS",
@@ -153,7 +155,8 @@ def load_search_config(settings: Settings) -> SearchConfig:
         search_policy = SearchPolicy(
             max_boardings=s.search_max_boardings, access_radius_meters=s.search_access_radius_meters,
             transfer_radius_meters=s.search_transfer_radius_meters, egress_radius_meters=s.search_egress_radius_meters,
-            max_candidates=s.search_max_candidates, max_search_states=s.search_max_states,
+            max_candidates=s.search_max_candidates, round_pool_size=s.search_round_pool_size,
+            walk_cost_weight=s.search_walk_cost_weight, max_search_states=s.search_max_states,
             search_budget_ms=s.search_budget_ms,
         )
         policy = EvaluationPolicy(

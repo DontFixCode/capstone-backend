@@ -419,6 +419,7 @@ class EtaBasisPolicyTest(unittest.TestCase):
         policy = EvaluationPolicy(
             max_boardings=2, access_radius_meters=300, transfer_radius_meters=150, egress_radius_meters=300,
             max_candidates=10, max_search_states=1000, search_budget_ms=1000, search_horizon_seconds=3600,
+            round_pool_size=50, walk_cost_weight=3,
             evaluation_budget_ms=1000, max_timed_candidates=10, boarding_buffer_seconds=60, max_data_age_seconds=900,
             min_segment_samples=5, min_probability_samples=30, min_joint_scenes=30, min_improvement_seconds=120,
             max_horizon_difference_seconds=300, max_recovery_attempts=2, recovery_search=None, timing_policy_version="t1",
