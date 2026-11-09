@@ -16,6 +16,11 @@ from psycopg.types.json import Jsonb
 from app.modules.transit.models import FetchAttemptRow, ObservationRow, RouteRow, RouteStopRow, StopRow
 
 PROVIDER = "tago"
+
+
+def _provider(target_key: str) -> str:
+    """수집 키의 제공처(접두사). 도착정보는 대전시(daejeon), 위치·정적 정보는 TAGO(tago)다."""
+    return target_key.split(":", 1)[0]
 _POINT = "extensions.ST_SetSRID(extensions.ST_MakePoint({lon}, {lat}), 4326)::extensions.geography"
 
 
@@ -81,7 +86,7 @@ def latest_published_pages(conn: psycopg.Connection, api_kind: str, target_key: 
          WHERE f.published_at IS NOT NULL
          ORDER BY f.page_no
         """,
-        {"p": PROVIDER, "k": api_kind, "t": target_key},
+        {"p": _provider(target_key), "k": api_kind, "t": target_key},
     ).fetchall()
     keys = ("id", "batch_key", "page_no", "result_status", "requested_at", "received_at", "published_at", "total_count")
     return [dict(zip(keys, row)) for row in rows]
@@ -96,7 +101,7 @@ def last_attempt(conn: psycopg.Connection, api_kind: str, target_key: str) -> di
          ORDER BY requested_at DESC, id DESC
          LIMIT 1
         """,
-        (PROVIDER, api_kind, target_key),
+        (_provider(target_key), api_kind, target_key),
     ).fetchone()
     if row is None:
         return None
@@ -117,23 +122,24 @@ def target_timings(
     if not target_keys:
         return {}
     result: dict[str, tuple[datetime | None, datetime | None]] = {key: (None, None) for key in target_keys}
+    providers = sorted({_provider(key) for key in target_keys})
     for key, last in conn.execute(
         "SELECT target_key, max(requested_at) FROM app.api_fetches "
-        "WHERE provider = %s AND api_kind = %s AND target_key = ANY(%s) GROUP BY target_key",
-        (PROVIDER, api_kind, list(target_keys)),
+        "WHERE provider = ANY(%s) AND api_kind = %s AND target_key = ANY(%s) GROUP BY target_key",
+        (providers, api_kind, list(target_keys)),
     ):
         result[key] = (last, None)
     for key, collected in conn.execute(
         """
         WITH lb AS (
             SELECT DISTINCT ON (target_key) target_key, batch_key FROM app.api_fetches
-             WHERE provider = %s AND api_kind = %s AND target_key = ANY(%s) AND published_at IS NOT NULL
+             WHERE provider = ANY(%s) AND api_kind = %s AND target_key = ANY(%s) AND published_at IS NOT NULL
              ORDER BY target_key, published_at DESC, id DESC)
         SELECT lb.target_key, min(f.received_at)
           FROM lb JOIN app.api_fetches f ON f.batch_key = lb.batch_key AND f.published_at IS NOT NULL
          GROUP BY lb.target_key
         """,
-        (PROVIDER, api_kind, list(target_keys)),
+        (providers, api_kind, list(target_keys)),
     ):
         result[key] = (result[key][0], collected)
     return result
@@ -426,6 +432,13 @@ def route_ids(conn: psycopg.Connection, external_ids: Iterable[str]) -> dict[str
         "SELECT external_id, id FROM app.routes WHERE provider = %s AND is_active AND external_id = ANY(%s)",
         (PROVIDER, ids),
     ).fetchall())
+
+
+def stop_number(conn: psycopg.Connection, external_id: str) -> str | None:
+    """정류소 번호(TAGO nodeno = 대전시 BusStopID). 활성 정류소만 본다."""
+    row = conn.execute("SELECT stop_no FROM app.stops WHERE provider = %s AND is_active AND external_id = %s",
+                       (PROVIDER, external_id)).fetchone()
+    return (row[0] or None) if row else None
 
 
 def stop_ids(conn: psycopg.Connection, external_ids: Iterable[str]) -> dict[str, int]:

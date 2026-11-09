@@ -34,6 +34,7 @@ from app.core.config import Settings
 from app.core.logging import configure_logging
 from app.db.session import Database, DbConfigError, DbError
 from app.integrations.bus_api import TagoClient, TagoConfigError
+from app.integrations.daejeon_bus_api import DaejeonBusClient, DaejeonBusConfigError
 from app.modules.transit import repository as transit_repository
 from app.modules.transit.service import RealtimeCollector, StaticImportService, latest_snapshot, utc_now
 from app.workers import recalculation, scheduler, search_jobs
@@ -66,8 +67,11 @@ class Worker:
         jobs_enabled: bool = True,
         walking_client_factory: Callable[[Settings], Any] | None = None,
         realtime_provider: Callable[..., Any] | None = None,
+        daejeon_client_factory: Callable[[Settings], DaejeonBusClient] = DaejeonBusClient.from_settings,
     ) -> None:
         self.settings_factory = settings_factory
+        # 실시간 도착정보 원천(대전시). 키가 없으면 도착정보 대상은 조회하지 않고 실패로 남긴다(위치정보 수집은 계속).
+        self.daejeon_client_factory = daejeon_client_factory
         self.db_factory = db_factory
         self.client_factory = client_factory
         self.clock = clock
@@ -86,7 +90,8 @@ class Worker:
         db = self.db_factory(settings)
         searches = search_jobs.process_search_jobs(
             db, settings, clock=self.clock, tago_client_factory=lambda s: self.client_factory(s),
-            walking_client_factory=self.walking_client_factory, realtime_provider=self.realtime_provider)
+            walking_client_factory=self.walking_client_factory, realtime_provider=self.realtime_provider,
+            daejeon_client_factory=self.daejeon_client_factory)
         journeys = recalculation.process_due_journeys(db, settings, clock=self.clock, network_cache=self.network_cache,
                                                       realtime_provider=self.realtime_provider)
         return {"searches": searches, "journeys": journeys}
@@ -143,7 +148,13 @@ class Worker:
         realtime_wake = [p.due.at for p in plans if p.due.at > now]
         if due:
             client = self.client_factory(settings)
-            collector = RealtimeCollector(db, client, interval_seconds=interval, clock=self.clock)
+            try:
+                daejeon = self.daejeon_client_factory(settings)
+            except DaejeonBusConfigError as exc:
+                logger.warning("대전시 버스 API 미설정(도착정보 수집 안 함): %s", exc)
+                daejeon = None
+            collector = RealtimeCollector(db, client, interval_seconds=interval, clock=self.clock,
+                                          daejeon_client=daejeon)
             try:
                 for plan in due:
                     try:
@@ -162,6 +173,8 @@ class Worker:
                                 outcome.http_attempts, outcome.observations)
             finally:
                 client.close()
+                if daejeon is not None:
+                    daejeon.close()
             with db.transaction() as conn:
                 replanned = scheduler.plan_realtime(conn, targets, interval, self.clock(), self.ran_slots)
             realtime_wake = [p.due.at for p in replanned]

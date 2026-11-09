@@ -74,6 +74,7 @@ def build_absolute_eta(
             observed_passed_at=report.observed_passed_at,
             source_ref=report.source_ref,
             basis_source=report.basis_source,
+            stops_away=report.stops_away,
         ),
         None,
     )
@@ -168,7 +169,8 @@ def resolve_alight_eta(
     """하차 정류소 ETA를 구성한다. 사용하지 못한 근거의 이유는 보완에 성공해도 함께 반환한다."""
     provider_eta, provider_reason = _provider_alight_eta(ride, board_eta, table)
     if provider_eta is not None:
-        return provider_eta, ()
+        # 회차 키 없이 같은 차량번호·진행 일관성으로 이은 경우 그 사실을 남긴다(검증 전 연결).
+        return provider_eta, ((ALIGHT_LINKED_WITHOUT_RUN_KEY,) if board_eta.run_key is None else ())
 
     reasons = {provider_reason, *table.rejected_by_stop.get((ride.pattern_id, ride.alight_stop_id), ())}
     seconds, counts, segment_reason = observed_segment_seconds(
@@ -257,21 +259,38 @@ def _eta_order(eta: VehicleEta) -> tuple:
     return eta.predicted_arrival_at, eta.vehicle_id or "", eta.run_key or ""
 
 
+ALIGHT_LINKED_WITHOUT_RUN_KEY = "alight_linked_by_vehicle_without_run_key"
+
+
 def _provider_alight_eta(
     ride: StaticRide,
     board_eta: VehicleEta,
     table: EtaTable,
 ) -> tuple[VehicleEta | None, str | None]:
-    """같은 차량·회차의 하차 정류소 제공 ETA를 찾는다. 차량번호가 같아도 다른 회차는 잇지 않는다."""
+    """같은 차량·회차의 하차 정류소 제공 ETA를 찾는다. 차량번호가 같아도 다른 회차는 잇지 않는다.
+
+    운행 회차 키를 주지 않는 제공처(대전시 도착정보)는 같은 패턴·같은 차량번호의 하차 예측 가운데, 남은 정류장 수 차이가
+    승하차 경유 순번 차이와 같은 것만 같은 운행으로 본다(남은 정류장 수가 없으면 시각 순서만 확인). 검증 전 연결이므로
+    호출자가 사유 코드로 표시한다.
+    """
     alight_etas = table.by_position.get((ride.pattern_id, ride.alight_position, ride.alight_stop_id), ())
     if not alight_etas:
         return None, "alight_eta_absent"
-    if board_eta.vehicle_id is None or board_eta.run_key is None:
+    if board_eta.vehicle_id is None:
         return None, "vehicle_run_unconfirmed"
     same_vehicle = [eta for eta in alight_etas if eta.vehicle_id == board_eta.vehicle_id]
-    same_run = [eta for eta in same_vehicle if eta.run_key == board_eta.run_key]
-    if not same_run:
-        return None, "alight_eta_run_mismatch" if same_vehicle else "alight_eta_vehicle_absent"
+    if not same_vehicle:
+        return None, "alight_eta_vehicle_absent"
+    if board_eta.run_key is not None:
+        same_run = [eta for eta in same_vehicle if eta.run_key == board_eta.run_key]
+        if not same_run:
+            return None, "alight_eta_run_mismatch"
+    else:
+        hops = ride.alight_position - ride.board_position
+        same_run = [eta for eta in same_vehicle if eta.run_key is None and (
+            eta.stops_away is None or board_eta.stops_away is None or eta.stops_away - board_eta.stops_away == hops)]
+        if not same_run:
+            return None, "alight_eta_progress_mismatch"
     if same_run[0].predicted_arrival_at <= board_eta.predicted_arrival_at:
         return None, "alight_eta_order_inconsistent"
     return same_run[0], None

@@ -32,6 +32,7 @@ from app.core.config import Settings
 from app.db.session import Database
 from app.integrations import route_shapes_api as route_shapes
 from app.integrations.bus_api import TagoClient
+from app.integrations.daejeon_bus_api import DaejeonBusClient
 from app.integrations.walking_api import PROVIDER as WALK_PROVIDER, TmapWalkingClient, WalkQuery, WalkResponse
 from app.modules.evaluation import repository as evaluation_repository
 from app.modules.evaluation import samples as sample_rules
@@ -379,9 +380,10 @@ IN_PROGRESS_RETRIES = 3
 IN_PROGRESS_WAIT_SECONDS = 1.0
 
 
-def collect_targets(db: Database, client: TagoClient, targets: list[RealtimeTarget],
+def collect_targets(db: Database, client: TagoClient | None, targets: list[RealtimeTarget],
                     interval_seconds: float, clock: Callable[[], datetime], *,
-                    sleep: Callable[[float], None] | None = None) -> dict[str, dict[str, Any]]:
+                    sleep: Callable[[float], None] | None = None,
+                    daejeon_client: DaejeonBusClient | None = None) -> dict[str, dict[str, Any]]:
     """Phase 2 수집기로 대상마다 간격 이내 공개값은 재사용하고 부족한 대상만 조회한다(도착 먼저).
 
     같은 대상을 다른 실행(워커의 주기 수집 등)이 수집 중이면(in_progress) 잠금을 기다리지 않고, 다른 대상을 먼저
@@ -390,7 +392,8 @@ def collect_targets(db: Database, client: TagoClient, targets: list[RealtimeTarg
     import time
 
     wait = sleep or time.sleep
-    collector = transit_service.RealtimeCollector(db, client, interval_seconds=interval_seconds, clock=clock)
+    collector = transit_service.RealtimeCollector(db, client, interval_seconds=interval_seconds, clock=clock,
+                                                  daejeon_client=daejeon_client)
     outcomes: dict[str, dict[str, Any]] = {}
     pending = sorted(targets, key=lambda t: (t.kind != "arrivals", t.external_id))
     for attempt in range(IN_PROGRESS_RETRIES + 1):
@@ -455,7 +458,7 @@ def realtime_inputs(conn, targets: list[RealtimeTarget], network: StaticNetwork,
             reports.append(EtaReport(
                 pattern_id=pattern, stop_id=stop_ext, stop_order=obs["stop_seq"], vehicle_id=obs["vehicle_no"],
                 run_key=obs["run_key"], remaining_seconds=obs["remaining_seconds"], basis_at=basis_at,
-                basis_source=basis_source,
+                basis_source=basis_source, stops_away=(obs.get("details") or {}).get("stops_away"),
                 source_generated_at=obs["source_generated_at"], collected_at=obs["collected_at"],
                 source_ref=f"transit_observation:{obs['id']}|batch:{snap.batch_key}",
             ))
@@ -666,10 +669,13 @@ class SearchWorkflow:
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         realtime_provider: RealtimeProvider | None = None,
         collect: bool = True,
+        daejeon_client: DaejeonBusClient | None = None,
     ) -> None:
         self.db = db
         self.config = config
         self.tago_client = tago_client
+        # 실시간 도착정보 원천(대전시). 위치정보는 tago_client로 수집한다.
+        self.daejeon_client = daejeon_client
         self.walking_client = walking_client
         self.clock = clock
         self.realtime_provider = realtime_provider
@@ -799,9 +805,10 @@ class SearchWorkflow:
                                          search_option=config.tmap_search_option, max_lookups=config.tmap_max_lookups)
         summary["walk_lookups"] = walk_stats
 
-        if self.collect and self.tago_client is not None and targets:
+        if self.collect and (self.tago_client is not None or self.daejeon_client is not None) and targets:
             summary["realtime_collection"] = collect_targets(self.db, self.tago_client, targets,
-                                                             config.realtime_interval_seconds, self.clock)
+                                                             config.realtime_interval_seconds, self.clock,
+                                                             daejeon_client=self.daejeon_client)
         cohort = sample_rules.condition_key("tago", policy, config.eta_basis_policy)
         now = self.clock()
         # 계산 시각(evaluated_at)은 입력을 확정한 시점이다. 검색 중 수집한 응답이 계획 시점보다 늦게 도착하므로

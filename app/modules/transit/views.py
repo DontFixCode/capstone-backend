@@ -94,7 +94,8 @@ def stop_arrivals(conn: psycopg.Connection, stop: dict[str, Any], *, interval_se
     briefs = _route_briefs(conn, {o["route_external_id"] for o in snap.observations})
     items = []
     for obs in snap.observations:
-        linked = obs["run_key"] is not None
+        # 대전시 도착정보는 차량번호를 직접 준다(운행 회차 키는 없음). 차량번호가 없으면 차량을 표시하지 않는다.
+        linked = obs["vehicle_no"] is not None or obs["run_key"] is not None
         basis_at, basis_source = eta_basis.resolve_basis(obs, basis_policy)
         items.append({
             "route": briefs.get(obs["route_external_id"]),
@@ -108,6 +109,7 @@ def stop_arrivals(conn: psycopg.Connection, stop: dict[str, Any], *, interval_se
             "etaBasisSource": basis_source,
             "sourceGeneratedAt": obs["source_generated_at"],
             "collectedAt": obs["collected_at"],
+            "stopsAway": (obs.get("details") or {}).get("stops_away"),
             "vehicle": {"vehicleNo": obs["vehicle_no"], "runKey": obs["run_key"]} if linked else None,
         })
     return {"stopId": sid(stop["id"]), "items": items, "dataStatus": data_status(snap)}

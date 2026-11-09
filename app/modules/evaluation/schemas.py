@@ -98,6 +98,8 @@ class EtaReport(FrozenSchema):
     source_ref: str | None = None
     # basis_at의 출처: provider(원천 확인) 또는 설정한 근사 정책의 출처(예: server_received_at_approx).
     basis_source: str | None = None
+    # 원천이 준 남은 정류장 수(대전시 STATUS_POS, 검증 전). 회차 키가 없을 때 같은 차량의 승하차 예측 일관성 확인에 쓴다.
+    stops_away: int | None = None
 
 
 class VehicleEta(FrozenSchema):
@@ -120,6 +122,7 @@ class VehicleEta(FrozenSchema):
     source_ref: str | None = None
     segment_sample_counts: tuple[int, ...] = ()
     basis_source: str | None = None
+    stops_away: int | None = None
 
 
 class ObservedEvent(FrozenSchema):

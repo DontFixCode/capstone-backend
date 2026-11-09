@@ -21,6 +21,7 @@ from app.core.config import Settings
 from app.core.logging import configure_logging
 from app.db.session import Database, DbConfigError, DbError
 from app.integrations.bus_api import TagoClient, TagoConfigError
+from app.integrations.daejeon_bus_api import DaejeonBusClient, DaejeonBusConfigError
 from app.integrations.walking_api import TmapConfigError, TmapWalkingClient
 from app.modules.routing import repository as search_repository
 from app.workers.main import to_jsonable
@@ -161,11 +162,14 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         tago = TagoClient.from_settings(settings)
         tmap = TmapWalkingClient.from_settings(settings)
+        daejeon = DaejeonBusClient.from_settings(settings)  # 도착정보 원천(대전시 버스 API)
         try:
-            outcome = SearchWorkflow(db, config, tago_client=tago, walking_client=tmap).run(request)
+            outcome = SearchWorkflow(db, config, tago_client=tago, walking_client=tmap,
+                                     daejeon_client=daejeon).run(request)
         finally:
             tago.close()
             tmap.close()
+            daejeon.close()
         with db.transaction(isolation="REPEATABLE READ") as conn:
             search = search_repository.read_search(conn, outcome.search_id)
             candidates = search_repository.read_candidates(conn, outcome.search_id)
@@ -173,7 +177,8 @@ def main(argv: list[str] | None = None) -> int:
         report["calls"] = {"tmap": tmap.request_count, "tago_http_attempts": tago.request_count}
         print(json.dumps(to_jsonable(report), ensure_ascii=False, indent=2))
         return 0 if outcome.status in ("ready", "data_limited", "no_path") else 1
-    except (DbConfigError, DbError, TagoConfigError, TmapConfigError, SearchConfigError, SearchError) as exc:
+    except (DbConfigError, DbError, TagoConfigError, TmapConfigError, DaejeonBusConfigError, SearchConfigError,
+            SearchError) as exc:
         print(f"오류: {exc}", file=sys.stderr)
         return 2
 
