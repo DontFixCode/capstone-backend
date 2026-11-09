@@ -40,6 +40,32 @@ TAGO 인증키는 실제 TAGO 호출에만 필요하다(아래 Phase 1 참고). 
 Docker 이미지에는 로컬 환경 파일을 포함하지 않으므로 `/health`는 DB 자격증명 없이 실행된다.
 신규 실행 골격에 추가한 의존성은 `pydantic-settings`이고, Phase 1 TAGO 호출을 위해 `httpx`를 추가했다.
 
+## 서버 배포 (DB가 있는 서버)
+
+`compose.server.yaml`은 API·워커를 DB와 같은 서버에서 띄운다. 두 서비스가 Supabase 스택의 Docker 네트워크에 붙어 DB(`db:5432`)에
+직접 접속하므로 SSH 터널이 필요 없고, 둘 다 `restart: unless-stopped`다. 이미지(Python 3.13)에는 코드와 `data/service_area`만 들어가고
+비밀값은 넣지 않는다.
+
+```bash
+# 서버에서 (저장소를 ~/capstone-backend에 둔 경우)
+docker network ls                      # Supabase 네트워크 이름 확인 (기본값 bus-transfer-supabase_default)
+cp <로컬>/.env.api ~/capstone-backend/  # 실행 설정·TAGO·대전시·TMAP 키 (커밋하지 않음)
+SUPABASE_NETWORK=<네트워크 이름> SUPABASE_ENV_FILE=~/bus-transfer-supabase/deployment/.env \
+  docker compose -f compose.server.yaml up -d --build
+curl http://127.0.0.1:8001/health      # 서버 안에서 확인
+docker compose -f compose.server.yaml logs -f worker
+```
+
+- `.env.api`의 로컬 값 중 `BACKEND_DB_HOST`·`BACKEND_DB_PORT`(터널 주소)·`BACKEND_ENV`·`ENABLE_DEVTOOLS`는 compose가 덮어쓴다
+  (DB `db:5432`, `production`, devtools 끔). `BACKEND_AUTH_JWT_ISSUER`는 서버 GoTrue 발급자(`http://localhost:18080/auth/v1`)와 같아야 한다.
+- DB 이름·비밀번호·JWT 비밀값은 `SUPABASE_ENV_FILE`(Supabase 스택 `.env`)을 컨테이너 `/app/.env`에 읽기 전용으로 연결해 읽는다.
+- API 공개 주소는 `API_PUBLISH`(기본 `0.0.0.0:8001`). 서버 방화벽·공유기에서 그 포트를 열어야 외부(프론트 개발자)에서 접근한다.
+  HTTPS·도메인은 앞단 리버스 프록시에서 붙인다. 모바일 앱은 HTTP를 기본 차단하므로(Android cleartext, iOS ATS) HTTP로 쓸 때는 개발 빌드에서 예외를 둔다.
+- 앱의 회원가입·로그인은 Supabase Auth(`/auth/v1`)에 직접 접속한다. 현재 Supabase 게이트웨이는 서버 내부(127.0.0.1:18080)에만 열려 있어
+  외부 공개 방식은 Supabase 스택 쪽에서 따로 정한다. 앱에는 Supabase 주소와 anon key만 주고 JWT 비밀값·service_role key는 주지 않는다.
+- 워커는 서버에 하나만 둔다. 로컬 PC 워커를 같은 DB에 동시에 띄우지 않는다. 서버 워커는 정적 정보 하루 1회 갱신도 수행한다.
+- 코드 갱신: `git pull` 뒤 같은 `up -d --build`. 중지: `docker compose -f compose.server.yaml down`(DB·Supabase 스택에는 영향 없음).
+
 ## 구성과 책임
 
 - `core/`: 실행 설정·로그, 추후 보안·공통 예외 처리.
