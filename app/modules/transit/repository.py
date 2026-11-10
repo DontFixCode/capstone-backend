@@ -538,6 +538,19 @@ def find_arrival_event(conn: psycopg.Connection, pattern_key: str, stop_seq: int
     return {"id": row[0], "quality": row[1], "event_at": row[2], "details": row[3]}
 
 
+def recent_published_fetch_ids(conn: psycopg.Connection, api_kind: str, target_keys: Sequence[str],
+                               since: datetime) -> list[int]:
+    """대상들의 since 이후 수신·공개된 모든 배치의 페이지(최신 배치만이 아님). 하차 ETA 구간 연결의 최근 스냅샷 입력."""
+    if not target_keys:
+        return []
+    rows = conn.execute(
+        "SELECT id FROM app.api_fetches WHERE api_kind = %s AND target_key = ANY(%s) AND published_at IS NOT NULL "
+        "AND received_at >= %s ORDER BY id",
+        (api_kind, list(target_keys), since),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
 def observations_for_fetches(conn: psycopg.Connection, fetch_ids: Sequence[int]) -> list[dict[str, Any]]:
     if not fetch_ids:
         return []

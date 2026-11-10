@@ -32,6 +32,7 @@ from app.workflows.search import (
     SearchRequest,
     SearchWorkflow,
     load_search_config,
+    pattern_stop_index,
     required_targets,
     walk_pairs,
 )
@@ -148,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
             workflow = SearchWorkflow(db, config, tago_client=None, walking_client=None)
             network, context, result, _ = workflow.plan(request)
             pairs = walk_pairs(result.candidates)
-            targets = required_targets(result.candidates)
+            targets = required_targets(result.candidates, pattern_stop_index(network))
             print(json.dumps(to_jsonable({
                 "mode": "plan (외부 호출·DB 쓰기 없음)", "static_version": network.data_version,
                 "config_version": config.config_version, "start_at": context.start_at,

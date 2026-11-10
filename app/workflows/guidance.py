@@ -57,14 +57,21 @@ def remaining_bus_legs(legs: list[dict[str, Any]], progress: dict[str, Any], mov
 
 def journey_targets(snapshot: dict[str, Any], progress: dict[str, Any], movement: str,
                     source: str) -> list[RealtimeTarget]:
-    """남은 버스 구간의 승하차 정류소 도착·노선 위치. 끝난 구간은 수집 대상에서 뺀다."""
+    """남은 버스 구간의 승하차 정류소 도착·노선 위치. 끝난 구간은 수집 대상에서 뺀다.
+
+    아직 타지 않은 구간은 승하차 사이 경유 정류소(via_stop_ids)도 넣는다(하차 ETA 구간 연결 입력). 탑승 중인 구간의
+    하차 ETA는 같은 차량의 하차 정류소 예측만 쓰므로 경유 정류소를 넣지 않는다.
+    """
     srcs = frozenset({source})
     arrivals, positions = set(), set()
+    onboard_leg = (progress.get("boarded") or {}).get("leg_index") if movement == journey_state.ONBOARD else None
     for leg in remaining_bus_legs(snapshot.get("legs") or [], progress, movement):
         for side in ("board", "alight"):
             stop = (leg.get(side) or {}).get("stop_id")
             if stop:
                 arrivals.add(stop)
+        if leg["leg_index"] != onboard_leg:
+            arrivals.update(leg.get("via_stop_ids") or [])
         if leg.get("route_id"):
             positions.add(leg["route_id"])
     return transit_service.merge_targets([[RealtimeTarget("arrivals", s, srcs) for s in sorted(arrivals)],
@@ -287,7 +294,7 @@ def compute_guidance(
             data_snapshot_id=data_snapshot_id, sample_condition_key=cohort, walks=tuple(walks),
             eta_reports=tuple(realtime.eta_reports), queried_stop_ids=realtime.queried_stop_ids,
             segment_observations=tuple(segments), transfer_error_samples=tuple(error_samples),
-            joint_scenes=tuple(scenes))
+            joint_scenes=tuple(scenes), segment_eta_reports=tuple(realtime.segment_eta_reports))
         result = evaluate_candidates(_search_result(candidate, static_version), context, inputs, policy)
         return [*result.candidates, *result.limited]
 

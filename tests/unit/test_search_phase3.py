@@ -230,6 +230,15 @@ class CandidateShapeTest(unittest.TestCase):
         self.assertTrue({w.A, w.C, w.C2, w.F, w.E} <= arrivals)
         self.assertEqual(positions, {r.route_id for c in result.candidates for r in c.rides})
 
+    def test_required_targets_add_via_stops_when_pattern_stops_given(self):
+        _, _, result = search()
+        ride = result.candidates[0].rides[0]
+        stops = {ride.pattern_id: {seq: f"VIA{seq}" for seq in range(ride.board_position, ride.alight_position + 1)}}
+        arrivals = {t.external_id for t in flow.required_targets(result.candidates, stops) if t.kind == "arrivals"}
+        expected = {f"VIA{seq}" for seq in range(ride.board_position + 1, ride.alight_position)}
+        self.assertTrue(expected <= arrivals, "승하차 사이 경유 정류소도 수집 대상")
+        self.assertNotIn(f"VIA{ride.board_position}", arrivals, "양끝은 원래 승하차 정류소 ID로 들어감")
+
 
 class EvaluationStagesTest(unittest.TestCase):
     def setUp(self):

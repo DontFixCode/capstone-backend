@@ -7,8 +7,9 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from app.integrations.daejeon_bus_api import RawResponse, parse_arrivals
+from app.modules.evaluation import eta as eta_module
 from app.modules.evaluation.eta import ALIGHT_LINKED_WITHOUT_RUN_KEY, EtaTable, resolve_alight_eta
-from app.modules.evaluation.schemas import EvaluationPolicy, VehicleEta
+from app.modules.evaluation.schemas import EtaReport, EvaluationPolicy, VehicleEta
 from app.modules.routing.schemas import StaticRide
 from app.modules.transit import service as transit_service
 from app.modules.transit.schemas import RealtimeTarget
@@ -125,6 +126,85 @@ class SameVehicleAlightTest(unittest.TestCase):
         self.assertIn("alight_eta_order_inconsistent", self.resolve(board, self.eta("B", 15, 60, stops_away=7))[1])
         self.assertIn("vehicle_run_unconfirmed", self.resolve(self.eta("A", 10, 120, vehicle=None),
                                                               self.eta("B", 15, 480))[1])
+
+
+class ProviderSegmentChainTest(unittest.TestCase):
+    """하차 정류소에 승차 차량이 없을 때: 인접 정류소 쌍마다 같은 운행 차량의 ETA 차이를 이어 붙인다."""
+
+    AT = SameVehicleAlightTest.AT
+    POLICY = SameVehicleAlightTest.POLICY
+    eta = SameVehicleAlightTest.eta
+    RIDE = StaticRide(route_id="R", pattern_id="P", direction=None, board_stop_id="S10", board_position=10,
+                      alight_stop_id="S13", alight_position=13)
+
+    def table(self, *etas):
+        by_position: dict = {}
+        for e in etas:
+            by_position.setdefault(("P", e.stop_order, e.stop_id), []).append(e)
+        return EtaTable(by_position={k: tuple(v) for k, v in by_position.items()}, rejected_by_stop={},
+                        rejected_counts={})
+
+    def chain_world(self):
+        """승차 차량 V1은 10·11에만, 앞 차량 V2는 11·12·13에 나온다(하차 쪽 정류소에는 가까운 V2만)."""
+        board = self.eta("S10", 10, 100, "V1", stops_away=1)
+        return board, [board, self.eta("S11", 11, 160, "V1", stops_away=2),
+                       self.eta("S11", 11, 50, "V2", stops_away=1), self.eta("S12", 12, 130, "V2", stops_away=2),
+                       self.eta("S13", 13, 210, "V2", stops_away=3)]
+
+    def test_chains_segments_when_board_vehicle_absent_at_alight(self):
+        board, etas = self.chain_world()
+        # 10→11: V1 60초, 11→12: V2 80초, 12→13: V2 80초.
+        found, reasons = resolve_alight_eta(self.RIDE, board, self.table(*etas), {}, self.POLICY)
+        self.assertIsNotNone(found)
+        self.assertEqual(found.predicted_arrival_at, board.predicted_arrival_at + timedelta(seconds=60 + 80 + 80))
+        self.assertEqual((found.eta_source, found.vehicle_id, found.segment_sample_counts),
+                         ("provider_segments", "V1", (1, 1, 1)))
+        self.assertIn("alight_eta_by_provider_segments", reasons)
+        self.assertIn("alight_eta_vehicle_absent", reasons, "같은 차량 연결 실패 이유는 남김")
+
+    def test_missing_pair_or_inconsistent_progress_leaves_alight_unknown(self):
+        board, etas = self.chain_world()
+        without_pair = [e for e in etas if not (e.vehicle_id == "V2" and e.stop_order == 11)]
+        found, reasons = resolve_alight_eta(self.RIDE, board, self.table(*without_pair), {}, self.POLICY)
+        self.assertIsNone(found, "11→12 구간 근거가 없으면 합을 완성하지 않음")
+        self.assertIn("provider_segment_missing", reasons)
+        jumped = [e if e.stop_order != 13 else self.eta("S13", 13, 210, "V2", stops_away=5) for e in etas]
+        self.assertIsNone(resolve_alight_eta(self.RIDE, board, self.table(*jumped), {}, self.POLICY)[0],
+                          "남은 정류장 수 차이가 1이 아니면 같은 운행으로 보지 않음")
+
+    def test_earlier_snapshot_fills_gap_where_another_bus_is_inside(self):
+        """지금은 V2가 12와 13 사이에 있어 12(V1)·13(V2)이 다른 차량이다. 이전 스냅샷의 V2 쌍으로 12→13을 채운다."""
+        board = self.eta("S10", 10, 100, "V1", stops_away=1)
+        latest = [board, self.eta("S11", 11, 160, "V1", stops_away=2), self.eta("S12", 12, 240, "V1", stops_away=3),
+                  self.eta("S13", 13, 30, "V2", stops_away=1)]
+        table = self.table(*latest)
+        self.assertIsNone(resolve_alight_eta(self.RIDE, board, table, {}, self.POLICY)[0], "최신 스냅샷만으로는 공백")
+        earlier = [self.eta("S12", 12, 10, "V2", stops_away=1), self.eta("S13", 13, 100, "V2", stops_away=2),
+                   self.eta("S13", 13, 400, "V9", stops_away=7)]  # V9: S12 쌍이 없어 쓰지 않음
+        recent: dict = {}
+        for e in [*latest, *earlier]:
+            recent.setdefault(("P", e.stop_order), []).append(e)
+        found, reasons = resolve_alight_eta(self.RIDE, board, table, {}, self.POLICY,
+                                            {k: tuple(v) for k, v in recent.items()})
+        self.assertEqual(found.predicted_arrival_at, board.predicted_arrival_at + timedelta(seconds=60 + 80 + 90))
+        self.assertIn("alight_eta_by_provider_segments", reasons)
+
+    def test_index_segment_etas_applies_age_rule(self):
+        def report(stop, order, basis_age, vehicle="V1"):
+            return EtaReport(pattern_id="P", stop_id=stop, stop_order=order, vehicle_id=vehicle, run_key=None,
+                             remaining_seconds=60, basis_at=self.AT - timedelta(seconds=basis_age),
+                             collected_at=self.AT, stops_away=1)
+        index = eta_module.index_segment_etas([report("S1", 1, 100), report("S1", 1, 1000, "V2"),
+                                               report("S2", None, 10)], evaluated_at=self.AT,
+                                              max_data_age_seconds=900)
+        self.assertEqual(list(index), [("P", 1)], "경유 위치 미확인 응답 제외")
+        self.assertEqual([e.vehicle_id for e in index[("P", 1)]], ["V1"], "허용 나이를 넘은 응답 제외")
+
+    def test_same_vehicle_alight_eta_still_preferred(self):
+        board, etas = self.chain_world()
+        direct = self.eta("S13", 13, 400, "V1", stops_away=4)
+        found, _ = resolve_alight_eta(self.RIDE, board, self.table(*etas, direct), {}, self.POLICY)
+        self.assertEqual((found.eta_source, found.predicted_arrival_at), ("provider", direct.predicted_arrival_at))
 
 
 if __name__ == "__main__":

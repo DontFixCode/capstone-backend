@@ -318,6 +318,15 @@ class ResponseRulesTest(unittest.TestCase):
         self.assertEqual({(t.kind, t.external_id) for t in targets},
                          {("arrivals", "A"), ("arrivals", "C"), ("arrivals", "F"), ("positions", "R10"),
                           ("positions", "R50")})
+        with_via = {**snapshot, "legs": [{**leg, "via_stop_ids": ["V1", "V2"]} if leg["leg_index"] == 1 else leg
+                                         for leg in legs]}
+        arrivals = {t.external_id for t in guidance.journey_targets(with_via, progress, "walking", "j") if
+                    t.kind == "arrivals"}
+        self.assertTrue({"V1", "V2"} <= arrivals, "타기 전 구간은 경유 정류소도 수집")
+        onboard = {**progress, "boarded": {"leg_index": 1}}
+        arrivals = {t.external_id for t in guidance.journey_targets(with_via, onboard, "onboard", "j") if
+                    t.kind == "arrivals"}
+        self.assertFalse({"V1", "V2"} & arrivals, "탑승 중 구간은 경유 정류소를 넣지 않음")
         done = {**progress, "completed_bus_legs": [1], "next_bus_leg_index": 3}
         rides = guidance.remaining_bus_legs(legs, done, "transferring")
         candidate, walks = guidance.remaining_candidate(snapshot, rides, first_walk_leg=legs[2], static_version="v")

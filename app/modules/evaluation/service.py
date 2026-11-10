@@ -13,7 +13,13 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
-from app.modules.evaluation.eta import EtaTable, build_ride_legs, index_etas, index_segment_durations
+from app.modules.evaluation.eta import (
+    EtaTable,
+    build_ride_legs,
+    index_etas,
+    index_segment_durations,
+    index_segment_etas,
+)
 from app.modules.evaluation.probability import (
     RecoveryOptions,
     estimate_expected_total_seconds,
@@ -35,6 +41,7 @@ from app.modules.evaluation.schemas import (
     PlannedJourney,
     RideLegs,
     TimedLeg,
+    VehicleEta,
     WalkResult,
 )
 from app.modules.evaluation.transfer import assess_connection, resolve_walk_seconds
@@ -52,6 +59,7 @@ class _SharedData:
     walks: dict[tuple[str, str], WalkResult]
     etas: EtaTable
     durations: dict[tuple[str, int], tuple[float, ...]]
+    segment_etas: dict[tuple[str, int], tuple[VehicleEta, ...]] = field(default_factory=dict)
     ride_legs: dict[tuple[str, int, int], RideLegs] = field(default_factory=dict)
     recovery_search_truncated: bool = False
 
@@ -84,6 +92,11 @@ def evaluate_candidates(
             max_data_age_seconds=policy.max_data_age_seconds,
         ),
         durations=index_segment_durations(inputs.segment_observations, condition_key=inputs.sample_condition_key),
+        segment_etas=index_segment_etas(
+            inputs.segment_eta_reports,
+            evaluated_at=context.evaluated_at,
+            max_data_age_seconds=policy.max_data_age_seconds,
+        ),
     )
     recovery_options = _recovery_provider(shared, search_index, monotonic)
     deadline = monotonic() + policy.evaluation_budget_ms / 1000
@@ -144,6 +157,7 @@ def _ride_legs(ride: StaticRide, shared: _SharedData) -> RideLegs:
             start_at=shared.context.start_at,
             queried_stop_ids=shared.inputs.queried_stop_ids,
             policy=shared.policy,
+            segment_etas=shared.segment_etas,
         )
     return shared.ride_legs[key]
 

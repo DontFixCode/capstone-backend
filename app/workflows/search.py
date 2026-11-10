@@ -6,7 +6,8 @@ recommendation.recommend_candidates)를 그대로 호출하고, 이 모듈은 �
 - 한 검색은 REPEATABLE READ 한 번으로 읽은 하나의 정적 공개본만 사용한다. DFS 중에는 외부 API를 호출하지 않는다.
 - 도보는 정적 후보 생성 뒤, 같은 방향·좌표·옵션의 구간을 한 번만 TMAP으로 조회한다. 같은 정류소 환승은 조회하지 않는다.
   경로 없음·조회 실패·시간 미확인(미조회)을 구분하고 미확인 도보시간을 0으로 채우지 않는다.
-- 실시간 대상(승하차 정류소 도착·노선 위치)은 검색 행(summary.realtime_targets, expires_at)에 등록해 워커가 공유 수집하고,
+- 실시간 대상(승하차 정류소와 그 사이 경유 정류소 도착·노선 위치)은 검색 행(summary.realtime_targets, expires_at)에
+  등록해 워커가 공유 수집하고,
   검색 시점에는 같은 Phase 2 수집기(RealtimeCollector)로 간격 이내 공개값은 재사용·부족한 대상만 조회한다.
 - TAGO 도착정보는 기준시각이 확인되지 않아(eta_basis_at=NULL) 기본 정책(unconfirmed)에서는 그대로 전달한다
   (2026-11-07 결정). 수신 시각 근사(BACKEND_TAGO_ETA_BASIS_POLICY=server_received_at)는 Notion DB-C04에 따라 검증한
@@ -282,13 +283,29 @@ def routing_snapshot(network: StaticNetwork) -> StaticSnapshot:
     )
 
 
-def required_targets(candidates: Iterable[StaticCandidate]) -> list[RealtimeTarget]:
-    """후보 전체의 승하차 정류소 도착·노선 위치 합집합."""
+PatternStops = dict[str, dict[int, str]]
+
+
+def pattern_stop_index(network: StaticNetwork) -> PatternStops:
+    """패턴별 경유 순번 → 정류소 원천 ID."""
+    return {p.pattern_key: {s.seq: s.stop_external_id for s in p.stops} for p in network.patterns}
+
+
+def via_stop_ids(pattern_stops: PatternStops | None, pattern_key: str, board_seq: int, alight_seq: int) -> list[str]:
+    """승하차 사이(양끝 제외) 경유 정류소. 하차 ETA 구간 연결(eta.provider_segment_seconds)의 입력을 모으는 데 쓴다."""
+    stops = (pattern_stops or {}).get(pattern_key, {})
+    return [stops[seq] for seq in range(board_seq + 1, alight_seq) if seq in stops]
+
+
+def required_targets(candidates: Iterable[StaticCandidate], pattern_stops: PatternStops | None = None,
+                     ) -> list[RealtimeTarget]:
+    """후보 전체의 승하차 정류소(경유 순번을 주면 그 사이 정류소 포함) 도착·노선 위치 합집합."""
     source = frozenset({"route_search"})
     arrivals, positions = set(), set()
     for candidate in candidates:
         for ride in candidate.rides:
             arrivals.update((ride.board_stop_id, ride.alight_stop_id))
+            arrivals.update(via_stop_ids(pattern_stops, ride.pattern_id, ride.board_position, ride.alight_position))
             positions.add(ride.route_id)
     return transit_service.merge_targets([
         [RealtimeTarget("arrivals", stop, source) for stop in sorted(arrivals)],
@@ -377,6 +394,8 @@ class RealtimeInputs:
     target_states: dict[str, dict[str, Any]]
     batch_refs: list[tuple[str, str | None]]
     rejected: dict[str, int]
+    # 최근(도착정보 허용 나이 이내) 공개된 모든 스냅샷의 도착 예측. 하차 ETA 구간 연결에만 쓴다(승차 ETA는 최신 스냅샷).
+    segment_eta_reports: list[EtaReport] = field(default_factory=list)
 
 
 IN_PROGRESS_RETRIES = 3
@@ -430,6 +449,28 @@ def realtime_inputs(conn, targets: list[RealtimeTarget], network: StaticNetwork,
     states: dict[str, dict[str, Any]] = {}
     refs: list[tuple[str, str | None]] = []
     rejected: Counter[str] = Counter()
+
+    def report(obs: dict[str, Any], batch_ref: str, counter: Counter[str]) -> EtaReport | None:
+        route_ext, stop_ext = obs["route_external_id"], obs["stop_external_id"]
+        if route_ext is None or stop_ext is None:
+            counter["arrival_route_or_stop_not_in_static"] += 1
+            return None
+        pattern = obs["pattern_key"]
+        if pattern is None:
+            keys = pattern_by_route.get(route_ext, [])
+            if len(keys) != 1:
+                counter["arrival_pattern_unresolved"] += 1
+                return None
+            pattern = keys[0]
+        basis_at, basis_source = eta_basis.resolve_basis(obs, eta_basis_policy)
+        return EtaReport(
+            pattern_id=pattern, stop_id=stop_ext, stop_order=obs["stop_seq"], vehicle_id=obs["vehicle_no"],
+            run_key=obs["run_key"], remaining_seconds=obs["remaining_seconds"], basis_at=basis_at,
+            basis_source=basis_source, stops_away=(obs.get("details") or {}).get("stops_away"),
+            source_generated_at=obs["source_generated_at"], collected_at=obs["collected_at"],
+            source_ref=f"transit_observation:{obs['id']}|{batch_ref}",
+        )
+
     for target in targets:
         snap: LatestSnapshot = transit_service.latest_snapshot(conn, target, interval_seconds=interval_seconds, now=now)
         states[snap.target_key] = {
@@ -446,26 +487,20 @@ def realtime_inputs(conn, targets: list[RealtimeTarget], network: StaticNetwork,
         if states[snap.target_key]["within_evaluation_age"]:
             queried.add(target.external_id)
         for obs in snap.observations:
-            route_ext, stop_ext = obs["route_external_id"], obs["stop_external_id"]
-            if route_ext is None or stop_ext is None:
-                rejected["arrival_route_or_stop_not_in_static"] += 1
-                continue
-            pattern = obs["pattern_key"]
-            if pattern is None:
-                keys = pattern_by_route.get(route_ext, [])
-                if len(keys) != 1:
-                    rejected["arrival_pattern_unresolved"] += 1
-                    continue
-                pattern = keys[0]
-            basis_at, basis_source = eta_basis.resolve_basis(obs, eta_basis_policy)
-            reports.append(EtaReport(
-                pattern_id=pattern, stop_id=stop_ext, stop_order=obs["stop_seq"], vehicle_id=obs["vehicle_no"],
-                run_key=obs["run_key"], remaining_seconds=obs["remaining_seconds"], basis_at=basis_at,
-                basis_source=basis_source, stops_away=(obs.get("details") or {}).get("stops_away"),
-                source_generated_at=obs["source_generated_at"], collected_at=obs["collected_at"],
-                source_ref=f"transit_observation:{obs['id']}|batch:{snap.batch_key}",
-            ))
-    return RealtimeInputs(reports, frozenset(queried), states, refs, dict(rejected))
+            item = report(obs, f"batch:{snap.batch_key}", rejected)
+            if item is not None:
+                reports.append(item)
+
+    # 구간 연결 입력: 노선별 가장 가까운 차량만 주는 원천에서 지금 두 정류소 사이에 다른 차량이 있으면 그 쌍의 같은 차량이
+    # 없으므로, 허용 나이 이내 이전 스냅샷의 같은 쌍도 함께 본다. 나이 판정은 eta.build_absolute_eta가 기준 시각으로 한다.
+    arrival_keys = [transit_service.realtime_target_key(t) for t in targets if t.kind == "arrivals"]
+    fetch_ids = transit_repository.recent_published_fetch_ids(
+        conn, "arrivals", arrival_keys, now - timedelta(seconds=max_data_age_seconds))
+    segment_reports = [item for obs in transit_repository.observations_for_fetches(conn, fetch_ids)
+                       if (item := report(obs, f"fetch:{obs['fetch_id']}", Counter())) is not None]
+    # 같은 입력이면 같은 결과가 되도록 구간 연결에 쓴 이전 스냅샷도 data_snapshot_id 근거에 넣는다.
+    refs.extend(("segment_fetch", str(fid)) for fid in fetch_ids)
+    return RealtimeInputs(reports, frozenset(queried), states, refs, dict(rejected), segment_reports)
 
 
 def segment_observations(conn, pattern_keys: Iterable[str], condition: str, until: datetime) -> list[SegmentObservation]:
@@ -562,6 +597,9 @@ def build_legs(candidate: StaticCandidate, evaluated: EvaluatedCandidate, walks:
             "alight": {**points.get(ride.alight_stop_id, {"stop_id": ride.alight_stop_id}),
                        "seq": ride.alight_position,
                        "direction_code": directions.get((ride.pattern_id, ride.alight_position))},
+            # 승하차 사이 경유 정류소(양끝 제외). 이동 안내의 도착정보 수집 대상(하차 ETA 구간 연결 입력)이 된다.
+            "via_stop_ids": via_stop_ids(network_info.get("pattern_stops"), ride.pattern_id, ride.board_position,
+                                         ride.alight_position),
             "timed": timed is not None,
             "vehicle": None if timed is None else {
                 "vehicle_id": timed.vehicle_id, "run_key": timed.run_key, "vehicle_rank": timed.vehicle_rank,
@@ -700,7 +738,7 @@ class SearchWorkflow:
         return network, context, result, index
 
     def _plan_summary(self, network: StaticNetwork, result: CandidateSearchResult) -> tuple[list[RealtimeTarget], dict]:
-        targets = required_targets(result.candidates)
+        targets = required_targets(result.candidates, pattern_stop_index(network))
         return targets, {
             "realtime_targets": targets_summary(targets),
             "static_version": str(network.data_version),
@@ -848,7 +886,7 @@ class SearchWorkflow:
             walks=tuple(w for w in (lookup.as_walk_result() for lookup in walks.values()) if w is not None),
             eta_reports=tuple(realtime.eta_reports), queried_stop_ids=realtime.queried_stop_ids,
             segment_observations=tuple(segments), transfer_error_samples=tuple(error_samples),
-            joint_scenes=tuple(scenes),
+            joint_scenes=tuple(scenes), segment_eta_reports=tuple(realtime.segment_eta_reports),
         )
         evaluation = evaluate_candidates(result, context, inputs, policy,
                                          search_index=index if policy.recovery_search else None)
@@ -878,6 +916,7 @@ class SearchWorkflow:
         network_info = {"routes": {r.external_id: r for r in network.routes},
                         "directions": {(p.pattern_key, s.seq): s.direction_code
                                        for p in network.patterns for s in p.stops},
+                        "pattern_stops": pattern_stop_index(network),
                         "shapes": shapes}
         with self.db.transaction() as conn:
             if not search_repository.lock_processing_search(conn, search_id):
