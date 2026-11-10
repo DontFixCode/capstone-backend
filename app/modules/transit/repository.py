@@ -538,6 +538,22 @@ def find_arrival_event(conn: psycopg.Connection, pattern_key: str, stop_seq: int
     return {"id": row[0], "quality": row[1], "event_at": row[2], "details": row[3]}
 
 
+def pattern_stop_ids_between(conn: psycopg.Connection, route_external_id: str, pattern_key: str, after_seq: int,
+                             before_seq: int) -> list[str]:
+    """활성 노선 패턴에서 after_seq < 순번 < before_seq인 정류소 원천 ID(순번 순)."""
+    rows = conn.execute(
+        """
+        SELECT s.external_id FROM app.route_stops rs
+          JOIN app.routes r ON r.id = rs.route_id AND r.is_active
+          JOIN app.stops s ON s.id = rs.stop_id
+         WHERE r.provider = %s AND r.external_id = %s AND rs.pattern_key = %s AND rs.seq > %s AND rs.seq < %s
+         ORDER BY rs.seq
+        """,
+        (PROVIDER, route_external_id, pattern_key, after_seq, before_seq),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
 def recent_published_fetch_ids(conn: psycopg.Connection, api_kind: str, target_keys: Sequence[str],
                                since: datetime) -> list[int]:
     """대상들의 since 이후 수신·공개된 모든 배치의 페이지(최신 배치만이 아님). 하차 ETA 구간 연결의 최근 스냅샷 입력."""

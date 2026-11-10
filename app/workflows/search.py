@@ -503,6 +503,27 @@ def realtime_inputs(conn, targets: list[RealtimeTarget], network: StaticNetwork,
     return RealtimeInputs(reports, frozenset(queried), states, refs, dict(rejected), segment_reports)
 
 
+def next_vehicle_upstream_stops(conn, route_id: str, pattern_key: str, board_seq: int, *, now: datetime,
+                                interval_seconds: float, max_age_seconds: float) -> list[str]:
+    """노선 위치(TAGO)로 승차 정류소 앞의 두 번째 차량(다음 차)을 찾아 그 차와 승차 정류소 사이 정류소를 돌려준다.
+
+    대전시 도착정보는 정류소마다 노선별 가장 가까운 차량만 주므로 승차 정류소에는 바로 앞 차만 나온다. 다음 차와 승차
+    정류소 사이 정류소를 조회하면 다음 차의 도착 예측(차량번호 포함)이 나오고, 거기서 구간 연결로 승차 정류소까지 잇는다
+    (eta.following_board_etas). 위치는 조회 대상을 고르는 데만 쓰고 시각은 도착정보로만 구한다(위치에는 시각이 없다).
+    위치 공개본이 없거나 허용 나이를 넘었거나 승차 정류소 앞 차량이 두 대 미만이면 빈 목록이다.
+    """
+    snap = transit_service.latest_snapshot(conn, RealtimeTarget("positions", route_id),
+                                           interval_seconds=interval_seconds, now=now)
+    if snap.batch_key is None or snap.age_seconds is None or snap.age_seconds > max_age_seconds:
+        return []
+    behind = sorted((o["stop_seq"] for o in snap.observations
+                     if o["pattern_key"] == pattern_key and o["stop_seq"] is not None and o["stop_seq"] < board_seq),
+                    reverse=True)
+    if len(behind) < 2:
+        return []
+    return transit_repository.pattern_stop_ids_between(conn, route_id, pattern_key, behind[1], board_seq)
+
+
 def segment_observations(conn, pattern_keys: Iterable[str], condition: str, until: datetime) -> list[SegmentObservation]:
     """같은 회차의 인접 경유 위치 도착 이벤트 쌍. 점 시각(exact)만 확인된 도착으로 쓴다."""
     events = transit_repository.arrival_events(conn, sorted(set(pattern_keys)), until=until)
@@ -834,6 +855,43 @@ class SearchWorkflow:
                                               summary=_jsonable(summary))
         return SearchOutcome(search_id, status, "nominal", summary["static_version"], None, None, None, summary, 0)
 
+    def _next_vehicle_targets(self, network: StaticNetwork, context: SearchContext, result: CandidateSearchResult,
+                              walks: dict[tuple[str, str], WalkLookup], targets: list[RealtimeTarget],
+                              ) -> list[RealtimeTarget]:
+        """1차 수집으로 평가해 기준 여유가 음수(바로 앞 차를 놓침)인 승차·환승 구간을 찾고, 그 구간 승차 정류소의 다음 차를
+        노선 위치로 찾아 그 사이 정류소를 추가 도착정보 대상으로 돌려준다. 필요한 구간만 조회해 호출을 줄인다."""
+        config, policy = self.config, self.config.evaluation_policy
+        now = self.clock()
+        probe_context = context.model_copy(update={"evaluated_at": max(now, context.evaluated_at)})
+        statics = {c.static_candidate_id: c for c in result.candidates}
+        known = {t.external_id for t in targets if t.kind == "arrivals"}
+        stops: set[str] = set()
+        with self.db.transaction(isolation="REPEATABLE READ") as conn:
+            realtime = realtime_inputs(conn, targets, network, now=now,
+                                       interval_seconds=config.realtime_interval_seconds,
+                                       max_data_age_seconds=policy.max_data_age_seconds,
+                                       eta_basis_policy=config.eta_basis_policy)
+            inputs = EvaluationInputs(
+                data_snapshot_id="next-vehicle-probe", sample_condition_key="next-vehicle-probe",
+                walks=tuple(w for w in (lookup.as_walk_result() for lookup in walks.values()) if w is not None),
+                eta_reports=tuple(realtime.eta_reports), queried_stop_ids=realtime.queried_stop_ids,
+                segment_eta_reports=tuple(realtime.segment_eta_reports))
+            evaluation = evaluate_candidates(result, probe_context, inputs, policy)
+            rides = {}
+            for item in (*evaluation.candidates, *evaluation.limited):
+                static = statics.get(item.static_candidate_id)
+                for assessed in item.connections:
+                    if static is not None and assessed.status == "negative_slack" \
+                            and assessed.connection_index < len(static.rides):
+                        ride = static.rides[assessed.connection_index]
+                        rides[(ride.route_id, ride.pattern_id, ride.board_position)] = ride
+            for route_id, pattern_key, board_seq in sorted(rides):
+                stops.update(next_vehicle_upstream_stops(
+                    conn, route_id, pattern_key, board_seq, now=now, interval_seconds=config.realtime_interval_seconds,
+                    max_age_seconds=policy.max_data_age_seconds))
+        source = frozenset({"route_search"})
+        return [RealtimeTarget("arrivals", stop, source) for stop in sorted(stops - known)]
+
     def _evaluate_and_save(self, search_id, request, network, context, result, index, targets, summary) -> SearchOutcome:
         config, policy = self.config, self.config.evaluation_policy
         stops = {s.external_id: s for s in network.stops}
@@ -850,6 +908,14 @@ class SearchWorkflow:
             summary["realtime_collection"] = collect_targets(self.db, self.tago_client, targets,
                                                              config.realtime_interval_seconds, self.clock,
                                                              daejeon_client=self.daejeon_client)
+            if self.daejeon_client is not None and self.realtime_provider is None:
+                extra = self._next_vehicle_targets(network, context, result, walks, targets)
+                if extra:
+                    summary["next_vehicle_collection"] = collect_targets(
+                        self.db, self.tago_client, extra, config.realtime_interval_seconds, self.clock,
+                        daejeon_client=self.daejeon_client)
+                    targets = transit_service.merge_targets([targets, extra])
+                    summary["realtime_targets"] = targets_summary(targets)
         cohort = sample_rules.condition_key("tago", policy, config.eta_basis_policy)
         now = self.clock()
         # 계산 시각(evaluated_at)은 입력을 확정한 시점이다. 검색 중 수집한 응답이 계획 시점보다 늦게 도착하므로

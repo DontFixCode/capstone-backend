@@ -85,7 +85,9 @@ REALTIME_ENDPOINT = {"positions": bus_api.BUS_LOCATIONS, "arrivals": bus_api.ARR
 REALTIME_NORMALIZER = {"positions": POSITIONS_NORMALIZER_VERSION, "arrivals": ARRIVALS_NORMALIZER_VERSION}
 # 실시간 도착정보 원천: 대전시 버스 도착정보(위치정보는 TAGO 그대로).
 DAEJEON_PROVIDER = "daejeon"
-DAEJEON_ARRIVALS_NORMALIZER_VERSION = "daejeon-arrivals/1"
+DAEJEON_ARRIVALS_NORMALIZER_VERSION = "daejeon-arrivals/2"
+# 다음 차가 기점·회차지에서 출발 전일 때의 항목(실조회로 추정, 검증 전). 차량번호를 쓰지 않는다.
+DAEJEON_MSG_TP_WAITING_DEPARTURE = "07"
 DAEJEON_ID_PREFIX = "DJB"
 DAEJEON_ETA_BASIS_SOURCE = "daejeon_info_offer_tm"
 KST = timezone(timedelta(hours=9))
@@ -1011,7 +1013,16 @@ def normalize_daejeon_arrivals(
         basis = parse_kst(item.get("INFO_OFFER_TM"))
         predicted = basis + timedelta(seconds=remaining) if basis is not None and remaining is not None else None
         stops_away = to_int(item.get("STATUS_POS"))
-        vehicle = (item.get("CAR_REG_NO") or "").strip() or None
+        plate = (item.get("CAR_REG_NO") or "").strip() or None
+        # MSG_TP=07: 다음 차가 기점·회차지에서 출발 전일 때의 항목으로 보이며, 차량번호는 직전에 지나간 차다
+        # (2026-11-10 실조회, 검증 전). 시각은 그대로 두고 차량번호는 쓰지 않는다(원값은 details.source에 남음).
+        waiting_departure = (item.get("MSG_TP") or "").strip() == DAEJEON_MSG_TP_WAITING_DEPARTURE
+        vehicle = None if waiting_departure else plate
+        if waiting_departure:
+            vehicle_match = {"status": "not_used", "reason": "msg_tp_07_last_passed_vehicle",
+                             "decision": "2026-11-10 사용자 결정(시각 유지·차량번호 제외, 검증 전)"}
+        else:
+            vehicle_match = {"status": "provided", "basis": "CAR_REG_NO"} if vehicle else {"status": "not_provided"}
         rows.append(ObservationRow(
             fetch_id=fetch_id, item_index=index, kind="arrival", collected_at=collected_at,
             route_id=route_internal, stop_id=stop_map.get(node_ext), pattern_key=pattern, stop_seq=seq,
@@ -1026,8 +1037,7 @@ def normalize_daejeon_arrivals(
                                "basis": "BUS_NODE_ID + DJB prefix" if item.get("BUS_NODE_ID") else "request_node_id",
                                "same_as_request": node_ext == request_stop_id},
                 "visit_match": visit,
-                "vehicle_match": ({"status": "provided", "basis": "CAR_REG_NO"} if vehicle
-                                  else {"status": "not_provided"}),
+                "vehicle_match": vehicle_match,
                 # STATUS_POS: 남은 정류장 수로 보이는 값(검증 전). 같은 차량의 승차·하차 예측을 잇는 일관성 확인에 쓴다.
                 "stops_away": stops_away,
                 "remaining_seconds_status": "provided" if remaining is not None else field_state(item, "EXTIME_SEC"),

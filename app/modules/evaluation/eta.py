@@ -258,8 +258,13 @@ def build_ride_legs(
     policy: EvaluationPolicy,
     segment_etas: SegmentEtas | None = None,
 ) -> RideLegs:
-    """정적 탑승 구간의 차량 옵션을 도착 예상 순서로 구성한다. 응답에 없는 차량을 운행 없음으로 해석하지 않는다."""
-    board_etas = table.by_position.get((ride.pattern_id, ride.board_position, ride.board_stop_id), ())
+    """정적 탑승 구간의 차량 옵션을 도착 예상 순서로 구성한다. 응답에 없는 차량을 운행 없음으로 해석하지 않는다.
+
+    승차 정류소 응답에 없는 뒤 차량(다음 차)은 상류 정류소 응답과 구간 연결로 만든 승차 ETA를 옵션에 더한다
+    (following_board_etas, 사유 board_eta_by_provider_segments).
+    """
+    listed = table.by_position.get((ride.pattern_id, ride.board_position, ride.board_stop_id), ())
+    board_etas = tuple(sorted((*listed, *following_board_etas(ride, table, segment_etas)), key=_eta_order))
     horizon_end_at = start_at + timedelta(seconds=policy.search_horizon_seconds)
     legs: list[TimedLeg] = []
     horizon_excluded = 0
@@ -268,6 +273,8 @@ def build_ride_legs(
             horizon_excluded += 1
             continue
         alight_eta, leg_reasons = resolve_alight_eta(ride, board_eta, table, durations, policy, segment_etas)
+        if board_eta.eta_source == "provider_segments":
+            leg_reasons = tuple(sorted({*leg_reasons, BOARD_ETA_BY_PROVIDER_SEGMENTS}))
         legs.append(
             TimedLeg(
                 route_id=ride.route_id,
@@ -308,8 +315,51 @@ def _eta_order(eta: VehicleEta) -> tuple:
 
 ALIGHT_LINKED_WITHOUT_RUN_KEY = "alight_linked_by_vehicle_without_run_key"
 ALIGHT_ETA_BY_PROVIDER_SEGMENTS = "alight_eta_by_provider_segments"
+BOARD_ETA_BY_PROVIDER_SEGMENTS = "board_eta_by_provider_segments"
 PROVIDER_SEGMENT_MISSING = "provider_segment_missing"
 PROVIDER_SEGMENTS_MODEL_VERSION = "provider-segments/1"
+
+
+def following_board_etas(ride: StaticRide, table: EtaTable, segment_etas: SegmentEtas | None = None,
+                         ) -> list[VehicleEta]:
+    """승차 정류소 응답에 없는 뒤 차량의 승차 ETA. 상류 정류소(같은 패턴, 승차 순번 앞)에 나온 차량마다 승차 정류소에
+    가장 가까운 상류 예측에서 구간 연결로 승차 정류소까지 잇는다. 차량번호가 없거나 연결이 끊기면 만들지 않는다.
+
+    대전시 도착정보는 정류소마다 노선별 가장 가까운 차량만 주므로, 다음 차의 예측은 다음 차와 바로 앞 차 사이 정류소에만
+    나온다(그 정류소들은 노선 위치로 골라 수집한다, workflows.search.next_vehicle_upstream_stops).
+    """
+    listed = table.by_position.get((ride.pattern_id, ride.board_position, ride.board_stop_id), ())
+    listed_vehicles = {eta.vehicle_id for eta in listed if eta.vehicle_id is not None}
+    nearest: dict[str, VehicleEta] = {}
+    for (pattern_id, stop_order, _), etas in table.by_position.items():
+        if pattern_id != ride.pattern_id or stop_order >= ride.board_position:
+            continue
+        for eta in etas:
+            if eta.vehicle_id is None or eta.vehicle_id in listed_vehicles:
+                continue
+            current = nearest.get(eta.vehicle_id)
+            if current is None or eta.stop_order > current.stop_order:
+                nearest[eta.vehicle_id] = eta
+    result: list[VehicleEta] = []
+    for vehicle_id, upstream in sorted(nearest.items()):
+        approach = StaticRide(route_id=ride.route_id, pattern_id=ride.pattern_id, direction=ride.direction,
+                              board_stop_id=upstream.stop_id, board_position=upstream.stop_order,
+                              alight_stop_id=ride.board_stop_id, alight_position=ride.board_position)
+        seconds, counts, _ = provider_segment_seconds(approach, table, segment_etas)
+        if seconds is None:
+            continue
+        hops = ride.board_position - upstream.stop_order
+        result.append(VehicleEta(
+            pattern_id=ride.pattern_id, stop_id=ride.board_stop_id, stop_order=ride.board_position,
+            vehicle_id=vehicle_id, run_key=upstream.run_key,
+            predicted_arrival_at=upstream.predicted_arrival_at + timedelta(seconds=seconds),
+            eta_source="provider_segments", model_version=PROVIDER_SEGMENTS_MODEL_VERSION,
+            horizon_seconds=upstream.horizon_seconds + seconds, basis_at=upstream.basis_at,
+            source_generated_at=upstream.source_generated_at, collected_at=upstream.collected_at,
+            source_ref=upstream.source_ref, segment_sample_counts=counts, basis_source=upstream.basis_source,
+            stops_away=None if upstream.stops_away is None else upstream.stops_away + hops,
+        ))
+    return result
 
 
 def _same_run_next_stop(first: VehicleEta, second: VehicleEta) -> bool:

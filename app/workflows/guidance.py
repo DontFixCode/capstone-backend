@@ -55,16 +55,30 @@ def remaining_bus_legs(legs: list[dict[str, Any]], progress: dict[str, Any], mov
             if leg["leg_index"] not in done and (current is None or leg["leg_index"] >= current)]
 
 
+UpstreamStops = Callable[[str, str, int], list[str]]
+
+
+def upstream_lookup(conn, *, now: datetime, interval_seconds: float, max_age_seconds: float) -> UpstreamStops:
+    """노선 위치 공개본으로 다음 차와 승차 정류소 사이 정류소를 찾는 함수(journey_targets의 upstream)."""
+    def lookup(route_id: str, pattern_key: str, board_seq: int) -> list[str]:
+        return search_flow.next_vehicle_upstream_stops(conn, route_id, pattern_key, board_seq, now=now,
+                                                       interval_seconds=interval_seconds,
+                                                       max_age_seconds=max_age_seconds)
+    return lookup
+
+
 def journey_targets(snapshot: dict[str, Any], progress: dict[str, Any], movement: str,
-                    source: str) -> list[RealtimeTarget]:
+                    source: str, upstream: UpstreamStops | None = None) -> list[RealtimeTarget]:
     """남은 버스 구간의 승하차 정류소 도착·노선 위치. 끝난 구간은 수집 대상에서 뺀다.
 
     아직 타지 않은 구간은 승하차 사이 경유 정류소(via_stop_ids)도 넣는다(하차 ETA 구간 연결 입력). 탑승 중인 구간의
-    하차 ETA는 같은 차량의 하차 정류소 예측만 쓰므로 경유 정류소를 넣지 않는다.
+    하차 ETA는 같은 차량의 하차 정류소 예측만 쓰므로 경유 정류소를 넣지 않는다. upstream(노선, 패턴, 승차 순번 →
+    정류소)을 주면 다음에 탈 구간의 다음 차와 승차 정류소 사이 정류소도 넣는다(search.next_vehicle_upstream_stops).
     """
     srcs = frozenset({source})
     arrivals, positions = set(), set()
     onboard_leg = (progress.get("boarded") or {}).get("leg_index") if movement == journey_state.ONBOARD else None
+    next_boarding_done = False
     for leg in remaining_bus_legs(snapshot.get("legs") or [], progress, movement):
         for side in ("board", "alight"):
             stop = (leg.get(side) or {}).get("stop_id")
@@ -72,6 +86,11 @@ def journey_targets(snapshot: dict[str, Any], progress: dict[str, Any], movement
                 arrivals.add(stop)
         if leg["leg_index"] != onboard_leg:
             arrivals.update(leg.get("via_stop_ids") or [])
+            board_seq = (leg.get("board") or {}).get("seq")
+            if upstream is not None and not next_boarding_done and leg.get("route_id") and leg.get("pattern_key") \
+                    and isinstance(board_seq, int):
+                arrivals.update(upstream(leg["route_id"], leg["pattern_key"], board_seq))
+            next_boarding_done = True
         if leg.get("route_id"):
             positions.add(leg["route_id"])
     return transit_service.merge_targets([[RealtimeTarget("arrivals", s, srcs) for s in sorted(arrivals)],
@@ -248,9 +267,13 @@ def compute_guidance(
     if snapshot.get("static_version") and snapshot["static_version"] != static_version:
         reasons.append("static_version_changed_since_selection")
 
-    targets = journey_targets(snapshot, progress, movement, f"{JOURNEY_SOURCE}:{journey['id']}")
     cohort = sample_rules.condition_key("tago", policy, config.eta_basis_policy)
     with db.transaction(isolation="REPEATABLE READ") as conn:
+        # 다음에 탈 구간의 다음 차 대상(상류 정류소)은 워커 수집(workers.collection)과 같은 규칙으로 고른다.
+        upstream = None if realtime_provider is not None else upstream_lookup(
+            conn, now=now, interval_seconds=settings.realtime_interval_seconds,
+            max_age_seconds=policy.max_data_age_seconds)
+        targets = journey_targets(snapshot, progress, movement, f"{JOURNEY_SOURCE}:{journey['id']}", upstream)
         if realtime_provider is not None:
             realtime = realtime_provider(conn, targets, network, now)
         else:

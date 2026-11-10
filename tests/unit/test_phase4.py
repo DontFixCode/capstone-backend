@@ -327,6 +327,18 @@ class ResponseRulesTest(unittest.TestCase):
         arrivals = {t.external_id for t in guidance.journey_targets(with_via, onboard, "onboard", "j") if
                     t.kind == "arrivals"}
         self.assertFalse({"V1", "V2"} & arrivals, "탑승 중 구간은 경유 정류소를 넣지 않음")
+        calls = []
+
+        def upstream(route_id, pattern_key, board_seq):
+            calls.append((route_id, pattern_key, board_seq))
+            return ["UP"]
+        arrivals = {t.external_id for t in guidance.journey_targets(with_via, progress, "walking", "j", upstream)
+                    if t.kind == "arrivals"}
+        self.assertIn("UP", arrivals)
+        self.assertEqual(calls, [("R10", "P10", 1)], "다음에 탈 구간 하나만 다음 차 상류 정류소를 찾음")
+        calls.clear()
+        guidance.journey_targets(with_via, onboard, "onboard", "j", upstream)
+        self.assertEqual(calls, [("R50", "P50", 1)], "탑승 중이면 그다음(환승) 구간")
         done = {**progress, "completed_bus_legs": [1], "next_bus_leg_index": 3}
         rides = guidance.remaining_bus_legs(legs, done, "transferring")
         candidate, walks = guidance.remaining_candidate(snapshot, rides, first_walk_leg=legs[2], static_version="v")

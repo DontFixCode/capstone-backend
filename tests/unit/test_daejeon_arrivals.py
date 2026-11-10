@@ -5,6 +5,7 @@ XML_OK는 2026-11-09 사용자가 확인한 실응답(도마네거리, BusStopID
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from app.integrations.daejeon_bus_api import RawResponse, parse_arrivals
 from app.modules.evaluation import eta as eta_module
@@ -77,6 +78,43 @@ class TargetKeyTest(unittest.TestCase):
         self.assertEqual((back.kind, back.external_id), ("arrivals", "DJB8001488"))
         old = "tago:getSttnAcctoArvlPrearngeInfoList?cityCode=25&nodeId=DJB8001488"
         self.assertIsNone(transit_service.target_from_key(old), "이전 TAGO 도착정보 키는 더 이상 수집 대상이 아님")
+
+    def test_msg_tp_07_keeps_time_but_drops_last_passed_vehicle(self):
+        """MSG_TP=07(다음 차 출발 전): 시각은 유지하고 차량번호(직전에 지나간 차)는 쓰지 않는다. 03은 그대로."""
+        items = parse_arrivals(raw(XML_OK), {"BusStopID": "8001488"}).items
+        waiting = {**items[0], "MSG_TP": "07"}
+        with mock.patch.object(transit_service.repository, "route_ids", return_value={}), \
+                mock.patch.object(transit_service.repository, "route_visits", return_value={}), \
+                mock.patch.object(transit_service.repository, "stop_ids", return_value={}):
+            rows = transit_service.normalize_daejeon_arrivals(
+                None, "DJB8001488", "8001488", 1, [waiting, items[1]], datetime(2026, 11, 9, 14, 12, 21, tzinfo=UTC),
+                None)
+        self.assertIsNone(rows[0].vehicle_no)
+        self.assertEqual(rows[0].details["vehicle_match"]["reason"], "msg_tp_07_last_passed_vehicle")
+        self.assertEqual(rows[0].details["source"]["CAR_REG_NO"], "대전75자2718", "원값은 보존")
+        self.assertIsNotNone(rows[0].predicted_arrival_at, "시각은 유지")
+        self.assertEqual(rows[1].vehicle_no, "대전75자3319")
+
+    def test_next_vehicle_upstream_stops_use_second_bus_behind_board(self):
+        from types import SimpleNamespace
+
+        from app.workflows import search as flow
+        obs = [{"pattern_key": "P", "stop_seq": s} for s in (44, 39, 33)] + [{"pattern_key": "Q", "stop_seq": 45}]
+        snap = SimpleNamespace(batch_key="b", age_seconds=30.0, observations=obs)
+        now = datetime(2026, 11, 10, 3, 40, tzinfo=UTC)
+        with mock.patch.object(flow.transit_service, "latest_snapshot", return_value=snap), \
+                mock.patch.object(flow.transit_repository, "pattern_stop_ids_between",
+                                  side_effect=lambda conn, r, p, a, b: [f"S{seq}" for seq in range(a + 1, b)]) as between:
+            stops = flow.next_vehicle_upstream_stops(None, "R", "P", 46, now=now, interval_seconds=600,
+                                                     max_age_seconds=900)
+            self.assertEqual(stops, [f"S{seq}" for seq in range(40, 46)], "바로 앞 차(44) 다음 차(39)부터 승차 전까지")
+            between.assert_called_once_with(None, "R", "P", 39, 46)
+            self.assertEqual(flow.next_vehicle_upstream_stops(None, "R", "P", 36, now=now, interval_seconds=600,
+                                                              max_age_seconds=900), [], "앞 차량이 한 대뿐(33)")
+        old = SimpleNamespace(batch_key="b", age_seconds=1000.0, observations=obs)
+        with mock.patch.object(flow.transit_service, "latest_snapshot", return_value=old):
+            self.assertEqual(flow.next_vehicle_upstream_stops(None, "R", "P", 46, now=now, interval_seconds=600,
+                                                              max_age_seconds=900), [], "허용 나이를 넘은 위치는 안 씀")
 
     def test_bus_stop_id_is_node_id_without_prefix(self):
         """BusStopID는 정류소 번호(stop_no 30720)가 아니라 'DJB'를 뗀 정류소 ID다(번호로 보내면 headerCd=4)."""
@@ -199,6 +237,29 @@ class ProviderSegmentChainTest(unittest.TestCase):
                                               max_data_age_seconds=900)
         self.assertEqual(list(index), [("P", 1)], "경유 위치 미확인 응답 제외")
         self.assertEqual([e.vehicle_id for e in index[("P", 1)]], ["V1"], "허용 나이를 넘은 응답 제외")
+
+    def test_next_vehicle_board_eta_from_upstream_stops(self):
+        """승차 정류소 20에는 바로 앞 차 M만 나온다. 다음 차 N은 17·18에 나오고, 18→19는 지금 M이 그 구간에 있어 이전
+        스냅샷 X로 채우며, 19→20은 M의 예측 차이로 잇는다."""
+        ride = StaticRide(route_id="R", pattern_id="P", direction=None, board_stop_id="S20", board_position=20,
+                          alight_stop_id="S22", alight_position=22)
+        latest = [self.eta("S17", 17, 60, "N", stops_away=1), self.eta("S18", 18, 130, "N", stops_away=2),
+                  self.eta("S19", 19, 20, "M", stops_away=1), self.eta("S20", 20, 90, "M", stops_away=2)]
+        table = self.table(*latest)
+        recent: dict = {}
+        for e in [*latest, self.eta("S18", 18, 10, "X", stops_away=1), self.eta("S19", 19, 80, "X", stops_away=2)]:
+            recent.setdefault(("P", e.stop_order), []).append(e)
+        recent = {k: tuple(v) for k, v in recent.items()}
+        derived = eta_module.following_board_etas(ride, table, recent)
+        self.assertEqual([(e.vehicle_id, e.stop_order, e.eta_source, e.stops_away) for e in derived],
+                         [("N", 20, "provider_segments", 4)], "승차 정류소에 이미 나온 M은 다시 만들지 않음")
+        self.assertEqual(derived[0].predicted_arrival_at, self.AT + timedelta(seconds=130 + 70 + 70))
+        legs = eta_module.build_ride_legs(ride, table, {}, start_at=self.AT, queried_stop_ids=frozenset({"S20"}),
+                                          policy=self.POLICY, segment_etas=recent)
+        self.assertEqual([leg.vehicle_id for leg in legs.legs], ["M", "N"], "바로 앞 차 다음에 다음 차 옵션")
+        self.assertIn("board_eta_by_provider_segments", legs.legs[1].reason_codes)
+        self.assertEqual(eta_module.following_board_etas(ride, table, None), [],
+                         "18→19 근거가 없으면(이전 스냅샷 없음) 만들지 않음")
 
     def test_same_vehicle_alight_eta_still_preferred(self):
         board, etas = self.chain_world()
