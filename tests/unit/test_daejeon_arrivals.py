@@ -1,6 +1,6 @@
 """대전시 도착정보 수집 해석·대상 키·같은 차량 하차 ETA 연결 단위 시험(DB·네트워크 없음).
 
-XML_OK는 2026-11-09 사용자가 확인한 실응답(도마네거리, BusStopID 30720)의 형식이다.
+XML_OK는 2026-11-09 사용자가 확인한 실응답(도마네거리, BusStopID 8001488)의 형식이다.
 """
 
 import unittest
@@ -37,7 +37,7 @@ def raw(body: str, status: int = 200) -> RawResponse:
 
 class ParseArrivalsTest(unittest.TestCase):
     def test_real_response_shape(self):
-        page = parse_arrivals(raw(XML_OK), {"BusStopID": "30720"})
+        page = parse_arrivals(raw(XML_OK), {"BusStopID": "8001488"})
         self.assertEqual((page.status, page.provider_code, page.item_count, page.error), ("success", "0", 2, None))
         self.assertEqual(page.items[0]["CAR_REG_NO"], "대전75자2718")
         self.assertEqual((page.items[1]["EXTIME_SEC"], page.items[1]["STATUS_POS"]), ("73", "2"))
@@ -76,6 +76,12 @@ class TargetKeyTest(unittest.TestCase):
         self.assertEqual((back.kind, back.external_id), ("arrivals", "DJB8001488"))
         old = "tago:getSttnAcctoArvlPrearngeInfoList?cityCode=25&nodeId=DJB8001488"
         self.assertIsNone(transit_service.target_from_key(old), "이전 TAGO 도착정보 키는 더 이상 수집 대상이 아님")
+
+    def test_bus_stop_id_is_node_id_without_prefix(self):
+        """BusStopID는 정류소 번호(stop_no 30720)가 아니라 'DJB'를 뗀 정류소 ID다(번호로 보내면 headerCd=4)."""
+        self.assertEqual(transit_service.daejeon_bus_stop_id("DJB8001488"), "8001488")
+        for bad in ("8001488", "DJB", "DJBabc", "CCB8001488", ""):
+            self.assertIsNone(transit_service.daejeon_bus_stop_id(bad), bad)
 
 
 class SameVehicleAlightTest(unittest.TestCase):

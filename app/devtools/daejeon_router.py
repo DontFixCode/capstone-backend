@@ -17,7 +17,7 @@ router = APIRouter(prefix="/dev/daejeon", tags=["devtools: 대전시 버스 확�
 _STATUS_BY_CATEGORY = {"timeout": 504}
 
 BusStopId = Annotated[str, Path(min_length=1, max_length=30, pattern=r"^\S+$",
-                                description="대전시 정류소 ID BusStopID (TAGO nodeId와 대응 미확인)")]
+                                description="대전시 정류소 ID BusStopID (7자리, TAGO nodeId에서 'DJB'를 뗀 값)")]
 
 
 @router.get("/stops/{bus_stop_id}/arrivals", summary="대전시 정류소 도착정보 원본 (getArrInfoByStopID)",

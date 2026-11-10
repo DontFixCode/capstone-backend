@@ -434,11 +434,10 @@ def route_ids(conn: psycopg.Connection, external_ids: Iterable[str]) -> dict[str
     ).fetchall())
 
 
-def stop_number(conn: psycopg.Connection, external_id: str) -> str | None:
-    """정류소 번호(TAGO nodeno = 대전시 BusStopID). 활성 정류소만 본다."""
-    row = conn.execute("SELECT stop_no FROM app.stops WHERE provider = %s AND is_active AND external_id = %s",
-                       (PROVIDER, external_id)).fetchone()
-    return (row[0] or None) if row else None
+def is_active_stop(conn: psycopg.Connection, external_id: str) -> bool:
+    """현재 활성 정류소인지."""
+    return conn.execute("SELECT 1 FROM app.stops WHERE provider = %s AND is_active AND external_id = %s",
+                        (PROVIDER, external_id)).fetchone() is not None
 
 
 def stop_ids(conn: psycopg.Connection, external_ids: Iterable[str]) -> dict[str, int]:

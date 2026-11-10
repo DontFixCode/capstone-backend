@@ -8,8 +8,10 @@
   부분 수집·실패는 공개하지 않으며, 정상 빈 응답은 빈 스냅샷으로 공개한다.
 - 위치정보와 도착정보를 특정 차량으로 임의 연결하지 않는다. 수집 시각·ETA 0·응답 소멸을 실제 도착으로 쓰지 않는다.
 - 도착정보는 대전시 버스 도착정보 API(getArrInfoByStopID)에서 수집한다(2026-11-09 사용자 결정, TAGO 도착정보 대체).
-  정류소 조회 조건 BusStopID는 정적 정류소의 정류소 번호(stop_no, TAGO nodeno)이고, 응답의 BUS_NODE_ID·ROUTE_CD는
-  'DJB' 접두사를 붙여 TAGO 정류소·노선 ID에 연결한다(실응답 2건으로 대응 확인, 일반 규칙은 검증 전). 차량번호(CAR_REG_NO)를
+  정류소 조회 조건 BusStopID는 대전시 정류소 ID(BUS_NODE_ID, 7자리)로, TAGO 정류소 ID에서 'DJB' 접두사를 뗀 값이다.
+  정류소 번호(stop_no, TAGO nodeno, 5자리)를 보내면 운행 중에도 headerCd=4 '결과가 없습니다'가 온다(2026-11-10 실호출 확인:
+  8002695·8001488은 정상, 12380·30720은 결과 없음). 응답의 BUS_NODE_ID·ROUTE_CD는
+  'DJB' 접두사를 붙여 TAGO 정류소·노선 ID에 연결한다(실응답 대응 확인, 일반 규칙은 검증 전). 차량번호(CAR_REG_NO)를
   그대로 저장하고, 잔여초 기준 시각은 항목별 INFO_OFFER_TM(KST)으로 채택한다(사용자 결정, 검증 전·출처 표시).
 """
 
@@ -121,12 +123,19 @@ def target_key(endpoint: Endpoint, params: dict[str, Any]) -> str:
 def realtime_target_key(target: RealtimeTarget, city_code: str = CITY_CODE) -> str:
     """대상의 수집 키(제공처:상세기능?조회 조건). 도착정보는 대전시 API, 위치정보는 TAGO다.
 
-    대전시 도착정보의 실제 조회 조건은 정류소 번호(BusStopID)지만 정적 갱신 뒤에도 같은 대상이 같은 키가 되도록
-    내부 정류소 원천 ID(nodeId)로 키를 만든다. 실제 요청 값은 api_fetches.request_params에 남는다.
+    대전시 도착정보는 기존 키와 같도록 내부 정류소 원천 ID(nodeId, 'DJB' 포함)로 키를 만든다. 실제 요청 값(BusStopID,
+    접두사 제외)은 api_fetches.request_params에 남는다.
     """
     if target.kind == "arrivals":
         return f"{DAEJEON_PROVIDER}:{daejeon_bus_api.ARRIVALS_BY_STOP}?nodeId={target.external_id}"
     return target_key(REALTIME_ENDPOINT["positions"], {"cityCode": city_code, "routeId": target.external_id})
+
+
+def daejeon_bus_stop_id(external_id: str) -> str | None:
+    """대전시 BusStopID = TAGO 정류소 ID('DJB'+숫자)에서 접두사를 뗀 대전시 정류소 ID(BUS_NODE_ID). 형식이 다르면 None."""
+    text = (external_id or "").strip()
+    digits = text[len(DAEJEON_ID_PREFIX):] if text.startswith(DAEJEON_ID_PREFIX) else ""
+    return digits if digits.isdigit() else None
 
 
 def provider_of_key(key: str) -> str:
@@ -967,7 +976,7 @@ def parse_kst(text: str | None) -> datetime | None:
 
 
 def normalize_daejeon_arrivals(
-    conn: psycopg.Connection, request_stop_id: str, bus_stop_no: str, fetch_id: int, items: list[dict[str, str]],
+    conn: psycopg.Connection, request_stop_id: str, bus_stop_id: str, fetch_id: int, items: list[dict[str, str]],
     collected_at: datetime, static_version: str | None,
 ) -> list[ObservationRow]:
     """대전시 정류소별 도착정보. 차량번호를 그대로 저장하고 운행 회차는 원천이 주지 않으므로 비워 둔다.
@@ -1010,7 +1019,7 @@ def normalize_daejeon_arrivals(
             eta_basis_at=basis if predicted is not None else None, predicted_arrival_at=predicted,
             details={
                 "source": dict(item),
-                "request": {"BusStopID": bus_stop_no, "nodeId": request_stop_id},
+                "request": {"BusStopID": bus_stop_id, "nodeId": request_stop_id},
                 "route_match": {"status": "matched" if route_internal else "unmatched",
                                 "basis": "ROUTE_CD + DJB prefix (2026-11-09 실응답 대응 확인, 일반 규칙 검증 전)"},
                 "stop_match": {"status": "matched" if node_ext in stop_map else "unmatched",
@@ -1119,11 +1128,11 @@ class RealtimeCollector:
 
     def _collect_daejeon(self, target: RealtimeTarget, key: str, lock_conn: psycopg.Connection) -> CollectOutcome:
         """대전시 도착정보 1회 조회 → api_fetches 기록(즉시 커밋) → 정상·빈 응답이면 관측과 공개를 한 트랜잭션에서 저장."""
-        stop_no = repository.stop_number(lock_conn, target.external_id)
-        if not stop_no:
+        bus_stop_id = daejeon_bus_stop_id(target.external_id)
+        if bus_stop_id is None or not repository.is_active_stop(lock_conn, target.external_id):
             lock_conn.rollback()
-            return CollectOutcome(key, "failed", reason="정류소 번호(stop_no)가 없어 대전시 BusStopID를 만들 수 없음")
-        page = self.daejeon_client.fetch_arrivals(stop_no)
+            return CollectOutcome(key, "failed", reason="활성 정류소가 아니거나 'DJB'+숫자 형식이 아니어서 대전시 BusStopID를 만들 수 없음")
+        page = self.daejeon_client.fetch_arrivals(bus_stop_id)
         with self.db.connect(autocommit=True) as record_conn:
             row = FetchAttemptRow(
                 batch_key=uuid4(), provider=DAEJEON_PROVIDER, api_kind="arrivals", target_key=key,
@@ -1141,7 +1150,7 @@ class RealtimeCollector:
             try:
                 versions = repository.current_static_versions(lock_conn)
                 version = str(versions[0]) if len(versions) == 1 else None
-                observations = normalize_daejeon_arrivals(lock_conn, target.external_id, stop_no, fetch_id, page.items,
+                observations = normalize_daejeon_arrivals(lock_conn, target.external_id, bus_stop_id, fetch_id, page.items,
                                                           row.received_at, version)
                 inserted = repository.insert_observations(lock_conn, observations)
                 if repository.mark_published(lock_conn, [fetch_id], repository.clock_now(lock_conn)) != 1:
