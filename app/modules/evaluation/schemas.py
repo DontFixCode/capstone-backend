@@ -26,8 +26,7 @@ ORIGIN_REF = "@origin"
 DESTINATION_REF = "@destination"
 
 # 거리 비례 추정(route_average_ratio)은 단위·운행 범위 검증 전이라 값에 포함하지 않는다.
-# provider_segments: 인접 정류소 쌍별 제공 ETA 차이를 이어 붙인 하차 ETA(검증 전, app.modules.evaluation.eta).
-EtaSource = Literal["provider", "historical_segments", "provider_segments"]
+EtaSource = Literal["provider", "historical_segments"]
 TimeStatus = Literal["available", "partial", "unavailable"]
 ConnectionStatus = Literal["feasible", "negative_slack", "time_unknown", "confirmed_infeasible"]
 WalkStatus = Literal["available", "no_route", "lookup_failed"]
@@ -217,9 +216,6 @@ class EvaluationInputs(FrozenSchema):
     segment_observations: tuple[SegmentObservation, ...] = ()
     transfer_error_samples: tuple[TransferErrorSample, ...] = ()
     joint_scenes: tuple[JointScene, ...] = ()
-    # 하차 ETA 구간 연결 입력: 허용 나이 이내 최근 스냅샷 전체의 도착 예측(eta.provider_segment_seconds). 비면 최신
-    # 스냅샷(eta_reports)만 쓴다.
-    segment_eta_reports: tuple[EtaReport, ...] = ()
 
 
 class TimedLeg(FrozenSchema):

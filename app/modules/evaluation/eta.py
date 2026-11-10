@@ -1,14 +1,7 @@
 """차량별 절대 ETA 구성과 관측 기반 하차 ETA 보완을 담당한다.
 
-하차 ETA는 같은 차량·회차의 제공 ETA → 적격 관측 구간 소요시간 → 제공 ETA 구간 연결 순으로 구성하고, 근거가 없으면
-None과 이유를 반환한다. 거리 비례 추정은 시간·거리 단위와 운행 범위를 검증하기 전이므로 구현하지 않고 비활성으로 둔다.
-
-제공 ETA 구간 연결(2026-11-10 사용자 결정, 설계 DB-P01 근거 순서에 없는 추가 근거·검증 전): 대전시 도착정보는 정류소마다
-노선별 가장 가까운 차량 1대만 주므로, 탑승 구간이 길면 승차 차량이 하차 정류소 응답에 없다. 그때 승하차 사이 인접 정류소
-쌍마다 두 정류소에 함께 나온 같은 차량(남은 정류장 수 차이 1)의 예측 도착시각 차이를 구간시간으로 보고 더한다. 지금 그
-구간 안에 다른 차량이 있으면 최신 스냅샷에는 같은 차량 쌍이 없으므로, 도착정보 허용 나이 이내 이전 스냅샷의 같은 쌍도
-쓴다. 임의 속도·배차간격은 쓰지 않으며, 한 구간이라도 근거가 없으면 합을 완성하지 않는다. 결과는
-eta_source=provider_segments와 사유 코드(alight_eta_by_provider_segments)로 구분한다.
+하차 ETA는 같은 차량·회차의 제공 ETA → 적격 관측 구간 소요시간 순으로 구성하고, 근거가 없으면 None과 이유를
+반환한다. 거리 비례 추정은 시간·거리 단위와 운행 범위를 검증하기 전이므로 구현하지 않고 비활성으로 둔다.
 """
 
 from __future__ import annotations
@@ -30,8 +23,6 @@ from app.modules.evaluation.schemas import (
 from app.modules.routing.schemas import StaticRide
 
 SegmentDurations = Mapping[tuple[str, int], tuple[float, ...]]
-# (pattern_id, stop_order) → 최근 스냅샷 전체의 차량 ETA. 구간 연결에만 쓴다.
-SegmentEtas = Mapping[tuple[str, int], tuple[VehicleEta, ...]]
 
 
 @dataclass(frozen=True)
@@ -123,18 +114,6 @@ def index_etas(reports: Iterable[EtaReport], *, evaluated_at: datetime, max_data
     )
 
 
-def index_segment_etas(
-    reports: Iterable[EtaReport], *, evaluated_at: datetime, max_data_age_seconds: float
-) -> dict[tuple[str, int], tuple[VehicleEta, ...]]:
-    """최근 스냅샷들의 응답을 같은 나이 규칙으로 절대 ETA로 바꿔 경유 위치별로 모은다. 스냅샷끼리 합치거나 고르지 않는다."""
-    grouped: dict[tuple[str, int], list[VehicleEta]] = defaultdict(list)
-    for report in reports:
-        eta, _ = build_absolute_eta(report, evaluated_at=evaluated_at, max_data_age_seconds=max_data_age_seconds)
-        if eta is not None:
-            grouped[(eta.pattern_id, eta.stop_order)].append(eta)
-    return {key: tuple(sorted(etas, key=_eta_order)) for key, etas in grouped.items()}
-
-
 def index_segment_durations(
     observations: Iterable[SegmentObservation],
     *,
@@ -186,7 +165,6 @@ def resolve_alight_eta(
     table: EtaTable,
     durations: SegmentDurations,
     policy: EvaluationPolicy,
-    segment_etas: SegmentEtas | None = None,
 ) -> tuple[VehicleEta | None, tuple[str, ...]]:
     """하차 정류소 ETA를 구성한다. 사용하지 못한 근거의 이유는 보완에 성공해도 함께 반환한다."""
     provider_eta, provider_reason = _provider_alight_eta(ride, board_eta, table)
@@ -200,31 +178,7 @@ def resolve_alight_eta(
     )
     if seconds is None:
         reasons.add(segment_reason)
-        chained, chain_counts, chain_reason = provider_segment_seconds(ride, table, segment_etas)
-        if chained is None:
-            reasons.add(chain_reason)
-            return None, tuple(sorted(reasons))
-        reasons.add(ALIGHT_ETA_BY_PROVIDER_SEGMENTS)
-        return (
-            VehicleEta(
-                pattern_id=ride.pattern_id,
-                stop_id=ride.alight_stop_id,
-                stop_order=ride.alight_position,
-                vehicle_id=board_eta.vehicle_id,
-                run_key=board_eta.run_key,
-                predicted_arrival_at=board_eta.predicted_arrival_at + timedelta(seconds=chained),
-                eta_source="provider_segments",
-                model_version=PROVIDER_SEGMENTS_MODEL_VERSION,
-                horizon_seconds=board_eta.horizon_seconds + chained,
-                basis_at=board_eta.basis_at,
-                source_generated_at=board_eta.source_generated_at,
-                collected_at=board_eta.collected_at,
-                source_ref=board_eta.source_ref,
-                segment_sample_counts=chain_counts,
-                basis_source=board_eta.basis_source,
-            ),
-            tuple(sorted(reasons)),
-        )
+        return None, tuple(sorted(reasons))
 
     return (
         VehicleEta(
@@ -256,15 +210,9 @@ def build_ride_legs(
     start_at: datetime,
     queried_stop_ids: frozenset[str],
     policy: EvaluationPolicy,
-    segment_etas: SegmentEtas | None = None,
 ) -> RideLegs:
-    """정적 탑승 구간의 차량 옵션을 도착 예상 순서로 구성한다. 응답에 없는 차량을 운행 없음으로 해석하지 않는다.
-
-    승차 정류소 응답에 없는 뒤 차량(다음 차)은 상류 정류소 응답과 구간 연결로 만든 승차 ETA를 옵션에 더한다
-    (following_board_etas, 사유 board_eta_by_provider_segments).
-    """
-    listed = table.by_position.get((ride.pattern_id, ride.board_position, ride.board_stop_id), ())
-    board_etas = tuple(sorted((*listed, *following_board_etas(ride, table, segment_etas)), key=_eta_order))
+    """정적 탑승 구간의 차량 옵션을 도착 예상 순서로 구성한다. 응답에 없는 차량을 운행 없음으로 해석하지 않는다."""
+    board_etas = table.by_position.get((ride.pattern_id, ride.board_position, ride.board_stop_id), ())
     horizon_end_at = start_at + timedelta(seconds=policy.search_horizon_seconds)
     legs: list[TimedLeg] = []
     horizon_excluded = 0
@@ -272,9 +220,7 @@ def build_ride_legs(
         if board_eta.predicted_arrival_at > horizon_end_at:
             horizon_excluded += 1
             continue
-        alight_eta, leg_reasons = resolve_alight_eta(ride, board_eta, table, durations, policy, segment_etas)
-        if board_eta.eta_source == "provider_segments":
-            leg_reasons = tuple(sorted({*leg_reasons, BOARD_ETA_BY_PROVIDER_SEGMENTS}))
+        alight_eta, leg_reasons = resolve_alight_eta(ride, board_eta, table, durations, policy)
         legs.append(
             TimedLeg(
                 route_id=ride.route_id,
@@ -314,96 +260,6 @@ def _eta_order(eta: VehicleEta) -> tuple:
 
 
 ALIGHT_LINKED_WITHOUT_RUN_KEY = "alight_linked_by_vehicle_without_run_key"
-ALIGHT_ETA_BY_PROVIDER_SEGMENTS = "alight_eta_by_provider_segments"
-BOARD_ETA_BY_PROVIDER_SEGMENTS = "board_eta_by_provider_segments"
-PROVIDER_SEGMENT_MISSING = "provider_segment_missing"
-PROVIDER_SEGMENTS_MODEL_VERSION = "provider-segments/1"
-
-
-def following_board_etas(ride: StaticRide, table: EtaTable, segment_etas: SegmentEtas | None = None,
-                         ) -> list[VehicleEta]:
-    """승차 정류소 응답에 없는 뒤 차량의 승차 ETA. 상류 정류소(같은 패턴, 승차 순번 앞)에 나온 차량마다 승차 정류소에
-    가장 가까운 상류 예측에서 구간 연결로 승차 정류소까지 잇는다. 차량번호가 없거나 연결이 끊기면 만들지 않는다.
-
-    대전시 도착정보는 정류소마다 노선별 가장 가까운 차량만 주므로, 다음 차의 예측은 다음 차와 바로 앞 차 사이 정류소에만
-    나온다(그 정류소들은 노선 위치로 골라 수집한다, workflows.search.next_vehicle_upstream_stops).
-    """
-    listed = table.by_position.get((ride.pattern_id, ride.board_position, ride.board_stop_id), ())
-    listed_vehicles = {eta.vehicle_id for eta in listed if eta.vehicle_id is not None}
-    nearest: dict[str, VehicleEta] = {}
-    for (pattern_id, stop_order, _), etas in table.by_position.items():
-        if pattern_id != ride.pattern_id or stop_order >= ride.board_position:
-            continue
-        for eta in etas:
-            if eta.vehicle_id is None or eta.vehicle_id in listed_vehicles:
-                continue
-            current = nearest.get(eta.vehicle_id)
-            if current is None or eta.stop_order > current.stop_order:
-                nearest[eta.vehicle_id] = eta
-    result: list[VehicleEta] = []
-    for vehicle_id, upstream in sorted(nearest.items()):
-        approach = StaticRide(route_id=ride.route_id, pattern_id=ride.pattern_id, direction=ride.direction,
-                              board_stop_id=upstream.stop_id, board_position=upstream.stop_order,
-                              alight_stop_id=ride.board_stop_id, alight_position=ride.board_position)
-        seconds, counts, _ = provider_segment_seconds(approach, table, segment_etas)
-        if seconds is None:
-            continue
-        hops = ride.board_position - upstream.stop_order
-        result.append(VehicleEta(
-            pattern_id=ride.pattern_id, stop_id=ride.board_stop_id, stop_order=ride.board_position,
-            vehicle_id=vehicle_id, run_key=upstream.run_key,
-            predicted_arrival_at=upstream.predicted_arrival_at + timedelta(seconds=seconds),
-            eta_source="provider_segments", model_version=PROVIDER_SEGMENTS_MODEL_VERSION,
-            horizon_seconds=upstream.horizon_seconds + seconds, basis_at=upstream.basis_at,
-            source_generated_at=upstream.source_generated_at, collected_at=upstream.collected_at,
-            source_ref=upstream.source_ref, segment_sample_counts=counts, basis_source=upstream.basis_source,
-            stops_away=None if upstream.stops_away is None else upstream.stops_away + hops,
-        ))
-    return result
-
-
-def _same_run_next_stop(first: VehicleEta, second: VehicleEta) -> bool:
-    """두 응답이 같은 차량의 같은 운행에서 바로 다음 정류소 예측인지. 회차 키가 없으면 남은 정류장 수 차이 1로 확인한다."""
-    if first.vehicle_id is None or first.vehicle_id != second.vehicle_id:
-        return False
-    if first.run_key is not None or second.run_key is not None:
-        return first.run_key == second.run_key
-    return first.stops_away is not None and second.stops_away is not None and second.stops_away - first.stops_away == 1
-
-
-def provider_segment_seconds(
-    ride: StaticRide, table: EtaTable, segment_etas: SegmentEtas | None = None
-) -> tuple[float | None, tuple[int, ...], str | None]:
-    """승차 위치부터 하차 위치까지 인접 정류소 쌍마다 제공 ETA 차이로 구간시간을 만들어 더한다.
-
-    segment_etas(허용 나이 이내 최근 스냅샷 전체)를 주면 그것을, 없으면 최신 스냅샷(table)만 쓴다. 지금 두 정류소 사이에
-    다른 차량이 있어 최신 스냅샷에 같은 차량 쌍이 없어도, 이전 스냅샷의 같은 쌍으로 채울 수 있다. 같은 운행 확인
-    (남은 정류장 수 차이 1)은 같은 시점 응답끼리만 맞으므로 스냅샷을 섞어도 어긋난 쌍은 쓰지 않는다.
-    한 쌍에서 확인된 차이가 여럿이면 중앙값을 쓴다. 한 쌍이라도 근거가 없거나 시각 순서가 맞지 않으면 합을 완성하지
-    않는다. (합계 초, 쌍별 사용 차이 수, 실패 이유).
-    """
-    at: dict[int, list[VehicleEta]] = defaultdict(list)
-    if segment_etas:
-        for stop_order in range(ride.board_position, ride.alight_position + 1):
-            at[stop_order].extend(segment_etas.get((ride.pattern_id, stop_order), ()))
-    else:
-        for (pattern_id, stop_order, _), etas in table.by_position.items():
-            if pattern_id == ride.pattern_id and ride.board_position <= stop_order <= ride.alight_position:
-                at[stop_order].extend(etas)
-    total = 0.0
-    counts: list[int] = []
-    for stop_order in range(ride.board_position, ride.alight_position):
-        deltas = [
-            (later.predicted_arrival_at - earlier.predicted_arrival_at).total_seconds()
-            for earlier in at.get(stop_order, ())
-            for later in at.get(stop_order + 1, ())
-            if _same_run_next_stop(earlier, later) and later.predicted_arrival_at > earlier.predicted_arrival_at
-        ]
-        if not deltas:
-            return None, tuple(counts), PROVIDER_SEGMENT_MISSING
-        total += median(deltas)
-        counts.append(len(deltas))
-    return total, tuple(counts), None
 
 
 def _provider_alight_eta(

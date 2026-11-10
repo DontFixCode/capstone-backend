@@ -7,9 +7,8 @@
   유효기간이 지나면 자동으로 해제된다(Notion DB-C01).
 - 화면 조회: GET /routes/{id}/positions·/stops/{id}/arrivals가 등록한 app.realtime_view_targets 중 만료 전 대상
   (기본 30분, 재조회 시 연장). 만료되면 집계에서 빠지고 다른 수요가 있으면 그 수요로 수집이 이어진다.
-- 활성 이동: 재평가가 예약된 active journeys의 선택 경로 중 남은 버스 구간 승하차·경유 정류소·노선, 다음에 탈 구간의
-  다음 차와 승차 정류소 사이 정류소(노선 위치 기준). 백그라운드·연결 단절에도 유지하고, 사용자가 완료·취소하면(예약
-  해제) 빠진다.
+- 활성 이동: 재평가가 예약된 active journeys의 선택 경로 중 남은 버스 구간 승하차 정류소·노선. 백그라운드·연결 단절에도
+  유지하고, 사용자가 완료·취소하면(예약 해제) 빠진다.
 같은 조회 조건은 출처가 여러 개여도 한 번만 수집한다.
 """
 
@@ -50,23 +49,14 @@ def search_targets(conn: psycopg.Connection, now: datetime) -> list[RealtimeTarg
     return targets
 
 
-def journey_targets(conn: psycopg.Connection, settings: Settings | None = None,
-                    now: datetime | None = None) -> list[RealtimeTarget]:
-    """재평가가 예약된 활성 이동의 남은 버스 구간 대상. 앱 연결 여부와 무관하게 유지하고, 완료·취소되면 빠진다.
-
-    설정·시각을 주면 다음에 탈 구간의 다음 차와 승차 정류소 사이 정류소도 넣는다(노선 위치 공개본 기준).
-    """
+def journey_targets(conn: psycopg.Connection) -> list[RealtimeTarget]:
+    """재평가가 예약된 활성 이동의 남은 버스 구간 대상. 앱 연결 여부와 무관하게 유지하고, 완료·취소되면 빠진다."""
     from app.workflows.guidance import journey_targets as targets_for
-    from app.workflows.guidance import upstream_lookup
 
-    upstream = None
-    if settings is not None and now is not None and settings.eval_max_data_age_seconds is not None:
-        upstream = upstream_lookup(conn, now=now, interval_seconds=settings.realtime_interval_seconds,
-                                   max_age_seconds=settings.eval_max_data_age_seconds)
     targets: list[RealtimeTarget] = []
     for row in journey_repository.active_journey_snapshots(conn):
         targets.extend(targets_for(row["selected_snapshot"] or {}, row["current_progress"] or {},
-                                   row["movement_state"], f"{JOURNEY_SOURCE}:{row['id']}", upstream))
+                                   row["movement_state"], f"{JOURNEY_SOURCE}:{row['id']}"))
     return targets
 
 
@@ -86,6 +76,6 @@ def collection_targets(settings: Settings, conn: psycopg.Connection | None = Non
     groups = [configured_targets(settings)]
     if conn is not None and now is not None:
         groups.append(search_targets(conn, now))
-        groups.append(journey_targets(conn, settings, now))
+        groups.append(journey_targets(conn))
         groups.append(view_targets(conn, now))
     return merge_targets(groups)
