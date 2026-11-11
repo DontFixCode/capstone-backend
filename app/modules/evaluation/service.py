@@ -32,6 +32,7 @@ from app.modules.evaluation.schemas import (
     EvaluationInputs,
     EvaluationPolicy,
     EvaluationResult,
+    GapAnchor,
     PlannedJourney,
     RideLegs,
     TimedLeg,
@@ -52,6 +53,7 @@ class _SharedData:
     walks: dict[tuple[str, str], WalkResult]
     etas: EtaTable
     durations: dict[tuple[str, int], tuple[float, ...]]
+    gap_anchors: dict[tuple[str, int, str], GapAnchor] = field(default_factory=dict)
     ride_legs: dict[tuple[str, int, int], RideLegs] = field(default_factory=dict)
     recovery_search_truncated: bool = False
 
@@ -84,6 +86,10 @@ def evaluate_candidates(
             max_data_age_seconds=policy.max_data_age_seconds,
         ),
         durations=index_segment_durations(inputs.segment_observations, condition_key=inputs.sample_condition_key),
+        gap_anchors={
+            (anchor.pattern_id, anchor.target_stop_order, anchor.trailing_vehicle_id): anchor
+            for anchor in inputs.gap_anchors
+        },
     )
     recovery_options = _recovery_provider(shared, search_index, monotonic)
     deadline = monotonic() + policy.evaluation_budget_ms / 1000
@@ -144,6 +150,8 @@ def _ride_legs(ride: StaticRide, shared: _SharedData) -> RideLegs:
             start_at=shared.context.start_at,
             queried_stop_ids=shared.inputs.queried_stop_ids,
             policy=shared.policy,
+            anchors=shared.gap_anchors,
+            evaluated_at=shared.context.evaluated_at,
         )
     return shared.ride_legs[key]
 

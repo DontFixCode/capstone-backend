@@ -26,7 +26,8 @@ ORIGIN_REF = "@origin"
 DESTINATION_REF = "@destination"
 
 # 거리 비례 추정(route_average_ratio)은 단위·운행 범위 검증 전이라 값에 포함하지 않는다.
-EtaSource = Literal["provider", "historical_segments"]
+# leading_vehicle_gap: 앞차 ETA 기반 후행 차량 도착시각 근사(Phase 3B, 검증 전, app.modules.evaluation.eta).
+EtaSource = Literal["provider", "historical_segments", "leading_vehicle_gap"]
 TimeStatus = Literal["available", "partial", "unavailable"]
 ConnectionStatus = Literal["feasible", "negative_slack", "time_unknown", "confirmed_infeasible"]
 WalkStatus = Literal["available", "no_route", "lookup_failed"]
@@ -203,6 +204,21 @@ class JointScene(FrozenSchema):
     rides: tuple[SceneRide, ...]
 
 
+class GapAnchor(FrozenSchema):
+    """앞차 ETA 기반 근사(Phase 3B)의 차량 조합. 목표 정류소 D에 먼저 도착할 앞차 A, A가 마지막으로 통과한 경유 위치 X,
+    X에 접근 중인 후행 차량 B. 호출자가 같은 패턴에서 B → X → A → D 순서를 확인해 고른다."""
+
+    pattern_id: str
+    target_stop_id: str
+    target_stop_order: int
+    trailing_vehicle_id: str
+    leading_vehicle_id: str
+    anchor_stop_id: str
+    anchor_stop_order: int
+    # 순서 판정에 쓴 원천 관측 참조.
+    source_ref: str | None = None
+
+
 class EvaluationInputs(FrozenSchema):
     """호출자가 준비한 평가 자료. 같은 입력이면 같은 계산 결과를 재현한다."""
 
@@ -216,6 +232,8 @@ class EvaluationInputs(FrozenSchema):
     segment_observations: tuple[SegmentObservation, ...] = ()
     transfer_error_samples: tuple[TransferErrorSample, ...] = ()
     joint_scenes: tuple[JointScene, ...] = ()
+    # 앞차 ETA 기반 하차 ETA 근사의 차량 조합. 비면 이 근사를 쓰지 않는다.
+    gap_anchors: tuple[GapAnchor, ...] = ()
 
 
 class TimedLeg(FrozenSchema):

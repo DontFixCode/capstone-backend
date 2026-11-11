@@ -1,7 +1,8 @@
 """차량별 절대 ETA 구성과 관측 기반 하차 ETA 보완을 담당한다.
 
-하차 ETA는 같은 차량·회차의 제공 ETA → 적격 관측 구간 소요시간 순으로 구성하고, 근거가 없으면 None과 이유를
-반환한다. 거리 비례 추정은 시간·거리 단위와 운행 범위를 검증하기 전이므로 구현하지 않고 비활성으로 둔다.
+하차 ETA는 같은 차량·회차의 제공 ETA → 적격 관측 구간 소요시간 → 앞차 ETA 기반 근사(Phase 3B) 순으로 구성하고,
+근거가 없으면 None과 이유를 반환한다. 거리 비례 추정은 시간·거리 단위와 운행 범위를 검증하기 전이므로 구현하지 않고
+비활성으로 둔다.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from statistics import median
 from app.modules.evaluation.schemas import (
     EtaReport,
     EvaluationPolicy,
+    GapAnchor,
     RideLegs,
     SegmentObservation,
     TimedLeg,
@@ -23,6 +25,8 @@ from app.modules.evaluation.schemas import (
 from app.modules.routing.schemas import StaticRide
 
 SegmentDurations = Mapping[tuple[str, int], tuple[float, ...]]
+# (pattern_id, 목표 stop_order, 후행 차량 B) → 앞차 ETA 기반 근사의 차량 조합.
+GapAnchors = Mapping[tuple[str, int, str], GapAnchor]
 
 
 @dataclass(frozen=True)
@@ -165,6 +169,8 @@ def resolve_alight_eta(
     table: EtaTable,
     durations: SegmentDurations,
     policy: EvaluationPolicy,
+    anchors: GapAnchors | None = None,
+    evaluated_at: datetime | None = None,
 ) -> tuple[VehicleEta | None, tuple[str, ...]]:
     """하차 정류소 ETA를 구성한다. 사용하지 못한 근거의 이유는 보완에 성공해도 함께 반환한다."""
     provider_eta, provider_reason = _provider_alight_eta(ride, board_eta, table)
@@ -178,7 +184,12 @@ def resolve_alight_eta(
     )
     if seconds is None:
         reasons.add(segment_reason)
-        return None, tuple(sorted(reasons))
+        anchor = (anchors or {}).get((ride.pattern_id, ride.alight_position, board_eta.vehicle_id))
+        if anchor is None or evaluated_at is None:
+            return None, tuple(sorted(reasons))
+        gap_eta, gap_reason = leading_vehicle_gap_eta(ride, board_eta, table, anchor, evaluated_at)
+        reasons.add(ALIGHT_ETA_BY_LEADING_VEHICLE_GAP if gap_eta is not None else gap_reason)
+        return gap_eta, tuple(sorted(reasons))
 
     return (
         VehicleEta(
@@ -210,6 +221,8 @@ def build_ride_legs(
     start_at: datetime,
     queried_stop_ids: frozenset[str],
     policy: EvaluationPolicy,
+    anchors: GapAnchors | None = None,
+    evaluated_at: datetime | None = None,
 ) -> RideLegs:
     """정적 탑승 구간의 차량 옵션을 도착 예상 순서로 구성한다. 응답에 없는 차량을 운행 없음으로 해석하지 않는다."""
     board_etas = table.by_position.get((ride.pattern_id, ride.board_position, ride.board_stop_id), ())
@@ -220,7 +233,7 @@ def build_ride_legs(
         if board_eta.predicted_arrival_at > horizon_end_at:
             horizon_excluded += 1
             continue
-        alight_eta, leg_reasons = resolve_alight_eta(ride, board_eta, table, durations, policy)
+        alight_eta, leg_reasons = resolve_alight_eta(ride, board_eta, table, durations, policy, anchors, evaluated_at)
         legs.append(
             TimedLeg(
                 route_id=ride.route_id,
@@ -260,6 +273,65 @@ def _eta_order(eta: VehicleEta) -> tuple:
 
 
 ALIGHT_LINKED_WITHOUT_RUN_KEY = "alight_linked_by_vehicle_without_run_key"
+ALIGHT_ETA_BY_LEADING_VEHICLE_GAP = "alight_eta_by_leading_vehicle_gap"
+# A의 X 통과시각 근거가 없어 경과분을 0으로 둔 근사(MVP 대체). 보정한 근사와 표본을 섞지 않도록 모델 버전에 남긴다.
+LEADING_VEHICLE_GAP_MODEL_VERSION = "leading-vehicle-gap/1;passage-uncorrected"
+
+
+def leading_vehicle_gap_eta(
+    ride: StaticRide,
+    board_eta: VehicleEta,
+    table: EtaTable,
+    anchor: GapAnchor,
+    evaluated_at: datetime,
+) -> tuple[VehicleEta | None, str | None]:
+    """앞차 ETA 기반 후행 차량 하차 ETA(Phase 3B, 검증 전). R_B(D;t0) = R_A(D;t0) + R_B(X;t0) + Δ_A(X).
+
+    A는 하차 정류소 D에 먼저 도착할 앞차, X는 A가 마지막으로 통과한 경유 위치, B는 탈 차량(board_eta)이다. X의 도착
+    목록에서 B가 가장 먼저 도착할 차량이고 진행 위치가 승차 예측과 맞을 때만 쓴다. A의 X 통과시각 근거(동일 차량·경유
+    위치의 검증된 이벤트)가 없으므로 Δ_A(X)=0(MVP 대체)이다. 여러 정류소의 누적 ETA는 더하지 않는다.
+    """
+    leading = [
+        eta
+        for eta in table.by_position.get((ride.pattern_id, anchor.target_stop_order, anchor.target_stop_id), ())
+        if eta.vehicle_id == anchor.leading_vehicle_id
+    ]
+    if not leading or anchor.leading_vehicle_id == board_eta.vehicle_id:
+        return None, "leading_gap_leading_eta_absent"
+    at_anchor = table.by_position.get((ride.pattern_id, anchor.anchor_stop_order, anchor.anchor_stop_id), ())
+    if not at_anchor or (at_anchor[0].vehicle_id, at_anchor[0].run_key) != (board_eta.vehicle_id, board_eta.run_key):
+        return None, "leading_gap_trailing_eta_absent"
+    a, x = leading[0], at_anchor[0]
+    hops = anchor.anchor_stop_order - ride.board_position
+    if x.stops_away is not None and board_eta.stops_away is not None and x.stops_away - board_eta.stops_away != hops:
+        return None, "leading_gap_progress_mismatch"
+    leading_remaining = (a.predicted_arrival_at - evaluated_at).total_seconds()
+    trailing_remaining = (x.predicted_arrival_at - evaluated_at).total_seconds()
+    if leading_remaining < 0 or trailing_remaining < 0:
+        return None, "leading_gap_eta_before_evaluation"
+    remaining = leading_remaining + trailing_remaining
+    predicted = evaluated_at + timedelta(seconds=remaining)
+    if predicted <= board_eta.predicted_arrival_at:
+        return None, "leading_gap_order_inconsistent"
+    return (
+        VehicleEta(
+            pattern_id=ride.pattern_id,
+            stop_id=ride.alight_stop_id,
+            stop_order=ride.alight_position,
+            vehicle_id=board_eta.vehicle_id,
+            run_key=board_eta.run_key,
+            predicted_arrival_at=predicted,
+            eta_source="leading_vehicle_gap",
+            model_version=LEADING_VEHICLE_GAP_MODEL_VERSION,
+            horizon_seconds=remaining,
+            basis_at=evaluated_at,
+            source_generated_at=None,
+            collected_at=max(a.collected_at, x.collected_at),
+            source_ref=f"leading_vehicle_gap|A:{a.source_ref}|X:{x.source_ref}|order:{anchor.source_ref}",
+            basis_source=a.basis_source if a.basis_source == x.basis_source else None,
+        ),
+        None,
+    )
 
 
 def _provider_alight_eta(

@@ -8,6 +8,8 @@ recommendation.recommend_candidates)를 그대로 호출하고, 이 모듈은 �
   경로 없음·조회 실패·시간 미확인(미조회)을 구분하고 미확인 도보시간을 0으로 채우지 않는다.
 - 실시간 대상(승하차 정류소 도착·노선 위치)은 검색 행(summary.realtime_targets, expires_at)에 등록해 워커가 공유 수집하고,
   검색 시점에는 같은 Phase 2 수집기(RealtimeCollector)로 간격 이내 공개값은 재사용·부족한 대상만 조회한다.
+- 직접 ETA·관측 구간시간으로 하차 ETA를 만들지 못한 차량만 앞차 ETA 기반 근사(Phase 3B)의 기준점 X 도착정보를 검색
+  시점에 한 번 추가 조회한다(정류소별 한 번, 같은 수집기). X는 그 시점 차량 위치로 정해지므로 워커 수집 대상에는 넣지 않는다.
 - TAGO 도착정보는 기준시각이 확인되지 않아(eta_basis_at=NULL) 기본 정책(unconfirmed)에서는 그대로 전달한다
   (2026-11-07 결정). 수신 시각 근사(BACKEND_TAGO_ETA_BASIS_POLICY=server_received_at)는 Notion DB-C04에 따라 검증한
   뒤에만 켜며, 켜면 기준 출처·정책 버전이 결과와 표본 조건 키에 함께 남는다(app.modules.transit.eta_basis).
@@ -36,6 +38,7 @@ from app.integrations.daejeon_bus_api import DaejeonBusClient
 from app.integrations.walking_api import PROVIDER as WALK_PROVIDER, TmapWalkingClient, WalkQuery, WalkResponse
 from app.modules.evaluation import repository as evaluation_repository
 from app.modules.evaluation import samples as sample_rules
+from app.modules.evaluation.eta import build_ride_legs, index_etas, index_segment_durations
 from app.modules.evaluation.schemas import (
     DESTINATION_REF,
     ORIGIN_REF,
@@ -44,6 +47,7 @@ from app.modules.evaluation.schemas import (
     EvaluationInputs,
     EvaluationPolicy,
     EvaluationResult,
+    GapAnchor,
     ObservedEvent,
     SegmentObservation,
     WalkResult,
@@ -377,6 +381,8 @@ class RealtimeInputs:
     target_states: dict[str, dict[str, Any]]
     batch_refs: list[tuple[str, str | None]]
     rejected: dict[str, int]
+    # 평가 허용 나이 이내 노선 위치 관측. 앞차 ETA 기반 근사의 차량 순서 판정에만 쓴다(위치에는 시각이 없다).
+    positions: list[dict[str, Any]] = field(default_factory=list)
 
 
 IN_PROGRESS_RETRIES = 3
@@ -430,6 +436,7 @@ def realtime_inputs(conn, targets: list[RealtimeTarget], network: StaticNetwork,
     states: dict[str, dict[str, Any]] = {}
     refs: list[tuple[str, str | None]] = []
     rejected: Counter[str] = Counter()
+    positions: list[dict[str, Any]] = []
     for target in targets:
         snap: LatestSnapshot = transit_service.latest_snapshot(conn, target, interval_seconds=interval_seconds, now=now)
         states[snap.target_key] = {
@@ -441,6 +448,8 @@ def realtime_inputs(conn, targets: list[RealtimeTarget], network: StaticNetwork,
             "within_evaluation_age": snap.age_seconds is not None and snap.age_seconds <= max_data_age_seconds,
         }
         refs.append((snap.target_key, str(snap.batch_key) if snap.batch_key else None))
+        if target.kind == "positions" and states[snap.target_key]["within_evaluation_age"]:
+            positions.extend(snap.observations)
         if target.kind != "arrivals" or snap.batch_key is None:
             continue
         if states[snap.target_key]["within_evaluation_age"]:
@@ -465,7 +474,52 @@ def realtime_inputs(conn, targets: list[RealtimeTarget], network: StaticNetwork,
                 source_generated_at=obs["source_generated_at"], collected_at=obs["collected_at"],
                 source_ref=f"transit_observation:{obs['id']}|batch:{snap.batch_key}",
             ))
-    return RealtimeInputs(reports, frozenset(queried), states, refs, dict(rejected))
+    return RealtimeInputs(reports, frozenset(queried), states, refs, dict(rejected), positions)
+
+
+def leading_gap_anchors(candidates: Iterable[StaticCandidate], realtime: RealtimeInputs,
+                        segments: Iterable[SegmentObservation], *, cohort: str, context: SearchContext,
+                        policy: EvaluationPolicy) -> list[GapAnchor]:
+    """앞차 ETA 기반 근사(Phase 3B)의 차량 조합을 고른다(설계 PREPARE_GAP_INPUTS).
+
+    직접 ETA·관측 구간시간으로 하차 ETA를 만들지 못한 (탈 차량 B, 하차 정류소 D)마다 D의 선두 차량 A와, 노선 위치에서
+    A가 마지막으로 통과한 경유 위치 X를 고른다. 같은 패턴에서 위치가 하나로 확인된 A·B만 쓰고 B 위치 < X(A 위치) < D
+    순서를 확인한다. 위치는 순서 판정에만 쓰고 시각은 도착정보로만 구한다(eta.leading_vehicle_gap_eta).
+    """
+    table = index_etas(realtime.eta_reports, evaluated_at=context.evaluated_at,
+                       max_data_age_seconds=policy.max_data_age_seconds)
+    durations = index_segment_durations(segments, condition_key=cohort)
+    located: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for obs in realtime.positions:
+        if obs["pattern_key"] and obs["stop_seq"] is not None and obs["vehicle_no"]:
+            located.setdefault((obs["pattern_key"], obs["vehicle_no"]), []).append(obs)
+    rides = {(r.pattern_id, r.board_position, r.alight_position): r for c in candidates for r in c.rides}
+    anchors: dict[tuple[str, int, str], GapAnchor] = {}
+    for key in sorted(rides):
+        ride = rides[key]
+        at_target = table.by_position.get((ride.pattern_id, ride.alight_position, ride.alight_stop_id), ())
+        leading = at_target[0].vehicle_id if at_target else None
+        if leading is None:
+            continue
+        legs = build_ride_legs(ride, table, durations, start_at=context.start_at,
+                               queried_stop_ids=realtime.queried_stop_ids, policy=policy)
+        for leg in legs.legs:
+            trailing = leg.vehicle_id
+            if leg.alight_eta is not None or trailing is None or trailing == leading:
+                continue
+            a_at = located.get((ride.pattern_id, leading), [])
+            b_at = located.get((ride.pattern_id, trailing), [])
+            if len(a_at) != 1 or len(b_at) != 1 or a_at[0]["stop_external_id"] is None:
+                continue
+            x_seq = a_at[0]["stop_seq"]
+            if not b_at[0]["stop_seq"] < x_seq < ride.alight_position:
+                continue
+            anchors[(ride.pattern_id, ride.alight_position, trailing)] = GapAnchor(
+                pattern_id=ride.pattern_id, target_stop_id=ride.alight_stop_id, target_stop_order=ride.alight_position,
+                trailing_vehicle_id=trailing, leading_vehicle_id=leading, anchor_stop_id=a_at[0]["stop_external_id"],
+                anchor_stop_order=x_seq,
+                source_ref=f"transit_observation:{a_at[0]['id']},{b_at[0]['id']}")
+    return [anchors[key] for key in sorted(anchors)]
 
 
 def segment_observations(conn, pattern_keys: Iterable[str], condition: str, until: datetime) -> list[SegmentObservation]:
@@ -796,6 +850,30 @@ class SearchWorkflow:
                                               summary=_jsonable(summary))
         return SearchOutcome(search_id, status, "nominal", summary["static_version"], None, None, None, summary, 0)
 
+    def _leading_gap_targets(self, network: StaticNetwork, context: SearchContext, result: CandidateSearchResult,
+                             targets: list[RealtimeTarget]) -> list[RealtimeTarget]:
+        """1차 수집값으로 앞차 ETA 기반 근사가 필요한 차량 조합을 고르고, 아직 조회 대상이 아닌 기준점 X만 돌려준다.
+
+        보완 시도당 X는 하나이고, 여러 후보가 같은 X를 쓰면 한 번만 조회한다.
+        """
+        config, policy = self.config, self.config.evaluation_policy
+        now = self.clock()
+        probe = context.model_copy(update={"evaluated_at": max(now, context.evaluated_at)})
+        cohort = sample_rules.condition_key("tago", policy, config.eta_basis_policy)
+        with self.db.transaction(isolation="REPEATABLE READ") as conn:
+            realtime = realtime_inputs(conn, targets, network, now=now,
+                                       interval_seconds=config.realtime_interval_seconds,
+                                       max_data_age_seconds=policy.max_data_age_seconds,
+                                       eta_basis_policy=config.eta_basis_policy)
+            segments = segment_observations(conn, [r.pattern_id for c in result.candidates for r in c.rides],
+                                            cohort, until=probe.evaluated_at)
+        anchors = leading_gap_anchors(result.candidates, realtime, segments, cohort=cohort, context=probe,
+                                      policy=policy)
+        known = {t.external_id for t in targets if t.kind == "arrivals"}
+        source = frozenset({"route_search"})
+        return [RealtimeTarget("arrivals", stop, source)
+                for stop in sorted({a.anchor_stop_id for a in anchors} - known)]
+
     def _evaluate_and_save(self, search_id, request, network, context, result, index, targets, summary) -> SearchOutcome:
         config, policy = self.config, self.config.evaluation_policy
         stops = {s.external_id: s for s in network.stops}
@@ -812,6 +890,13 @@ class SearchWorkflow:
             summary["realtime_collection"] = collect_targets(self.db, self.tago_client, targets,
                                                              config.realtime_interval_seconds, self.clock,
                                                              daejeon_client=self.daejeon_client)
+            if self.daejeon_client is not None and self.realtime_provider is None:
+                extra = self._leading_gap_targets(network, context, result, targets)
+                if extra:
+                    summary["leading_gap_collection"] = collect_targets(
+                        self.db, self.tago_client, extra, config.realtime_interval_seconds, self.clock,
+                        daejeon_client=self.daejeon_client)
+                    targets = transit_service.merge_targets([targets, extra])
         cohort = sample_rules.condition_key("tago", policy, config.eta_basis_policy)
         now = self.clock()
         # 계산 시각(evaluated_at)은 입력을 확정한 시점이다. 검색 중 수집한 응답이 계획 시점보다 늦게 도착하므로
@@ -835,8 +920,12 @@ class SearchWorkflow:
                 evaluation_repository.labeled_samples(conn, cohort, before=context.evaluated_at))
             scenes = sample_rules.joint_scenes(
                 evaluation_repository.complete_scenes(conn, cohort, before=context.evaluated_at))
+        anchors = leading_gap_anchors(result.candidates, realtime, segments, cohort=cohort, context=context,
+                                      policy=policy)
         summary["data_inputs"] = _jsonable(realtime.target_states)
         summary["eta_reports"] = {"usable_input_rows": len(realtime.eta_reports), "rejected": realtime.rejected}
+        summary["leading_gap_anchors"] = {"count": len(anchors),
+                                          "anchor_stops": sorted({a.anchor_stop_id for a in anchors})}
         summary["history_inputs"] = {"segment_observations": len(segments), "transfer_error_samples":
                                      len(error_samples), "joint_scenes": len(scenes), "cohort_key": cohort}
         data_snapshot_id = hashlib.sha256(json.dumps([str(network.data_version), sorted(realtime.batch_refs, key=str)],
@@ -848,7 +937,7 @@ class SearchWorkflow:
             walks=tuple(w for w in (lookup.as_walk_result() for lookup in walks.values()) if w is not None),
             eta_reports=tuple(realtime.eta_reports), queried_stop_ids=realtime.queried_stop_ids,
             segment_observations=tuple(segments), transfer_error_samples=tuple(error_samples),
-            joint_scenes=tuple(scenes),
+            joint_scenes=tuple(scenes), gap_anchors=tuple(anchors),
         )
         evaluation = evaluate_candidates(result, context, inputs, policy,
                                          search_index=index if policy.recovery_search else None)
