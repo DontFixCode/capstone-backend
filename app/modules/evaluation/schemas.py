@@ -232,7 +232,7 @@ class EvaluationInputs(FrozenSchema):
     segment_observations: tuple[SegmentObservation, ...] = ()
     transfer_error_samples: tuple[TransferErrorSample, ...] = ()
     joint_scenes: tuple[JointScene, ...] = ()
-    # 앞차 ETA 기반 하차 ETA 근사의 차량 조합. 비면 이 근사를 쓰지 않는다.
+    # 앞차 ETA 기반 승하차 ETA 근사의 차량 조합. 비면 이 근사를 쓰지 않는다.
     gap_anchors: tuple[GapAnchor, ...] = ()
 
 

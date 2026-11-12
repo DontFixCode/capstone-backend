@@ -11,7 +11,9 @@ from app.integrations.daejeon_bus_api import RawResponse, parse_arrivals
 from app.modules.evaluation.eta import (
     ALIGHT_ETA_BY_LEADING_VEHICLE_GAP,
     ALIGHT_LINKED_WITHOUT_RUN_KEY,
+    BOARD_ETA_BY_LEADING_VEHICLE_GAP,
     EtaTable,
+    build_ride_legs,
     resolve_alight_eta,
 )
 from app.modules.evaluation.schemas import EtaReport, EvaluationPolicy, GapAnchor, VehicleEta
@@ -191,6 +193,40 @@ class LeadingVehicleGapTest(unittest.TestCase):
         self.assertFalse(any(r.startswith("leading_gap") for r in reasons), "차량 조합이 없으면 기존 결과 그대로")
 
 
+class FollowingBoardGapTest(unittest.TestCase):
+    """Phase 3B 승차 정류소 적용: 승차 D(10)에 앞차 A만 나올 때 바로 뒤 B의 승차 ETA = R_A(D) + R_B(X), X(7)."""
+
+    AT, RIDE, POLICY, eta = (SameVehicleAlightTest.AT, SameVehicleAlightTest.RIDE, SameVehicleAlightTest.POLICY,
+                             SameVehicleAlightTest.eta)
+    B, A = "대전75자0001", "대전75자0002"
+
+    def legs(self, at_anchor):
+        board_anchor = GapAnchor(pattern_id="P", target_stop_id="A", target_stop_order=10, trailing_vehicle_id=self.B,
+                                 leading_vehicle_id=self.A, anchor_stop_id="X", anchor_stop_order=7, source_ref="pos")
+        alight_anchor = board_anchor.model_copy(update={"target_stop_id": "B", "target_stop_order": 15})
+        table = EtaTable(by_position={("P", 10, "A"): (self.eta("A", 10, 120, self.A, 3),),
+                                      ("P", 15, "B"): (self.eta("B", 15, 480, self.A, 8),),
+                                      ("P", 7, "X"): tuple(at_anchor)}, rejected_by_stop={}, rejected_counts={})
+        anchors = {(a.pattern_id, a.target_stop_order, a.trailing_vehicle_id): a for a in (board_anchor, alight_anchor)}
+        return build_ride_legs(self.RIDE, table, {}, start_at=self.AT, queried_stop_ids=frozenset({"A", "B", "X"}),
+                               policy=self.POLICY, anchors=anchors, evaluated_at=self.AT)
+
+    def test_adds_following_vehicle_option(self):
+        legs = self.legs([self.eta("X", 7, 200, self.B, 2)])
+        self.assertEqual([leg.vehicle_id for leg in legs.legs], [self.A, self.B], "앞차 옵션은 그대로, 뒤 차량 추가")
+        follow = legs.legs[1]
+        self.assertEqual((follow.vehicle_rank, follow.board_eta.eta_source, follow.board_eta.stops_away),
+                         (1, "leading_vehicle_gap", 5))
+        self.assertEqual(follow.board_eta.predicted_arrival_at, self.AT + timedelta(seconds=320), "2분 + 3분20초")
+        self.assertEqual(follow.alight_eta.predicted_arrival_at, self.AT + timedelta(seconds=680), "같은 X로 하차 근사")
+        self.assertIn(BOARD_ETA_BY_LEADING_VEHICLE_GAP, follow.reason_codes)
+
+    def test_no_following_option_when_anchor_vehicle_differs(self):
+        legs = self.legs([self.eta("X", 7, 200, "대전75자9999", 2)])
+        self.assertEqual([leg.vehicle_id for leg in legs.legs], [self.A])
+        self.assertIn("leading_gap_trailing_eta_absent", legs.reason_codes)
+
+
 class LeadingGapAnchorTest(unittest.TestCase):
     """하차 ETA가 없는 차량만, 노선 위치로 B 위치 < X(A 위치) < D를 확인해 기준점을 고른다."""
 
@@ -200,19 +236,21 @@ class LeadingGapAnchorTest(unittest.TestCase):
         return EtaReport(pattern_id="P", stop_id=stop, stop_order=order, vehicle_id=vehicle, run_key=None,
                          remaining_seconds=seconds, basis_at=self.AT, collected_at=self.AT, stops_away=stops_away)
 
-    def anchors(self, b_seq, a_seq):
-        positions = [{"id": 1, "pattern_key": "P", "stop_seq": a_seq, "vehicle_no": "대전75자0002",
-                      "stop_external_id": f"S{a_seq}"},
-                     {"id": 2, "pattern_key": "P", "stop_seq": b_seq, "vehicle_no": "대전75자0001",
-                      "stop_external_id": f"S{b_seq}"}]
-        realtime = flow.RealtimeInputs([self.report("A", 10, 120, "대전75자0001", 2),
-                                        self.report("B", 15, 480, "대전75자0002", 3)],
-                                       frozenset({"A", "B"}), {}, [], {}, positions)
+    def position(self, obs_id, seq, vehicle):
+        return {"id": obs_id, "pattern_key": "P", "stop_seq": seq, "vehicle_no": vehicle, "stop_external_id": f"S{seq}"}
+
+    def select(self, reports, positions, board_rides=frozenset()):
+        realtime = flow.RealtimeInputs(reports, frozenset({"A", "B"}), {}, [], {}, positions)
         candidate = build_static_candidate([self.RIDE], transfer_meters=[], access_straight_line_meters=None,
                                            egress_straight_line_meters=None)
         context = SearchContext(origin=Coordinate(lat=36.3, lon=127.4), destination=Coordinate(lat=36.4, lon=127.4),
                                 start_at=self.AT, evaluated_at=self.AT, static_snapshot_id="v")
-        return flow.leading_gap_anchors([candidate], realtime, [], cohort="c", context=context, policy=self.POLICY)
+        return flow.leading_gap_anchors([candidate], realtime, [], cohort="c", context=context, policy=self.POLICY,
+                                        board_rides=board_rides)
+
+    def anchors(self, b_seq, a_seq):
+        return self.select([self.report("A", 10, 120, "대전75자0001", 2), self.report("B", 15, 480, "대전75자0002", 3)],
+                        [self.position(1, a_seq, "대전75자0002"), self.position(2, b_seq, "대전75자0001")])
 
     def test_selects_last_passed_stop_of_leading_vehicle(self):
         [anchor] = self.anchors(b_seq=8, a_seq=12)
@@ -220,6 +258,17 @@ class LeadingGapAnchorTest(unittest.TestCase):
                           anchor.anchor_stop_order), ("대전75자0001", "대전75자0002", "S12", 12))
         self.assertEqual(self.anchors(b_seq=12, a_seq=12), [], "두 차량이 같은 정류장 사이면 쓰지 않음")
         self.assertEqual(self.anchors(b_seq=8, a_seq=15), [], "A가 이미 D에 있으면 X–D 구간이 없음")
+
+    def test_selects_vehicle_behind_leading_for_missed_board_ride(self):
+        a, b, c = "대전75자0002", "대전75자0001", "대전75자0003"
+        reports = [self.report("A", 10, 120, a, 2), self.report("B", 15, 480, a, 7)]
+        positions = [self.position(1, 8, a), self.position(2, 5, b), self.position(3, 3, c)]
+        self.assertEqual(self.select(reports, positions), [], "선두 차량을 놓치지 않는 구간은 고르지 않음")
+        anchors = self.select(reports, positions, board_rides={("P", 10)})
+        self.assertEqual([(x.target_stop_order, x.trailing_vehicle_id, x.leading_vehicle_id, x.anchor_stop_id)
+                          for x in anchors], [(10, b, a, "S8"), (15, b, a, "S8")], "승차·하차 모두 같은 X")
+        self.assertEqual(self.select(reports, [*positions, self.position(4, 8, "대전75자0004")], board_rides={("P", 10)}), [],
+                         "선두 차량과 같은 위치에 다른 차량이 있으면 순서가 모호")
 
 
 if __name__ == "__main__":
