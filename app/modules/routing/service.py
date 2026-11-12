@@ -169,6 +169,12 @@ def generate_candidates(
     예산을 다 쓰면 그때까지 찾은 후보를 보관하고 다음 라운드로 넘어가며, 잘린 범위를 반환한다.
 
     from_stop_id를 주면 출발지 좌표 대신 그 정류소와 환승 반경 안의 정류소에서 출발한다(실패 대응 재탐색).
+
+    한 번의 탑승에서 버스가 같은 곳(환승 반경 안)을 두 번 지나면 되돌아오는 구간을 타지 않는다. 순환·왕복 패턴은
+    목적지 근처를 갈 때(건너편 정류소)와 돌아올 때 두 번 지나는데, 목적지 반경에는 한쪽 정류소만 들 수 있다.
+    - 하차: 목적지 후보 정류소의 환승 반경 안 정류소를 같은 패턴이 더 일찍 지나면 그 위치도 하차 후보로 보고
+      (near_goals), 더 일찍 지나는 위치가 있는 뒤쪽 하차는 버린다(passes_earlier).
+    - 승차: 승차 정류소의 환승 반경 안 정류소를 하차 전에 다시 지나면 가장 늦게 지나는 위치에서 탄다(later_board).
     """
     if context.static_snapshot_id != index.snapshot_id:
         raise ValueError("탐색 인덱스와 검색 입력의 정적 스냅샷이 다릅니다.")
@@ -197,12 +203,75 @@ def generate_candidates(
             ride_meters[pattern_id] = _cumulative_ride_meters(index, index.pattern_stops[pattern_id])
         return ride_meters[pattern_id]
 
+    origin_stop = index.stops.get(from_stop_id) if from_stop_id is not None else None
+    origin_point = (
+        (context.origin.lat, context.origin.lon) if from_stop_id is None
+        else (origin_stop.lat, origin_stop.lon) if origin_stop is not None and _has_usable_coordinate(origin_stop)
+        else None
+    )
+    destination_point = (context.destination.lat, context.destination.lon)
+    near_goal_positions: dict[str, dict[int, NearbyStop]] = {}
+    used_near_goals: dict[str, NearbyStop] = {}
+
+    def meters_from(point: tuple[float, float] | None, stop_id: str) -> float | None:
+        stop = index.stops.get(stop_id)
+        if point is None or stop is None or not _has_usable_coordinate(stop):
+            return None
+        return haversine_meters(point[0], point[1], stop.lat, stop.lon)
+
+    def nearby_ids(stop_id: str) -> set[str]:
+        return {option.stop_id for option in _transfer_options(index, stop_id)}
+
+    def near_goals(pattern_id: str) -> dict[int, NearbyStop]:
+        """목적지 후보 정류소의 환승 반경 안 정류소를 같은 패턴이 더 일찍 지나는 위치(건너편 정류소 등)와 목적지까지 거리."""
+        if pattern_id not in near_goal_positions:
+            stops = index.pattern_stops[pattern_id].stops
+            found: dict[int, NearbyStop] = {}
+            run_start = 0
+            for later, item in enumerate(stops):
+                if later > 0 and item.stop_order != stops[later - 1].stop_order + 1:
+                    run_start = later
+                if item.stop_id not in goal_stops:
+                    continue
+                near = nearby_ids(item.stop_id)
+                for earlier in range(run_start, later):
+                    stop_id = stops[earlier].stop_id
+                    if stop_id in near and stop_id not in goal_stops and earlier not in found:
+                        meters = meters_from(destination_point, stop_id)
+                        if meters is not None:
+                            found[earlier] = NearbyStop(stop_id=stop_id, straight_line_meters=meters)
+            near_goal_positions[pattern_id] = found
+        return near_goal_positions[pattern_id]
+
+    def goal_at(pattern_id: str, position: int) -> NearbyStop | None:
+        goal = goal_stops.get(index.pattern_stops[pattern_id].stops[position].stop_id)
+        return goal if goal is not None else near_goals(pattern_id).get(position)
+
+    def passes_earlier(pattern: RoutePattern, board_index: int, alight_index: int) -> bool:
+        """이 탑승이 하차 정류소 근처(환승 반경)를 더 일찍 지나는지. 그렇다면 돌아와서 내리는 탑승이다."""
+        near = nearby_ids(pattern.stops[alight_index].stop_id)
+        return any(pattern.stops[position].stop_id in near for position in range(board_index + 1, alight_index))
+
+    def later_board(
+        start: NearbyStop, pattern: RoutePattern, board_index: int, alight_index: int
+    ) -> tuple[int, NearbyStop]:
+        """승차 정류소 근처(환승 반경)를 하차 전에 다시 지나면 가장 늦게 지나는 위치와 그 정류소까지의 접근 거리."""
+        near = nearby_ids(pattern.stops[board_index].stop_id)
+        for position in range(alight_index - 1, board_index, -1):
+            stop_id = pattern.stops[position].stop_id
+            if stop_id in near:
+                meters = meters_from(origin_point, stop_id)
+                if meters is not None:
+                    return position, NearbyStop(stop_id=stop_id, straight_line_meters=meters)
+        return board_index, start
+
     def keep(
         pool: _RoundPool,
         start: NearbyStop,
         rides: tuple[StaticRide, ...],
         links: tuple[NearbyStop, ...],
         score: float,
+        goal: NearbyStop,
     ) -> None:
         if pool.above_cutoff(score):
             return
@@ -210,10 +279,12 @@ def generate_candidates(
             rides,
             transfer_meters=[link.straight_line_meters for link in links],
             access_straight_line_meters=start.straight_line_meters,
-            egress_straight_line_meters=goal_stops[rides[-1].alight_stop_id].straight_line_meters,
+            egress_straight_line_meters=goal.straight_line_meters,
         )
         if pool.keep_best_unique(score, candidate):
             completed[len(rides) - 1] += 1
+            if goal.stop_id not in goal_stops:
+                used_near_goals[goal.stop_id] = goal
 
     def direct(pool: _RoundPool) -> None:
         """같은 패턴에서 하차 경유 순번이 승차 경유 순번보다 뒤인 목적지 인근 하차 위치를 모두 직행 후보로 둔다."""
@@ -229,12 +300,16 @@ def generate_candidates(
                     if alight.stop_id == start.stop_id:
                         pruned_cycles += 1
                         continue
-                    goal = goal_stops.get(alight.stop_id)
+                    goal = goal_at(pattern_id, alight_index)
                     if goal is None:
                         continue
-                    score = (start_cost + meters[alight_index] - meters[board_index]
+                    if passes_earlier(pattern, board_index, alight_index):
+                        pruned_cycles += 1
+                        continue
+                    board_at, access = later_board(start, pattern, board_index, alight_index)
+                    score = (walk_weight * access.straight_line_meters + meters[alight_index] - meters[board_at]
                              + walk_weight * goal.straight_line_meters)
-                    keep(pool, start, (_ride(pattern, board_index, alight_index),), (), score)
+                    keep(pool, access, (_ride(pattern, board_at, alight_index),), (), score, goal)
 
     def transfer_boardings(
         alight_stop_id: str,
@@ -294,22 +369,30 @@ def generate_candidates(
             if alight.stop_id in visited:
                 pruned_cycles += 1
                 continue
+            # 첫 탑승은 승차 정류소 근처를 다시 지나면 가장 늦게 지나는 위치에서 탄 것으로 본다(되돌아오는 구간 제외).
+            board_at, access = (later_board(start, pattern, board_index, alight_index) if level == 0
+                                else (board_index, start))
+            if board_at != board_index:
+                arrival_cost = (walk_weight * access.straight_line_meters + meters[alight_index] - meters[board_at])
             if remaining_after_ride == 0:
-                goal = goal_stops.get(alight.stop_id)
+                goal = goal_at(pattern_id, alight_index)
                 if goal is not None:
-                    score = arrival_cost + walk_weight * goal.straight_line_meters
-                    keep(pool, start, (*rides, _ride(pattern, board_index, alight_index)), links, score)
+                    if passes_earlier(pattern, board_at, alight_index):
+                        pruned_cycles += 1
+                    else:
+                        score = arrival_cost + walk_weight * goal.straight_line_meters
+                        keep(pool, access, (*rides, _ride(pattern, board_at, alight_index)), links, score, goal)
                 continue
             boardings = transfer_boardings(alight.stop_id, pattern_id, alight.stop_order, visited,
                                            remaining_after_ride)
             if not boardings:
                 continue
-            next_rides = (*rides, _ride(pattern, board_index, alight_index))
+            next_rides = (*rides, _ride(pattern, board_at, alight_index))
             next_visited = visited | {alight.stop_id}
             for option, next_pattern_id, next_board_index in boardings:
                 if budget.exhausted():
                     return
-                dfs(start, next_pattern_id, next_board_index, next_rides, (*links, option),
+                dfs(access, next_pattern_id, next_board_index, next_rides, (*links, option),
                     arrival_cost + walk_weight * option.straight_line_meters, next_visited | {option.stop_id},
                     target, pool, budget)
 
@@ -363,7 +446,7 @@ def generate_candidates(
         static_snapshot_id=index.snapshot_id,
         candidates=tuple(sorted(selected, key=lambda candidate: candidate.static_candidate_id)),
         access_stops=tuple(start_stops),
-        egress_stops=tuple(goal_stops.values()),
+        egress_stops=(*goal_stops.values(), *(used_near_goals[key] for key in sorted(used_near_goals))),
         reason_codes=tuple(reasons),
         coverage=SearchCoverage(
             truncated=truncated,

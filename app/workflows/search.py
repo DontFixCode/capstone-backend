@@ -10,7 +10,10 @@ recommendation.recommend_candidates)를 그대로 호출하고, 이 모듈은 �
   검색 시점에는 같은 Phase 2 수집기(RealtimeCollector)로 간격 이내 공개값은 재사용·부족한 대상만 조회한다.
 - 직접 ETA·관측 구간시간으로 하차 ETA를 만들지 못한 차량과, 기준 여유가 음수(선두 차량을 놓침)인 승차·환승 구간의 뒤
   차량(준비 시각 뒤에 오는 차량이 나올 때까지 한 대씩)만 앞차 ETA 기반 근사(Phase 3B)를 쓴다. 근사에 쓰는 노선 위치,
-  놓친 승차 정류소, 기준점 X 도착정보는 검색 시점에 새로 조회한다(재사용하지 않음, 대상별 한 번, 같은 수집기). X는 그
+  목표 정류소(놓친 승차 정류소·하차 근사 대상 하차 정류소), 기준점 X 도착정보는 검색 시점에 새로 조회한다(재사용하지
+  않음, 대상별 한 번, 같은 수집기). 노선 위치로 순서를 확인한 조합은 지난 예측을 지금 도착 중으로 본다. 다음 차량이
+  아직 출발하지 않았으면(대전시 MSG_TP=07) 직전 차량 시각 + 노선 배차간격으로 예상 차량을 더하고, 순위는 실시간 후보 뒤에 준다
+  (eta_source=headway_estimate, applicable_headway_seconds). X는 그
   시점 차량 위치로 정해지므로 워커 수집 대상에는 넣지 않는다.
 - TAGO 도착정보는 기준시각이 확인되지 않아(eta_basis_at=NULL) 기본 정책(unconfirmed)에서는 그대로 전달한다
   (2026-11-07 결정). 수신 시각 근사(BACKEND_TAGO_ETA_BASIS_POLICY=server_received_at)는 Notion DB-C04에 따라 검증한
@@ -24,7 +27,7 @@ import hashlib
 import json
 import logging
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -57,12 +60,14 @@ from app.modules.evaluation.schemas import (
     EvaluationResult,
     GapAnchor,
     ObservedEvent,
+    RouteHeadway,
     SegmentObservation,
+    VehicleEta,
     WalkResult,
 )
 from app.modules.evaluation.service import evaluate_candidates
 from app.modules.recommendation.schemas import RecommendationResult
-from app.modules.recommendation.service import recommend_candidates
+from app.modules.recommendation.service import recommend_candidates, uses_headway_estimate
 from app.modules.routing import repository as search_repository
 from app.modules.routing import service_area
 from app.modules.routing.schemas import (
@@ -399,24 +404,30 @@ class LeadingGapNeeds:
     """앞차 ETA 기반 근사에 쓰는 입력 대상. 호출자가 이 검색에서 새로 받은 응답만 쓰도록 다시 조회한다."""
 
     anchor_stops: frozenset[str]  # 기준점 X
-    board_stops: frozenset[str]   # 선두 차량을 놓치는 승차·환승 정류소 D
+    target_stops: frozenset[str]  # 목표 정류소 D: 선두 차량을 놓치는 승차·환승 정류소와 하차 근사 대상 하차 정류소
     routes: frozenset[str]        # 차량 순서 판정에 노선 위치를 쓰는 노선
 
 
 IN_PROGRESS_RETRIES = 3
 IN_PROGRESS_WAIT_SECONDS = 1.0
+# 한 번에 동시에 조회하는 도착정보 대상 수. 검색 한 번의 대상이 수십 개라 순서대로 부르면 대기 시간이 그대로 쌓인다.
+ARRIVAL_COLLECT_WORKERS = 4
 
 
 def collect_targets(db: Database, client: TagoClient | None, targets: list[RealtimeTarget],
                     interval_seconds: float, clock: Callable[[], datetime], *,
                     sleep: Callable[[float], None] | None = None,
                     daejeon_client: DaejeonBusClient | None = None, force: bool = False) -> dict[str, dict[str, Any]]:
-    """Phase 2 수집기로 대상마다 간격 이내 공개값은 재사용하고 부족한 대상만 조회한다(도착 먼저). force면 재사용하지 않는다.
+    """Phase 2 수집기로 대상마다 간격 이내 공개값은 재사용하고 부족한 대상만 조회한다. force면 재사용하지 않는다.
 
     같은 대상을 다른 실행(워커의 주기 수집 등)이 수집 중이면(in_progress) 잠금을 기다리지 않고, 다른 대상을 먼저
     처리한 뒤 짧게 몇 번만 다시 확인한다. 끝까지 진행 중이면 그 시점의 마지막 공개값으로 평가한다(서로 막히지 않음).
+
+    도착정보(대전시)는 대상마다 독립된 DB 연결·요청이라 ARRIVAL_COLLECT_WORKERS개씩 동시에 조회한다. 노선 위치(TAGO)는
+    클라이언트가 호출 기록 콜백(on_attempt)을 인스턴스에 두므로 한 번에 하나씩, 도착정보와 나란히 조회한다.
     """
     import time
+    from concurrent.futures import ThreadPoolExecutor
 
     wait = sleep or time.sleep
     collector = transit_service.RealtimeCollector(db, client, interval_seconds=interval_seconds, clock=clock,
@@ -426,9 +437,15 @@ def collect_targets(db: Database, client: TagoClient | None, targets: list[Realt
     for attempt in range(IN_PROGRESS_RETRIES + 1):
         if attempt:
             wait(IN_PROGRESS_WAIT_SECONDS)
+        with ThreadPoolExecutor(max_workers=ARRIVAL_COLLECT_WORKERS, thread_name_prefix="arrivals") as pool:
+            futures = {index: pool.submit(collector.collect, target, force=force)
+                       for index, target in enumerate(pending) if target.kind == "arrivals"}
+            collected = {index: collector.collect(target, force=force)
+                         for index, target in enumerate(pending) if target.kind != "arrivals"}
+            collected.update((index, future.result()) for index, future in futures.items())
         busy = []
-        for target in pending:
-            outcome = collector.collect(target, force=force)
+        for index, target in enumerate(pending):
+            outcome = collected[index]
             outcomes[outcome.target_key] = {"action": outcome.action, "http_attempts": outcome.http_attempts,
                                             "reason": outcome.reason}
             if outcome.action == "in_progress":
@@ -441,10 +458,12 @@ def collect_targets(db: Database, client: TagoClient | None, targets: list[Realt
 
 def realtime_inputs(conn, targets: list[RealtimeTarget], network: StaticNetwork, *, now: datetime,
                     interval_seconds: float, max_data_age_seconds: float,
-                    eta_basis_policy: str = eta_basis.UNCONFIRMED) -> RealtimeInputs:
+                    eta_basis_policy: str = eta_basis.UNCONFIRMED, mark_not_departed: bool = False) -> RealtimeInputs:
     """대상별 마지막 공개 배치 전체를 읽어 평가 입력으로 바꾼다. 최신·오래됨·빈 결과·미제공·실패를 상태로 남긴다.
 
     ETA 기준 시각은 eta_basis 정책으로 정한다. 기본 정책은 원천이 주지 않은 기준 시각을 채우지 않는다(eta_basis_unconfirmed).
+    mark_not_departed면 '다음 차량 출발 전' 응답(대전시 MSG_TP=07)을 ETA가 아니라 직전 차량 통과 기록으로 넘긴다
+    (배차간격 기반 예상의 근거, eta.headway_legs). 최초 검색만 켜고 이동 안내 재계산은 기존 동작을 유지한다.
     """
     pattern_by_route: dict[str, list[str]] = {}
     for pattern in network.patterns:
@@ -485,12 +504,18 @@ def realtime_inputs(conn, targets: list[RealtimeTarget], network: StaticNetwork,
                     continue
                 pattern = keys[0]
             basis_at, basis_source = eta_basis.resolve_basis(obs, eta_basis_policy)
+            details = obs.get("details") or {}
+            waiting = mark_not_departed and (
+                (details.get("vehicle_match") or {}).get("reason") == "msg_tp_07_last_passed_vehicle")
             reports.append(EtaReport(
                 pattern_id=pattern, stop_id=stop_ext, stop_order=obs["stop_seq"], vehicle_id=obs["vehicle_no"],
                 run_key=obs["run_key"], remaining_seconds=obs["remaining_seconds"], basis_at=basis_at,
-                basis_source=basis_source, stops_away=(obs.get("details") or {}).get("stops_away"),
+                basis_source=basis_source, stops_away=details.get("stops_away"),
                 source_generated_at=obs["source_generated_at"], collected_at=obs["collected_at"],
                 source_ref=f"transit_observation:{obs['id']}|batch:{snap.batch_key}",
+                not_departed=waiting,
+                last_passed_vehicle_id=(
+                    ((details.get("source") or {}).get("CAR_REG_NO") or "").strip() or None if waiting else None),
             ))
     return RealtimeInputs(reports, frozenset(queried), states, refs, dict(rejected), positions)
 
@@ -499,17 +524,30 @@ def leading_gap_anchors(candidates: Iterable[StaticCandidate], realtime: Realtim
                         segments: Iterable[SegmentObservation], *, cohort: str, context: SearchContext,
                         policy: EvaluationPolicy, board_rides: Mapping[tuple[str, int], datetime] | None = None,
                         previous_stops: Mapping[tuple[str, int], tuple[int, str]] | None = None,
+                        probe_stops: set[str] | None = None,
+                        rear_vehicles: set[tuple[str, str]] | None = None,
+                        pattern_stops: Mapping[tuple[str, int], str] | None = None,
                         ) -> list[GapAnchor]:
     """앞차 ETA 기반 근사(Phase 3B)의 차량 조합을 고른다(설계 PREPARE_GAP_INPUTS).
 
-    직접 ETA·관측 구간시간으로 하차 ETA를 만들지 못한 (탈 차량 B, 하차 정류소 D)마다 D의 선두 차량 A와, 노선 위치에서
-    A가 마지막으로 통과한 경유 위치 X를 고른다. 같은 패턴에서 위치가 하나로 확인된 A·B만 쓰고 B 위치 < X(A 위치) < D
-    순서를 확인한다. 위치는 순서 판정에만 쓰고 시각은 도착정보로만 구한다(eta.leading_vehicle_gap_eta).
+    직접 ETA·관측 구간시간으로 하차 ETA를 만들지 못한 (탈 차량 B, 하차 정류소 D)마다 D의 선두 차량 A와, A가 마지막으로
+    통과한 경유 위치 X를 고른다. X의 다음 차량이 B가 아니면 그 차량을 다시 앞차로 삼아 B가 나올 때까지 잇는다.
+    X는 두 가지로 찾는다.
+    - 도착정보(_arrival_links): 정류소 응답의 남은 정류장 수로 앞차가 마지막으로 지난 정류소를 정하고, 그 정류소 응답의
+      다음 차량을 뒤 차량으로 본다. pattern_stops((패턴, 순번) → 정류소)가 있어야 하고, 아직 조회하지 않은 정류소는
+      probe_stops에 더해 호출자가 조회한 뒤 이어 간다. 노선 위치에 없는 차량이 끼어도 이어진다.
+    - 노선 위치(_alight_chain·_following_chain): 위치가 하나로 확인된 차량들의 순서로 여러 단계를 한 번에 고른다.
+    같은 뒤 차량에 두 조합이 있으면 응답으로 확인한 도착정보 쪽을 쓴다. 시각은 도착정보로만 구한다
+    (eta.leading_vehicle_gap_eta).
 
     board_rides는 승차 정류소의 선두 차량을 놓치는 (패턴, 승차 위치)와 그 구간의 준비 시각이다. 노선 위치상 선두 차량
     뒤 차량을 가까운 순으로 이어(_following_chain) 승차 정류소를 D로 한 조합을 고른다. 뒤 차량의 하차는 앞 차량 하차
     ETA에 같은 간격을 더하므로(eta.build_ride_legs) 하차 조합을 따로 고르지 않는다. previous_stops((패턴, 순번) → 바로 앞
     정류소, previous_stop_index)를 주면 선두 차량이 이미 승차 정류소에 있을 때 그 앞 정류소를 X로 쓴다.
+
+    배차간격 기반 예상(eta.headway_legs)의 근거도 함께 고른다. 승차 정류소가 '다음 차량 출발 전'이면 그 정류소를 마지막으로
+    지난 차량의 하차 조합을 고르고, 놓치는 구간에서 뒤 차량이 더 없으면 맨 뒤 차량이 마지막으로 지난 정류소를
+    probe_stops에, 그 차량을 rear_vehicles에 더한다(그 정류소 응답이 '다음 차량 출발 전'인지 확인하도록 호출자가 조회).
     """
     table = index_etas(realtime.eta_reports, evaluated_at=context.evaluated_at,
                        max_data_age_seconds=policy.max_data_age_seconds)
@@ -527,23 +565,158 @@ def leading_gap_anchors(candidates: Iterable[StaticCandidate], realtime: Realtim
                                queried_stop_ids=realtime.queried_stop_ids, policy=policy)
         at_target = table.by_position.get((ride.pattern_id, ride.alight_position, ride.alight_stop_id), ())
         leading = at_target[0].vehicle_id if at_target else None
-        for trailing in sorted({leg.vehicle_id for leg in legs.legs if leg.alight_eta is None} - {None, leading}):
-            a_at = located.get((ride.pattern_id, leading), [])
-            b_at = located.get((ride.pattern_id, trailing), [])
-            if len(a_at) != 1 or len(b_at) != 1 or a_at[0]["stop_external_id"] is None:
-                continue
-            x_seq = a_at[0]["stop_seq"]
-            if not b_at[0]["stop_seq"] < x_seq < ride.alight_position:
-                continue
-            anchors[(ride.pattern_id, ride.alight_position, trailing)] = GapAnchor(
-                pattern_id=ride.pattern_id, target_stop_id=ride.alight_stop_id, target_stop_order=ride.alight_position,
-                trailing_vehicle_id=trailing, leading_vehicle_id=leading, anchor_stop_id=a_at[0]["stop_external_id"],
-                anchor_stop_order=x_seq, source_ref=f"transit_observation:{a_at[0]['id']},{b_at[0]['id']}")
+        waiting = table.not_departed.get((ride.pattern_id, ride.board_position, ride.board_stop_id))
+        trailing_vehicles = {leg.vehicle_id for leg in legs.legs if leg.alight_eta is None}
+        if waiting is not None:
+            trailing_vehicles.add(waiting.vehicle_id)
+        for trailing in sorted(trailing_vehicles - {None, leading}):
+            anchors.update(_alight_chain(ride, leading, trailing, located, previous_stops))
+            if pattern_stops:
+                anchors.update(_alight_chain_by_arrivals(ride, trailing, table, pattern_stops, probe_stops))
         ready_at = (board_rides or {}).get((ride.pattern_id, ride.board_position))
         if ready_at is not None:
-            anchors.update(_following_chain(ride, table, located, until=min(ready_at, horizon_end_at),
-                                            evaluated_at=context.evaluated_at, previous_stops=previous_stops))
+            until = min(ready_at, horizon_end_at)
+            anchors.update(_following_chain(ride, table, located, until=until,
+                                            evaluated_at=context.evaluated_at, previous_stops=previous_stops,
+                                            probe_stops=probe_stops, rear_vehicles=rear_vehicles))
+            if pattern_stops:
+                anchors.update(_following_chain_by_arrivals(ride, table, pattern_stops, until=until,
+                                                            evaluated_at=context.evaluated_at,
+                                                            probe_stops=probe_stops))
     return [anchors[key] for key in sorted(anchors)]
+
+
+# 노선 위치로 한 번에 고르는 하차 조합의 최대 단계 수(단계마다 기준점 조회 1회).
+ALIGHT_GAP_MAX_LINKS = 6
+# 도착정보로 한 대씩 이어 가는 조합의 최대 단계 수(끝없이 이어지지 않도록 하는 안전 한도, 단계마다 기준점 조회 1회).
+ARRIVAL_CHAIN_MAX_LINKS = 8
+
+
+def pattern_stop_index(network: StaticNetwork) -> dict[tuple[str, int], str]:
+    """(패턴, 경유 순번) → 정류소 원천 ID."""
+    return {(pattern.pattern_key, stop.seq): stop.stop_external_id for pattern in network.patterns
+            for stop in pattern.stops}
+
+
+def _arrival_links(pattern_id: str, target_stop_id: str, target_order: int, table: EtaTable,
+                   pattern_stops: Mapping[tuple[str, int], str], probe_stops: set[str] | None,
+                   ) -> Iterator[tuple[str, int, str, VehicleEta]]:
+    """도착정보만으로 목표 정류소 D에 오는 차량을 앞에서부터 한 대씩 찾는다. (앞 차량, X 순번, X 정류소, 뒤 차량의 X 예측).
+
+    정류소 응답에 나온 차량의 남은 정류장 수만큼 거슬러 올라간 정류소가 그 차량이 마지막으로 지난 정류소 X이고, X 응답에
+    나온 다음 차량이 뒤 차량이다. 그 뒤 차량의 X 응답 남은 정류장 수로 다시 거슬러 올라간다. X 응답에 앞 차량이 그대로
+    나오면(정류장 수가 한두 개 어긋나 아직 X를 지나지 않음) X에서 다시 센다. X를 아직 조회하지 않았으면 probe_stops에
+    더하고 멈춘다. X가 '다음 차량 출발 전'이거나 남은 정류장 수가 없으면 멈춘다.
+    """
+    listed = table.by_position.get((pattern_id, target_order, target_stop_id), ())
+    if not listed or listed[0].vehicle_id is None:
+        return
+    at_order, lead = target_order, listed[0]
+    seen = {lead.vehicle_id}
+    for _ in range(ARRIVAL_CHAIN_MAX_LINKS * 2):
+        if lead.stops_away is None:
+            return
+        x_order = at_order - max(lead.stops_away, 1)
+        x_stop = pattern_stops.get((pattern_id, x_order))
+        if x_stop is None:
+            return
+        at_x = table.by_position.get((pattern_id, x_order, x_stop), ())
+        if not at_x:
+            if (pattern_id, x_order, x_stop) not in table.not_departed and probe_stops is not None:
+                probe_stops.add(x_stop)
+            return
+        following = at_x[0]
+        if following.vehicle_id is None:
+            return
+        if following.vehicle_id == lead.vehicle_id:
+            at_order, lead = x_order, following
+            continue
+        if following.vehicle_id in seen:
+            return
+        seen.add(following.vehicle_id)
+        yield lead.vehicle_id, x_order, x_stop, following
+        at_order, lead = x_order, following
+
+
+def _arrival_anchor(ride: StaticRide, target_stop_id: str, target_order: int, leading: str, x_order: int, x_stop: str,
+                    following: VehicleEta) -> GapAnchor:
+    return GapAnchor(
+        pattern_id=ride.pattern_id, target_stop_id=target_stop_id, target_stop_order=target_order,
+        trailing_vehicle_id=following.vehicle_id, leading_vehicle_id=leading, anchor_stop_id=x_stop,
+        anchor_stop_order=x_order, source_ref=f"arrivals:{following.source_ref}", order_confirmed=True)
+
+
+def _alight_chain_by_arrivals(ride: StaticRide, trailing: str, table: EtaTable,
+                              pattern_stops: Mapping[tuple[str, int], str], probe_stops: set[str] | None,
+                              ) -> dict[tuple[str, int, str], GapAnchor]:
+    """하차 정류소 D의 다음 차량부터 탈 차량 B가 나올 때까지 도착정보로 이은 하차 조합.
+
+    B의 하차 시각 = D 다음 차량의 남은 시간 + 그 뒤 차량이 앞차 직전 정류소까지 남은 시간 + … + B가 앞차 직전 정류소까지
+    남은 시간(eta.gap_chain_etas). B에 닿기 전에 조회하지 않은 정류소가 나오면 거기까지의 조합만 돌려준다(조회 뒤 이어짐).
+    """
+    chain: dict[tuple[str, int, str], GapAnchor] = {}
+    links = _arrival_links(ride.pattern_id, ride.alight_stop_id, ride.alight_position, table, pattern_stops, probe_stops)
+    for count, (leading, x_order, x_stop, following) in enumerate(links, start=1):
+        chain[(ride.pattern_id, ride.alight_position, following.vehicle_id)] = _arrival_anchor(
+            ride, ride.alight_stop_id, ride.alight_position, leading, x_order, x_stop, following)
+        if following.vehicle_id == trailing or count >= ARRIVAL_CHAIN_MAX_LINKS:
+            break
+    return chain
+
+
+def _following_chain_by_arrivals(ride: StaticRide, table: EtaTable, pattern_stops: Mapping[tuple[str, int], str], *,
+                                 until: datetime, evaluated_at: datetime, probe_stops: set[str] | None,
+                                 ) -> dict[tuple[str, int, str], GapAnchor]:
+    """승차 정류소 D의 다음 차량을 놓칠 때, 그 뒤 차량을 도착정보로 한 대씩 이은 승차 조합.
+
+    근사한 승차 ETA가 until(준비 시각) 이후인 차량이 나오면 멈춘다.
+    """
+    listed = table.by_position.get((ride.pattern_id, ride.board_position, ride.board_stop_id), ())
+    if not listed or listed[0].predicted_arrival_at >= until:
+        return {}
+    chain: dict[tuple[str, int, str], GapAnchor] = {}
+    links = _arrival_links(ride.pattern_id, ride.board_stop_id, ride.board_position, table, pattern_stops, probe_stops)
+    for count, (leading, x_order, x_stop, following) in enumerate(links, start=1):
+        chain[(ride.pattern_id, ride.board_position, following.vehicle_id)] = _arrival_anchor(
+            ride, ride.board_stop_id, ride.board_position, leading, x_order, x_stop, following)
+        etas = {eta.vehicle_id: eta for eta in following_board_etas(ride, table, chain, evaluated_at)[0]}
+        estimate = etas.get(following.vehicle_id)
+        if estimate is None or estimate.predicted_arrival_at >= until or count >= ARRIVAL_CHAIN_MAX_LINKS:
+            break
+    return chain
+# 승차 근사에서 한 번에 미리 고르는 뒤 차량 수. 준비 시각 뒤 차량이 먼저 나오면 남는 조회(최대 이 수 − 1회)가 생기지만,
+# 재평가 반복 횟수가 그만큼 준다.
+FOLLOWING_LOOKAHEAD = 3
+
+
+def _alight_chain(ride: StaticRide, leading: str | None, trailing: str,
+                  located: dict[tuple[str, str], list[dict[str, Any]]],
+                  previous_stops: Mapping[tuple[str, int], tuple[int, str]] | None,
+                  ) -> dict[tuple[str, int, str], GapAnchor]:
+    """하차 정류소 D의 선두 차량 A부터 탈 차량 B까지 노선 위치 순서로 이은 하차 조합(사이 차량 V1, V2 … 포함).
+
+    각 단계의 X는 앞 차량이 마지막으로 통과한 위치다(앞 차량이 D에 있으면 D 바로 앞 정류소). 사이 차량이
+    ALIGHT_GAP_MAX_LINKS 단계를 넘거나 순서가 모호하면 고르지 않는다.
+    """
+    if leading is None:
+        return {}
+    order = _vehicles_in_order(ride.pattern_id, leading, located)
+    vehicles = [obs["vehicle_no"] for obs in order]
+    if trailing not in vehicles or not 0 < vehicles.index(trailing) <= ALIGHT_GAP_MAX_LINKS \
+            or order[0]["stop_seq"] > ride.alight_position:
+        return {}
+    at_target = order[0]["stop_seq"] == ride.alight_position
+    chain: dict[tuple[str, int, str], GapAnchor] = {}
+    for index, (lead, trail) in enumerate(zip(order, order[1:vehicles.index(trailing) + 1])):
+        x = ((previous_stops or {}).get((ride.pattern_id, ride.alight_position)) if index == 0 and at_target
+             else (lead["stop_seq"], lead["stop_external_id"]))
+        if x is None or x[1] is None or trail["stop_seq"] >= x[0]:
+            return {}
+        chain[(ride.pattern_id, ride.alight_position, trail["vehicle_no"])] = GapAnchor(
+            pattern_id=ride.pattern_id, target_stop_id=ride.alight_stop_id, target_stop_order=ride.alight_position,
+            trailing_vehicle_id=trail["vehicle_no"], leading_vehicle_id=lead["vehicle_no"], anchor_stop_id=x[1],
+            anchor_stop_order=x[0], source_ref=f"transit_observation:{lead['id']},{trail['id']}", order_confirmed=True)
+    return chain
 
 
 def previous_stop_index(network: StaticNetwork) -> dict[tuple[str, int], tuple[int, str]]:
@@ -559,12 +732,16 @@ def previous_stop_index(network: StaticNetwork) -> dict[tuple[str, int], tuple[i
 def _following_chain(ride: StaticRide, table: EtaTable, located: dict[tuple[str, str], list[dict[str, Any]]], *,
                      until: datetime, evaluated_at: datetime,
                      previous_stops: Mapping[tuple[str, int], tuple[int, str]] | None = None,
+                     probe_stops: set[str] | None = None,
+                     rear_vehicles: set[tuple[str, str]] | None = None,
                      ) -> dict[tuple[str, int, str], GapAnchor]:
     """승차 정류소 선두 차량 뒤 차량을 가까운 순으로 이은 조합. B1은 선두 차량, B2는 B1이 마지막으로 통과한 위치를 X로 한다.
 
     선두 차량이 노선 위치상 이미 승차 정류소에 있으면 B1의 X는 승차 정류소 바로 앞 정류소다(previous_stops).
-    근사한 승차 ETA가 until(준비 시각) 이후인 차량이 나오거나, 아직 근사할 수 없는 차량(X 미조회·확인 실패)에서 멈춘다.
-    X를 조회하지 않은 조합은 마지막에 하나만 남으므로 호출자가 그 X를 조회한 뒤 다시 고르면 한 대씩 늘어난다.
+    근사한 승차 ETA가 until(준비 시각) 이후인 차량이 나오면 멈춘다. 아직 근사할 수 없는 차량(X 미조회·확인 실패)은
+    FOLLOWING_LOOKAHEAD대까지 미리 고르므로, 호출자가 그 X들을 한 묶음으로 조회한 뒤 다시 고르면 그만큼씩 늘어난다.
+    노선 위치에 뒤 차량이 더 없는데도 준비 시각 전 차량뿐이면, 맨 뒤 차량이 마지막으로 지난 정류소를 probe_stops에,
+    그 차량을 rear_vehicles((패턴, 차량))에 더한다(다음 차량이 아직 출발 전인지 그 정류소 응답으로 확인, eta.headway_legs).
     """
     listed = table.by_position.get((ride.pattern_id, ride.board_position, ride.board_stop_id), ())
     if not listed or listed[0].vehicle_id is None or listed[0].predicted_arrival_at >= until:
@@ -579,9 +756,12 @@ def _following_chain(ride: StaticRide, table: EtaTable, located: dict[tuple[str,
         return {}
     listed_ids = {eta.vehicle_id for eta in listed}
     chain: dict[tuple[str, int, str], GapAnchor] = {}
+    exhausted = True
+    unknown = 0
     for index, (lead, trail) in enumerate(zip(order, order[1:])):
         x_seq, x_stop = first_x if index == 0 else (lead["stop_seq"], lead["stop_external_id"])
         if x_stop is None or trail["stop_seq"] >= x_seq:
+            exhausted = False
             break
         vehicle = trail["vehicle_no"]
         if vehicle not in listed_ids:
@@ -589,10 +769,29 @@ def _following_chain(ride: StaticRide, table: EtaTable, located: dict[tuple[str,
                 pattern_id=ride.pattern_id, target_stop_id=ride.board_stop_id, target_stop_order=ride.board_position,
                 trailing_vehicle_id=vehicle, leading_vehicle_id=lead["vehicle_no"], anchor_stop_id=x_stop,
                 anchor_stop_order=x_seq, source_ref=f"transit_observation:{lead['id']},{trail['id']}",
-                leading_at_target=index == 0 and at_target)
+                order_confirmed=True)
         etas = {eta.vehicle_id: eta for eta in (*listed, *following_board_etas(ride, table, chain, evaluated_at)[0])}
-        if vehicle not in etas or etas[vehicle].predicted_arrival_at >= until:
+        if vehicle not in etas:
+            # X를 아직 조회하지 않았거나 확인에 실패한 차량. X는 노선 위치만으로 정해지므로 몇 대까지는 미리 골라
+            # 호출자가 한 묶음으로 조회하게 한다(한 대씩 고르면 차량마다 재평가 한 바퀴가 든다).
+            exhausted = False
+            unknown += 1
+            if unknown >= FOLLOWING_LOOKAHEAD:
+                break
+            continue
+        if etas[vehicle].predicted_arrival_at >= until:
+            exhausted = False
             break
+    behind_rear = any(pattern == ride.pattern_id and obs["stop_seq"] < order[-1]["stop_seq"]
+                      for (pattern, _), found in located.items() for obs in found)
+    if exhausted and not behind_rear:
+        # 노선 위치에 맨 뒤 차량보다 뒤인 차량이 없다. 그 차량이 마지막으로 지난 정류소 응답으로 다음 차량이 출발 전인지 확인한다.
+        rear_seq, rear_stop = first_x if len(order) == 1 else (order[-1]["stop_seq"], order[-1]["stop_external_id"])
+        if rear_stop is not None and rear_seq < ride.board_position:
+            if probe_stops is not None:
+                probe_stops.add(rear_stop)
+            if rear_vehicles is not None:
+                rear_vehicles.add((ride.pattern_id, order[-1]["vehicle_no"]))
     return chain
 
 
@@ -611,6 +810,40 @@ def _vehicles_in_order(pattern_id: str, leading_vehicle: str,
             break
         order.append(obs)
     return order
+
+
+_KST = timezone(timedelta(hours=9))
+# 배차간격(분)으로 받아들이는 범위. 벗어나면 단위·값이 다른 것으로 보고 쓰지 않는다.
+_HEADWAY_MINUTES = (1.0, 180.0)
+
+
+def applicable_headway_seconds(service_info: dict[str, Any] | None, at: datetime) -> float | None:
+    """평가 시각에 적용할 노선 배차간격(초). 아직 출발하지 않은 다음 차량의 예상(eta.headway_legs)에만 쓴다.
+
+    TAGO 노선정보(getRouteInfoIem)의 배차간격을 분 단위로 보고 요일(평일·토·일, 한국 시각)로 고른다. 단위는 2026-11-12
+    대전시 '출발 전' 응답의 직전 차량 통과 간격과 대조해 확인했다(60쌍, 절대오차 중앙값 3.2분, 하루치·검증 대기).
+    첫차 전·막차 뒤(원값 HHMM)이거나 값이 없으면 None이다. 공휴일·시간대별 배차는 구분하지 못한다.
+    """
+    fields = (service_info or {}).get("fields") or {}
+
+    def number(name: str) -> float | None:
+        try:
+            return float((fields.get(name) or {}).get("value"))
+        except (TypeError, ValueError):
+            return None
+
+    def minute_of_day(name: str) -> float | None:
+        value = number(name)
+        return None if value is None else (value // 100) * 60 + value % 100
+
+    local = at.astimezone(_KST)
+    minutes = number({5: "intervalsattime", 6: "intervalsuntime"}.get(local.weekday(), "intervaltime"))
+    if minutes is None or not _HEADWAY_MINUTES[0] <= minutes <= _HEADWAY_MINUTES[1]:
+        return None
+    first, last, now = minute_of_day("startvehicletime"), minute_of_day("endvehicletime"), local.hour * 60 + local.minute
+    if first is not None and last is not None and first <= last and not first <= now <= last:
+        return None
+    return minutes * 60
 
 
 def segment_observations(conn, pattern_keys: Iterable[str], condition: str, until: datetime) -> list[SegmentObservation]:
@@ -945,12 +1178,14 @@ class SearchWorkflow:
                              walks: dict[tuple[str, str], WalkLookup], targets: list[RealtimeTarget],
                              board_rides: dict[tuple[str, int], datetime],
                              previous_stops: Mapping[tuple[str, int], tuple[int, str]],
+                             headways: tuple[RouteHeadway, ...] = (),
                              ) -> tuple[LeadingGapNeeds, dict[tuple[str, int], datetime]]:
         """수집값으로 앞차 ETA 기반 근사가 필요한 차량 조합을 고르고, 근사에 쓰는 입력(기준점 X·승차 정류소 D·노선 위치)을 돌려준다.
 
         현재 수집값과 조합으로 평가해 기준 여유가 음수(선두 차량을 놓침)인 승차·환승 구간과 그 준비 시각(같은 구간은 가장
         늦은 시각)을 board_rides에 더하고, 그 구간의 뒤 차량 조합도 고른다. 여러 후보가 같은 X를 쓰면 한 번만 조회한다.
-        노선 위치는 놓친 구간과 하차 ETA가 없거나 앞차 근사로 구한 구간의 노선만 돌려준다.
+        노선 위치는 놓친 구간과 하차 ETA가 없거나 앞차 근사로 구한 구간의 노선만 돌려준다. 뒤 차량이 더 없는 놓친 구간은
+        다음 차량이 출발 전인지 확인할 정류소(배차간격 기반 예상의 근거)를 기준점과 함께 돌려준다.
         """
         config, policy = self.config, self.config.evaluation_policy
         now = self.clock()
@@ -960,21 +1195,27 @@ class SearchWorkflow:
             realtime = realtime_inputs(conn, targets, network, now=now,
                                        interval_seconds=config.realtime_interval_seconds,
                                        max_data_age_seconds=policy.max_data_age_seconds,
-                                       eta_basis_policy=config.eta_basis_policy)
+                                       eta_basis_policy=config.eta_basis_policy, mark_not_departed=True)
             segments = segment_observations(conn, [r.pattern_id for c in result.candidates for r in c.rides],
                                             cohort, until=probe.evaluated_at)
+        probe_stops: set[str] = set()
+        rear_vehicles: set[tuple[str, str]] = set()
         anchors = leading_gap_anchors(result.candidates, realtime, segments, cohort=cohort, context=probe,
-                                      policy=policy, board_rides=board_rides, previous_stops=previous_stops)
+                                      policy=policy, board_rides=board_rides, previous_stops=previous_stops,
+                                      pattern_stops=pattern_stop_index(network),
+                                      probe_stops=probe_stops, rear_vehicles=rear_vehicles)
         inputs = EvaluationInputs(
             data_snapshot_id="leading-gap-probe", sample_condition_key=cohort,
             walks=tuple(w for w in (lookup.as_walk_result() for lookup in walks.values()) if w is not None),
             eta_reports=tuple(realtime.eta_reports), queried_stop_ids=realtime.queried_stop_ids,
-            segment_observations=tuple(segments), gap_anchors=tuple(anchors))
+            segment_observations=tuple(segments), gap_anchors=tuple(anchors), route_headways=headways,
+            rear_vehicles=frozenset(rear_vehicles))
         evaluation = evaluate_candidates(result, probe, inputs, policy)
         statics = {c.static_candidate_id: c for c in result.candidates}
         boarded = {(r.pattern_id, r.board_position): r for c in result.candidates for r in c.rides}
         missed = dict(board_rides)
         routes: set[str] = set()
+        alight_stops: set[str] = set()
         for item in (*evaluation.candidates, *evaluation.limited):
             rides = statics[item.static_candidate_id].rides
             for link in item.connections:
@@ -983,14 +1224,23 @@ class SearchWorkflow:
                     ride = rides[link.connection_index]
                     key = (ride.pattern_id, ride.board_position)
                     missed[key] = max(missed.get(key, link.ready_at), link.ready_at)
-            routes.update(leg.route_id for leg in item.legs if leg.vehicle_id is not None and (
-                leg.alight_eta is None or leg.alight_eta.eta_source == "leading_vehicle_gap"))
+            for leg in item.legs:
+                # 하차 ETA가 없거나 앞차 근사로 구한 실제 차량, 그리고 하차 시각을 못 구한 배차간격 예상 차량(재사용한
+                # 하차 정류소 응답에 이미 지나간 차량이 남아 직전 차량을 찾지 못한 경우)은 하차 정류소·노선 위치를 새로 받는다.
+                gap_or_missing = leg.alight_eta is None or leg.alight_eta.eta_source == "leading_vehicle_gap"
+                estimated_without_alight = leg.board_eta.eta_source == "headway_estimate" and leg.alight_eta is None
+                if (leg.vehicle_id is not None and gap_or_missing) or estimated_without_alight:
+                    routes.add(leg.route_id)
+                    alight_stops.add(leg.alight_stop_id)
         if missed != board_rides:
+            probe_stops.clear()
             anchors = leading_gap_anchors(result.candidates, realtime, segments, cohort=cohort, context=probe,
-                                          policy=policy, board_rides=missed, previous_stops=previous_stops)
+                                          policy=policy, board_rides=missed, previous_stops=previous_stops,
+                                          pattern_stops=pattern_stop_index(network),
+                                          probe_stops=probe_stops)
         return LeadingGapNeeds(
-            anchor_stops=frozenset(a.anchor_stop_id for a in anchors),
-            board_stops=frozenset(boarded[key].board_stop_id for key in missed),
+            anchor_stops=frozenset({a.anchor_stop_id for a in anchors} | probe_stops),
+            target_stops=frozenset(alight_stops | {boarded[key].board_stop_id for key in missed}),
             routes=frozenset(routes | {boarded[key].route_id for key in missed}),
         ), missed
 
@@ -1008,13 +1258,23 @@ class SearchWorkflow:
 
         board_rides: dict[tuple[str, int], datetime] = {}
         previous_stops = previous_stop_index(network)
+        # 아직 출발하지 않은 다음 차량의 예상에 쓰는 노선별 배차간격(출발 기준 시각의 요일·운행시간으로 고름).
+        with self.db.transaction(isolation="REPEATABLE READ") as conn:
+            service_infos = transit_repository.route_service_infos(
+                conn, {r.route_id for c in result.candidates for r in c.rides})
+        headways = tuple(
+            RouteHeadway(route_id=route_id, headway_seconds=seconds)
+            for route_id, info in sorted(service_infos.items())
+            if (seconds := applicable_headway_seconds(info, context.start_at)) is not None)
         if self.collect and (self.tago_client is not None or self.daejeon_client is not None) and targets:
             summary["realtime_collection"] = collect_targets(self.db, self.tago_client, targets,
                                                              config.realtime_interval_seconds, self.clock,
                                                              daejeon_client=self.daejeon_client)
             if self.daejeon_client is not None and self.realtime_provider is None:
                 # 근사에 쓰는 입력(노선 위치·승차 정류소·기준점)은 이 검색에서 새로 받은 응답만 쓴다(간격 이내 재사용분도
-                # 대상별 한 번 다시 조회). 노선 위치·놓친 승차 정류소를 먼저 받고, 기준점 X는 그 값으로 다시 고른 뒤 조회한다.
+                # 대상별 한 번 다시 조회). 노선 위치·목표 정류소(놓친 승차·하차 근사 대상 하차)·기준점 X를 한 묶음으로
+                # 받는다. 재사용한 노선 위치로 고른 X는 새 위치를 받은 뒤 달라질 수 있어 그때 한 번 더 조회될 수 있지만,
+                # 묶음마다 입력을 다시 읽고 평가하는 반복 횟수가 준다.
                 # 앞 구간 하차 ETA나 앞 차량의 근사 승차 ETA는 조회 뒤에야 나오므로 새로 받을 대상이 없을 때까지 반복한다.
                 fresh: dict[str, set[str]] = {"arrivals": set(), "positions": set()}
                 for target in targets:
@@ -1024,9 +1284,9 @@ class SearchWorkflow:
                 source = frozenset({"route_search"})
                 while True:
                     needs, board_rides = self._leading_gap_targets(network, context, result, walks, targets,
-                                                                   board_rides, previous_stops)
-                    routes, boards = needs.routes - fresh["positions"], needs.board_stops - fresh["arrivals"]
-                    stops = boards if routes or boards else needs.anchor_stops - fresh["arrivals"]
+                                                                   board_rides, previous_stops, headways)
+                    routes = needs.routes - fresh["positions"]
+                    stops = (needs.target_stops | needs.anchor_stops) - fresh["arrivals"]
                     extra = [*(RealtimeTarget("positions", route, source) for route in sorted(routes)),
                              *(RealtimeTarget("arrivals", stop, source) for stop in sorted(stops))]
                     if not extra:
@@ -1051,7 +1311,7 @@ class SearchWorkflow:
                 realtime = realtime_inputs(conn, targets, network, now=now,
                                            interval_seconds=config.realtime_interval_seconds,
                                            max_data_age_seconds=policy.max_data_age_seconds,
-                                           eta_basis_policy=config.eta_basis_policy)
+                                           eta_basis_policy=config.eta_basis_policy, mark_not_departed=True)
             segments = segment_observations(conn, [r.pattern_id for c in result.candidates for r in c.rides],
                                             cohort, until=context.evaluated_at)
             shapes = transit_repository.route_shape_infos(
@@ -1060,8 +1320,11 @@ class SearchWorkflow:
                 evaluation_repository.labeled_samples(conn, cohort, before=context.evaluated_at))
             scenes = sample_rules.joint_scenes(
                 evaluation_repository.complete_scenes(conn, cohort, before=context.evaluated_at))
+        rear_vehicles: set[tuple[str, str]] = set()
         anchors = leading_gap_anchors(result.candidates, realtime, segments, cohort=cohort, context=context,
-                                      policy=policy, board_rides=board_rides, previous_stops=previous_stops)
+                                      policy=policy, board_rides=board_rides, previous_stops=previous_stops,
+                                      pattern_stops=pattern_stop_index(network),
+                                      rear_vehicles=rear_vehicles)
         summary["data_inputs"] = _jsonable(realtime.target_states)
         summary["eta_reports"] = {"usable_input_rows": len(realtime.eta_reports), "rejected": realtime.rejected}
         summary["leading_gap_anchors"] = {"count": len(anchors), "missed_board_rides": len(board_rides),
@@ -1077,7 +1340,8 @@ class SearchWorkflow:
             walks=tuple(w for w in (lookup.as_walk_result() for lookup in walks.values()) if w is not None),
             eta_reports=tuple(realtime.eta_reports), queried_stop_ids=realtime.queried_stop_ids,
             segment_observations=tuple(segments), transfer_error_samples=tuple(error_samples),
-            joint_scenes=tuple(scenes), gap_anchors=tuple(anchors),
+            joint_scenes=tuple(scenes), gap_anchors=tuple(anchors), route_headways=headways,
+            rear_vehicles=frozenset(rear_vehicles),
         )
         evaluation = evaluate_candidates(result, context, inputs, policy,
                                          search_index=index if policy.recovery_search else None)
@@ -1133,7 +1397,10 @@ class SearchWorkflow:
                     "recommended_timed_candidate_id": recommendation.recommended_timed_candidate_id,
                 },
                 "counts": {"static_candidates": len(result.candidates), "timed_candidates": len(timed),
-                           "ranked": len(recommendation.ranked), "limited": len(recommendation.excluded)},
+                           "ranked": len(recommendation.ranked), "limited": len(recommendation.excluded),
+                           # 배차간격 기반 예상 시각이 들어간 조합(순위는 경로마다 가장 빠른 하나만, 실시간 후보 뒤).
+                           "estimated": sum(1 for item in timed if uses_headway_estimate(item))},
+                "headway_estimate": {"route_headway_seconds": {h.route_id: h.headway_seconds for h in headways}},
                 "samples": {"saved_or_reused": len(set(sample_ids.values())),
                             "skipped": dict(Counter(sample_skips.values()))},
                 "scenes": {"saved_or_reused": len(scene_ids), "skipped": dict(scene_skips)},

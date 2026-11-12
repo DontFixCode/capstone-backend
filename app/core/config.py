@@ -127,6 +127,20 @@ class Settings(BaseSettings):
     service_area_geojson: str | None = None
     # 장소 검색 제공처. 프론트엔드와 지도 제공처를 확정하기 전이라 비어 있고, 비어 있으면 /places/search는 503이다.
     places_provider: str | None = None
+    # 버스 노선 지도 형상 제공처. 지원 값은 odsay이며 비우면 형상을 수집하지 않는다(기존 저장분은 그대로 반환).
+    route_shape_provider: str | None = None
+    # ODsay API 키(lab.odsay.com, 서버 플랫폼 키는 호출하는 서버의 IP를 등록해야 한다). 접두사 없이 읽는다.
+    odsay_api_key: SecretStr | None = Field(default=None, validation_alias="ODSAY_API_KEY")
+    odsay_timeout_seconds: float = Field(default=60.0, gt=0)
+    # ODsay 계정의 하루 호출 한도(확인한 값). 최근 24시간 호출 수와 비교해 남은 만큼만 호출한다. 근거 없는 기본값을
+    # 두지 않으며, 비우면 워커는 형상을 자동 수집하지 않는다(scripts.import_route_shapes의 --max-calls로만 실행).
+    odsay_daily_call_limit: int | None = Field(default=None, gt=0)
+    # ODsay 도시 코드(대전 3000)와 노선 그래픽 조회 1회에 넣는 최대 노선 수. 호출 수를 아끼려고 받아야 할 노선을 한 요청에
+    # 최대한 넣는다. 요청이 실패하면 수집 흐름이 반으로 나눠 다시 시도한다.
+    odsay_city_code: str = "3000"
+    odsay_lane_batch_size: int = Field(default=200, gt=0, le=1000)
+    # 저장한 형상을 다시 받는 간격(초, 기본 30일). 경유 정류소가 바뀌어 패턴이 달라진 노선은 이 간격과 무관하게 다시 받는다.
+    route_shape_refresh_interval_seconds: float = Field(default=2_592_000.0, gt=0)
     # 워커 작업 대기열(검색 접수·이동 재평가)을 확인하는 간격. 공공 API 수집 주기와 별개다.
     job_poll_seconds: float = Field(default=2.0, gt=0)
     # 검색 작업 임대 시간·최대 시도 수. 워커가 중단돼 임대가 지나면 다시 가져가고, 시도를 다 쓰면 error로 끝낸다.
@@ -155,7 +169,8 @@ class Settings(BaseSettings):
         "search_expires_seconds", "tmap_search_option", "tmap_max_lookups_per_search",
         "sample_label_deadline_seconds", "tmap_app_key", "auth_jwt_secret", "auth_jwt_issuer",
         "stops_nearby_default_radius_meters", "stops_nearby_max_radius_meters", "places_provider",
-        "journey_location_max_age_seconds", "service_area_geojson",
+        "journey_location_max_age_seconds", "service_area_geojson", "route_shape_provider", "odsay_api_key",
+        "odsay_daily_call_limit",
         mode="before",
     )
     @classmethod

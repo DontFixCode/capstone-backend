@@ -296,6 +296,45 @@ class ResponseRulesTest(unittest.TestCase):
         self.assertEqual(views.start_limit_reasons(unranked("time_unknown", ("a", "b"), ("b", "c"))), ["a", "b", "c"])
         self.assertEqual(views.start_limit_reasons({"rank_no": 2, "evaluation": {"reason_codes": ["x"]}}), [])
 
+    def test_visible_candidates_keep_best_tier_per_static_route(self):
+        def candidate(route, option, rank=None, status="feasible"):
+            return {"static_route_key": route, "option_key": option, "rank_no": rank,
+                    "evaluation": {"connection_status": status}}
+
+        found = views.visible_candidates([
+            candidate("R1", "a", rank=1), candidate("R1", "b", status="negative_slack"), candidate("R1", "c"),
+            candidate("R2", "d", status="negative_slack"), candidate("R2", "e", status="time_unknown"),
+            candidate("R3", "f", status="negative_slack"), candidate("R3", "g", status="confirmed_infeasible"),
+        ])
+        self.assertEqual([c["option_key"] for c in found], ["a", "e", "f", "g"],
+                         "순위 있는 경로는 순위 조합만, 없으면 시작 가능한 조합만, 그것도 없으면 전부")
+
+    def test_visible_candidates_show_fastest_estimate_per_route_after_ranked(self):
+        def candidate(route, option, *, rank=None, total=None, source="provider", status="feasible", board=None):
+            leg = {"kind": "bus", "leg_index": 1, "board_eta": {"eta_source": source, "predicted_arrival_at": board},
+                   "alight_eta": {"eta_source": source} if total is not None or source == "provider" else None}
+            return {"id": option, "static_route_key": route, "option_key": option, "rank_no": rank,
+                    "nominal_total_seconds": total, "legs": [{"kind": "walk", "leg_index": 0}, leg],
+                    "boarding_count": 1, "evaluation": {"connection_status": status}}
+
+        rows = [
+            candidate("R1", "limited"),
+            candidate("R2", "slow", total=2940, source="headway_estimate"),
+            candidate("R2", "fast", total=1740, source="headway_estimate"),
+            candidate("R3", "estimate", total=1500, source="headway_estimate"),
+            candidate("R3", "ranked", rank=1, total=1900),
+            candidate("R4", "later", total=1600, source="headway_estimate"),
+            candidate("R5", "second-bus", source="headway_estimate", board="2026-11-12T09:09:00Z"),
+            candidate("R5", "first-bus", source="headway_estimate", board="2026-11-12T08:49:00Z"),
+        ]
+        found = views.visible_candidates(rows)
+        self.assertEqual([c["option_key"] for c in found], ["ranked", "later", "fast", "limited", "first-bus"],
+                         "순위 후보 → 경로별 가장 빠른 예상 후보(예상 시간 순) → 나머지(시간이 덜 채워진 예상은 이른 승차 하나)")
+        self.assertEqual([views.is_estimated(c) for c in found], [False, True, True, False, True])
+        search = {"status": "data_limited", "expires_at": self.NOW + timedelta(minutes=5)}
+        view = views.candidate_view(search, rows[2], self.NOW)
+        self.assertEqual((view["estimated"], view["rank"], view["startMode"]), (True, None, "data_limited"))
+
     def test_profile_patch_distinguishes_omitted_and_null(self):
         self.assertFalse(ProfilePatch.model_validate({}).provided())
         self.assertTrue(ProfilePatch.model_validate({"displayName": None}).provided())

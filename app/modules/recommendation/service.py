@@ -54,15 +54,25 @@ def recommend_candidates(evaluation: EvaluationResult) -> RecommendationResult:
 
     nominal·expected 모두 비용 → 환승 횟수 → 도보시간 → 안정적인 후보 ID 순이다. 순위에 들지 못한 후보는 숫자를
     채우지 않고 이유와 함께 제외 목록으로 반환한다.
+
+    배차간격 기반 예상 시각이 들어간 후보(아직 출발하지 않은 차량)는 실시간 예측만으로 계산된 후보 뒤에 순위를 준다
+    (ranked_with_headway_estimate). 같은 정적 경로의 예상 후보는 가장 빠른 하나만 순위에 넣는다. 나머지는 같은 경로를
+    배차간격만큼 뒤 차량으로 타는 반복이다(later_headway_estimate_not_ranked).
     """
-    mode, mode_reasons = select_ranking_mode(evaluation.candidates, evaluation.limited)
+    later_estimates = _later_estimates(evaluation.candidates)
+    # 비교 모드는 실시간 예측만으로 계산된 후보로 정한다. 예상 후보는 기대시간이 없어 그 뒤에서 기준 이동시간으로만 비교한다.
+    mode, mode_reasons = select_ranking_mode(
+        [item for item in evaluation.candidates if not uses_headway_estimate(item)], evaluation.limited)
+    if mode_reasons == ("no_comparable_candidates",) and any(
+            _nominal_eligible(item) and uses_headway_estimate(item) for item in evaluation.candidates):
+        mode_reasons = ("headway_estimates_only",)
     rankable: list[EvaluatedCandidate] = []
     excluded: list[ExcludedCandidate] = []
     for item in (*evaluation.candidates, *evaluation.limited):
-        if _time_for_mode(item, mode) is not None:
+        if item.timed_candidate_id not in later_estimates and _time_for_mode(item, mode) is not None:
             rankable.append(item)
         else:
-            excluded.append(_excluded(item, mode))
+            excluded.append(_excluded(item, mode, later_estimate=item.timed_candidate_id in later_estimates))
 
     ordered = sorted(rankable, key=lambda item: _sort_key(item, mode))
     ranked = tuple(
@@ -90,6 +100,28 @@ def recommend_candidates(evaluation: EvaluationResult) -> RecommendationResult:
     )
 
 
+def uses_headway_estimate(item: EvaluatedCandidate) -> bool:
+    """배차간격 기반 예상 시각(아직 출발하지 않은 차량)이 들어간 후보. 실시간 예측만으로 계산된 후보 뒤에 순위를 준다."""
+    return any(
+        eta is not None and eta.eta_source == "headway_estimate"
+        for leg in item.legs
+        for eta in (leg.board_eta, leg.alight_eta)
+    )
+
+
+def _later_estimates(candidates: Sequence[EvaluatedCandidate]) -> frozenset[str]:
+    """같은 정적 경로의 예상 후보 가운데 가장 빠른 하나를 뺀 나머지(순위에 넣지 않는 조합)의 후보 ID."""
+    fastest: dict[str, EvaluatedCandidate] = {}
+    estimates = [item for item in candidates if _nominal_eligible(item) and uses_headway_estimate(item)]
+    for item in estimates:
+        current = fastest.get(item.static_candidate_id)
+        if current is None or (item.nominal_total_seconds, item.timed_candidate_id) < (
+                current.nominal_total_seconds, current.timed_candidate_id):
+            fastest[item.static_candidate_id] = item
+    kept = {item.timed_candidate_id for item in fastest.values()}
+    return frozenset(item.timed_candidate_id for item in estimates if item.timed_candidate_id not in kept)
+
+
 def _nominal_eligible(item: EvaluatedCandidate) -> bool:
     return (
         item.time_status == "available"
@@ -107,6 +139,9 @@ def _negative_slack_with_expected(item: EvaluatedCandidate) -> bool:
 
 
 def _time_for_mode(item: EvaluatedCandidate, mode: RankingMode) -> float | None:
+    if uses_headway_estimate(item):
+        # 예상 후보는 기대시간이 없다. 어느 모드에서든 실시간 후보 뒤에서 기준 이동시간으로만 비교한다(두 시간을 섞지 않음).
+        return item.nominal_total_seconds if _nominal_eligible(item) else None
     if mode == "nominal":
         return item.nominal_total_seconds if _nominal_eligible(item) else None
     if _nominal_eligible(item) or _negative_slack_with_expected(item):
@@ -116,7 +151,8 @@ def _time_for_mode(item: EvaluatedCandidate, mode: RankingMode) -> float | None:
 
 def _sort_key(item: EvaluatedCandidate, mode: RankingMode) -> tuple:
     cost = recommendation_cost(_time_for_mode(item, mode))
-    return cost, item.transfer_count, item.walk_seconds, item.timed_candidate_id
+    # 배차간격 예상은 실제 출발과 수 분 차이 날 수 있어, 실시간 예측만으로 계산된 후보를 먼저 둔다.
+    return uses_headway_estimate(item), cost, item.transfer_count, item.walk_seconds, item.timed_candidate_id
 
 
 def _ranked(
@@ -133,6 +169,8 @@ def _ranked(
             reasons.extend(_tie_break_reasons(item, following, mode))
     if item.connection_status == "negative_slack":
         reasons.append("nominal_connection_negative_slack")
+    if uses_headway_estimate(item):
+        reasons.append("ranked_with_headway_estimate")
     if item.journey_probability is None:
         reasons.append("journey_probability_unavailable")
     if any(value is None for value in item.transfer_probabilities):
@@ -166,8 +204,10 @@ def _tie_break_reasons(item: EvaluatedCandidate, following: EvaluatedCandidate, 
     return ["tie_broken_by_candidate_id"]
 
 
-def _excluded(item: EvaluatedCandidate, mode: RankingMode) -> ExcludedCandidate:
+def _excluded(item: EvaluatedCandidate, mode: RankingMode, *, later_estimate: bool = False) -> ExcludedCandidate:
     reasons = set(item.reason_codes)
+    if later_estimate:
+        reasons.add("later_headway_estimate_not_ranked")
     if item.connection_status == "negative_slack":
         reasons.add("nominal_connection_not_established")
     elif item.connection_status == "confirmed_infeasible":

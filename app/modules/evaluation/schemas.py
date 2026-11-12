@@ -27,7 +27,8 @@ DESTINATION_REF = "@destination"
 
 # 거리 비례 추정(route_average_ratio)은 단위·운행 범위 검증 전이라 값에 포함하지 않는다.
 # leading_vehicle_gap: 앞차 ETA 기반 후행 차량 도착시각 근사(Phase 3B, 검증 전, app.modules.evaluation.eta).
-EtaSource = Literal["provider", "historical_segments", "leading_vehicle_gap"]
+# headway_estimate: 아직 출발하지 않은 다음 차량의 배차간격 기반 예상(직전 차량 시각 + 배차간격, 검증 전). 순위는 실시간 후보 뒤에 준다.
+EtaSource = Literal["provider", "historical_segments", "leading_vehicle_gap", "headway_estimate"]
 TimeStatus = Literal["available", "partial", "unavailable"]
 ConnectionStatus = Literal["feasible", "negative_slack", "time_unknown", "confirmed_infeasible"]
 WalkStatus = Literal["available", "no_route", "lookup_failed"]
@@ -101,6 +102,10 @@ class EtaReport(FrozenSchema):
     basis_source: str | None = None
     # 원천이 준 남은 정류장 수(대전시 STATUS_POS, 검증 전). 회차 키가 없을 때 같은 차량의 승하차 예측 일관성 확인에 쓴다.
     stops_away: int | None = None
+    # 다음 차량이 기점·회차지에서 아직 출발하지 않았다는 응답(대전시 MSG_TP=07). 이때 remaining_seconds는 실제 예측이
+    # 아니어서 ETA로 쓰지 않고, basis_at을 직전 차량(last_passed_vehicle_id)이 이 정류소를 지난 시각으로 본다(검증 전).
+    not_departed: bool = False
+    last_passed_vehicle_id: str | None = None
 
 
 class VehicleEta(FrozenSchema):
@@ -217,8 +222,16 @@ class GapAnchor(FrozenSchema):
     anchor_stop_order: int
     # 순서 판정에 쓴 원천 관측 참조.
     source_ref: str | None = None
-    # 노선 위치상 A가 이미 D에 있어 X를 D 바로 앞 정류소로 잡은 조합. A는 D에 도착했으므로 R_A(D)를 0 아래로 두지 않는다.
-    leading_at_target: bool = False
+    # 노선 위치로 B → X → A → D 순서(A는 아직 D를, B는 X를 지나지 않음)를 확인한 조합. 확인했으면 예측 도착이 평가 시각보다
+    # 이르더라도 지금 도착 중으로 보고 R_A(D)·R_B(X)를 0 아래로 두지 않는다(응답 기준시각이 평가 시각보다 앞서 생기는 차이).
+    order_confirmed: bool = False
+
+
+class RouteHeadway(FrozenSchema):
+    """평가 시각에 적용할 노선 배차간격. 호출자가 요일 구분·운행시간을 확인해 준다."""
+
+    route_id: str
+    headway_seconds: PositiveFloat
 
 
 class EvaluationInputs(FrozenSchema):
@@ -236,6 +249,11 @@ class EvaluationInputs(FrozenSchema):
     joint_scenes: tuple[JointScene, ...] = ()
     # 앞차 ETA 기반 승하차 ETA 근사의 차량 조합. 비면 이 근사를 쓰지 않는다.
     gap_anchors: tuple[GapAnchor, ...] = ()
+    # 아직 출발하지 않은 다음 차량의 배차간격 기반 예상에 쓰는 노선별 배차간격. 비면 예상을 만들지 않는다.
+    route_headways: tuple[RouteHeadway, ...] = ()
+    # (pattern_id, vehicle_id): 노선 위치상 뒤에 운행 중인 차량이 없는 맨 뒤 차량. 기점 정류소의 '다음 차량 출발 전' 응답은
+    # 직전 차량번호를 주지 않으므로, 이 확인이 있을 때만 그 응답을 맨 뒤 차량 뒤가 출발 전이라는 근거로 쓴다.
+    rear_vehicles: frozenset[tuple[str, str]] = frozenset()
 
 
 class TimedLeg(FrozenSchema):

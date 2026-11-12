@@ -19,6 +19,8 @@ START_RANKED = "ranked"
 START_DATA_LIMITED = "data_limited"
 # 자료 부족(time_unknown)이 아니라 기준 ETA·도보 결과로 연결이 성립하지 않는다고 판정된 상태.
 BLOCKING_CONNECTION_STATUSES = ("confirmed_infeasible", "negative_slack")
+# 아직 출발하지 않은 차량의 배차간격 기반 예상 시각(evaluation.schemas.EtaSource).
+HEADWAY_ESTIMATE = "headway_estimate"
 
 
 def _sid(value: Any) -> str | None:
@@ -147,11 +149,21 @@ def start_limit_reasons(candidate: dict[str, Any]) -> list[str]:
     return list(dict.fromkeys([*(evaluation.get("reason_codes") or []), *(ranking.get("reason_codes") or [])]))
 
 
+def is_estimated(row: dict[str, Any]) -> bool:
+    """배차간격 기반 예상 시각이 들어간 후보(아직 출발하지 않은 차량). 실시간 예측이 아니므로 화면에 "예상"으로 표시한다."""
+    return any(
+        (leg.get(side) or {}).get("eta_source") == HEADWAY_ESTIMATE
+        for leg in row.get("legs") or [] if leg.get("kind") == "bus"
+        for side in ("board_eta", "alight_eta")
+    )
+
+
 def candidate_view(search: dict[str, Any], row: dict[str, Any], now: datetime) -> dict[str, Any]:
     mode, reason = start_mode(search, row, now)
     ranking = (row.get("evaluation") or {}).get("ranking") or {}
     return {
         "candidateId": str(row["id"]), "rank": row.get("rank_no"), "rankingMode": row.get("ranking_mode"),
+        "estimated": is_estimated(row),
         "startable": mode is not None, "startMode": mode, "startBlockedReason": reason,
         "staticRouteKey": row["static_route_key"], "optionKey": row["option_key"],
         "boardingCount": row["boarding_count"], "transferCount": max(0, row["boarding_count"] - 1),
@@ -186,6 +198,59 @@ def service_area_view(scope: dict[str, Any] | None) -> dict[str, Any] | None:
 def _data_as_of(summary: dict[str, Any]) -> Any:
     times = [s.get("collected_at") for s in (summary.get("data_inputs") or {}).values() if s.get("collected_at")]
     return min(times) if times else None
+
+
+def visible_candidates(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """앱에 보일 후보. 같은 정적 경로의 차량 조합이 여러 개면 순위가 있는 조합만, 없으면 시작 가능한 조합만 남긴다.
+
+    나머지는 같은 경로를 앞 차를 놓치거나 다른 차량으로 타는 조합이다. 모든 조합은 저장되어 있고 화면 목록에서만 뺀다.
+    순위를 받지 못한 배차간격 기반 예상 조합은 경로마다 하나만 남긴다(시간이 다 채워진 가장 빠른 조합, 없으면 가장 이른 승차).
+    시간이 다 채워진 예상 조합은 순위 후보 다음에 예상 이동시간 순으로 두고, 그 밖의 순위 없는 조합은 뒤에 둔다.
+    """
+    def tier(candidate: dict[str, Any]) -> int:
+        if candidate.get("rank_no") is not None:
+            return 0
+        blocked = (candidate.get("evaluation") or {}).get("connection_status") in BLOCKING_CONNECTION_STATUSES
+        return 2 if blocked else 1
+
+    def estimate_key(candidate: dict[str, Any]) -> tuple | None:
+        """같은 경로의 예상 조합끼리 비교할 키(작을수록 먼저). 예상 조합이 아니면 None."""
+        if tier(candidate) != 1 or not is_estimated(candidate):
+            return None
+        total = candidate.get("nominal_total_seconds")
+        boards = tuple(str((leg.get("board_eta") or {}).get("predicted_arrival_at") or "")
+                       for leg in candidate.get("legs") or [] if leg.get("kind") == "bus")
+        return (1, 0.0, boards) if total is None else (0, float(total), boards)
+
+    best: dict[str, int] = {}
+    first: dict[str, tuple] = {}
+    for candidate in candidates:
+        key = candidate["static_route_key"]
+        best[key] = min(best.get(key, 2), tier(candidate))
+        estimate = estimate_key(candidate)
+        if estimate is not None:
+            first[key] = min(first.get(key, estimate), estimate)
+
+    shown: list[dict[str, Any]] = []
+    kept: set[str] = set()
+    for candidate in candidates:
+        key = candidate["static_route_key"]
+        if tier(candidate) != best[key]:
+            continue
+        estimate = estimate_key(candidate)
+        if estimate is not None:
+            if estimate != first[key] or key in kept:
+                continue
+            kept.add(key)
+        shown.append(candidate)
+
+    def order(candidate: dict[str, Any]) -> tuple:
+        if candidate.get("rank_no") is not None:
+            return 0, 0.0
+        estimate = estimate_key(candidate)
+        return (1, estimate[1]) if estimate is not None and estimate[0] == 0 else (2, 0.0)
+
+    return sorted(shown, key=order)
 
 
 def search_view(search: dict[str, Any], candidates: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
@@ -228,5 +293,5 @@ def search_view(search: dict[str, Any], candidates: list[dict[str, Any]], now: d
             "evaluationTruncated": (summary.get("evaluation_coverage") or {}).get("truncated"),
             "counts": summary.get("counts"),
         },
-        "candidates": [] if processing else [candidate_view(search, c, now) for c in candidates],
+        "candidates": [] if processing else [candidate_view(search, c, now) for c in visible_candidates(candidates)],
     }
