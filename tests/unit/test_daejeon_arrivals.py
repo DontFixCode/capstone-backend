@@ -194,37 +194,45 @@ class LeadingVehicleGapTest(unittest.TestCase):
 
 
 class FollowingBoardGapTest(unittest.TestCase):
-    """Phase 3B 승차 정류소 적용: 승차 D(10)에 앞차 A만 나올 때 바로 뒤 B의 승차 ETA = R_A(D) + R_B(X), X(7)."""
+    """Phase 3B 승차 정류소 적용: 승차 D(10)에 선두 A만 나올 때 뒤 차량을 한 대씩 잇는다.
+
+    B1 = R_A(D) + R_B1(X1), X1(7)은 A 위치. B2 = R_B1(D) + R_B2(X2), X2(4)는 B1 위치. 하차는 앞 차량 하차 + 같은 간격.
+    """
 
     AT, RIDE, POLICY, eta = (SameVehicleAlightTest.AT, SameVehicleAlightTest.RIDE, SameVehicleAlightTest.POLICY,
                              SameVehicleAlightTest.eta)
-    B, A = "대전75자0001", "대전75자0002"
+    A, B1, B2 = "대전75자0002", "대전75자0001", "대전75자0003"
 
-    def legs(self, at_anchor):
-        board_anchor = GapAnchor(pattern_id="P", target_stop_id="A", target_stop_order=10, trailing_vehicle_id=self.B,
-                                 leading_vehicle_id=self.A, anchor_stop_id="X", anchor_stop_order=7, source_ref="pos")
-        alight_anchor = board_anchor.model_copy(update={"target_stop_id": "B", "target_stop_order": 15})
+    def legs(self, at_x1, at_x2=()):
+        first = GapAnchor(pattern_id="P", target_stop_id="A", target_stop_order=10, trailing_vehicle_id=self.B1,
+                          leading_vehicle_id=self.A, anchor_stop_id="X1", anchor_stop_order=7, source_ref="pos")
+        second = first.model_copy(update={"trailing_vehicle_id": self.B2, "leading_vehicle_id": self.B1,
+                                          "anchor_stop_id": "X2", "anchor_stop_order": 4})
         table = EtaTable(by_position={("P", 10, "A"): (self.eta("A", 10, 120, self.A, 3),),
                                       ("P", 15, "B"): (self.eta("B", 15, 480, self.A, 8),),
-                                      ("P", 7, "X"): tuple(at_anchor)}, rejected_by_stop={}, rejected_counts={})
-        anchors = {(a.pattern_id, a.target_stop_order, a.trailing_vehicle_id): a for a in (board_anchor, alight_anchor)}
-        return build_ride_legs(self.RIDE, table, {}, start_at=self.AT, queried_stop_ids=frozenset({"A", "B", "X"}),
+                                      ("P", 7, "X1"): tuple(at_x1), ("P", 4, "X2"): tuple(at_x2)},
+                         rejected_by_stop={}, rejected_counts={})
+        anchors = {(a.pattern_id, a.target_stop_order, a.trailing_vehicle_id): a for a in (first, second)}
+        return build_ride_legs(self.RIDE, table, {}, start_at=self.AT, queried_stop_ids=frozenset({"A", "B"}),
                                policy=self.POLICY, anchors=anchors, evaluated_at=self.AT)
 
-    def test_adds_following_vehicle_option(self):
-        legs = self.legs([self.eta("X", 7, 200, self.B, 2)])
-        self.assertEqual([leg.vehicle_id for leg in legs.legs], [self.A, self.B], "앞차 옵션은 그대로, 뒤 차량 추가")
-        follow = legs.legs[1]
-        self.assertEqual((follow.vehicle_rank, follow.board_eta.eta_source, follow.board_eta.stops_away),
+    def test_chains_following_vehicles_and_their_alight(self):
+        legs = self.legs([self.eta("X1", 7, 200, self.B1, 2)], [self.eta("X2", 4, 150, self.B2, 1)])
+        self.assertEqual([leg.vehicle_id for leg in legs.legs], [self.A, self.B1, self.B2], "선두 옵션은 그대로")
+        b1, b2 = legs.legs[1], legs.legs[2]
+        self.assertEqual((b1.vehicle_rank, b1.board_eta.eta_source, b1.board_eta.stops_away),
                          (1, "leading_vehicle_gap", 5))
-        self.assertEqual(follow.board_eta.predicted_arrival_at, self.AT + timedelta(seconds=320), "2분 + 3분20초")
-        self.assertEqual(follow.alight_eta.predicted_arrival_at, self.AT + timedelta(seconds=680), "같은 X로 하차 근사")
-        self.assertIn(BOARD_ETA_BY_LEADING_VEHICLE_GAP, follow.reason_codes)
+        self.assertEqual([leg.board_eta.predicted_arrival_at for leg in legs.legs],
+                         [self.AT + timedelta(seconds=s) for s in (120, 320, 470)], "2분+3분20초, 그 뒤 +2분30초")
+        self.assertEqual([leg.alight_eta.predicted_arrival_at for leg in legs.legs],
+                         [self.AT + timedelta(seconds=s) for s in (480, 680, 830)], "앞 차량 하차 + 같은 간격")
+        self.assertTrue({BOARD_ETA_BY_LEADING_VEHICLE_GAP, ALIGHT_ETA_BY_LEADING_VEHICLE_GAP} <= set(b2.reason_codes))
 
-    def test_no_following_option_when_anchor_vehicle_differs(self):
-        legs = self.legs([self.eta("X", 7, 200, "대전75자9999", 2)])
+    def test_stops_chain_when_anchor_vehicle_differs(self):
+        legs = self.legs([self.eta("X1", 7, 200, "대전75자9999", 2)], [self.eta("X2", 4, 150, self.B2, 1)])
         self.assertEqual([leg.vehicle_id for leg in legs.legs], [self.A])
-        self.assertIn("leading_gap_trailing_eta_absent", legs.reason_codes)
+        self.assertTrue({"leading_gap_trailing_eta_absent", "leading_gap_leading_eta_absent"} <= set(legs.reason_codes),
+                        "B1을 못 만들면 B1 기준인 B2도 만들지 않음")
 
 
 class LeadingGapAnchorTest(unittest.TestCase):
@@ -239,7 +247,7 @@ class LeadingGapAnchorTest(unittest.TestCase):
     def position(self, obs_id, seq, vehicle):
         return {"id": obs_id, "pattern_key": "P", "stop_seq": seq, "vehicle_no": vehicle, "stop_external_id": f"S{seq}"}
 
-    def select(self, reports, positions, board_rides=frozenset()):
+    def select(self, reports, positions, board_rides=None):
         realtime = flow.RealtimeInputs(reports, frozenset({"A", "B"}), {}, [], {}, positions)
         candidate = build_static_candidate([self.RIDE], transfer_meters=[], access_straight_line_meters=None,
                                            egress_straight_line_meters=None)
@@ -259,15 +267,24 @@ class LeadingGapAnchorTest(unittest.TestCase):
         self.assertEqual(self.anchors(b_seq=12, a_seq=12), [], "두 차량이 같은 정류장 사이면 쓰지 않음")
         self.assertEqual(self.anchors(b_seq=8, a_seq=15), [], "A가 이미 D에 있으면 X–D 구간이 없음")
 
-    def test_selects_vehicle_behind_leading_for_missed_board_ride(self):
+    def test_chains_vehicles_behind_leading_until_ready_time(self):
         a, b, c = "대전75자0002", "대전75자0001", "대전75자0003"
         reports = [self.report("A", 10, 120, a, 2), self.report("B", 15, 480, a, 7)]
         positions = [self.position(1, 8, a), self.position(2, 5, b), self.position(3, 3, c)]
+        missed = {("P", 10): self.AT + timedelta(seconds=600)}
+
+        def chain(found):
+            return [(x.target_stop_order, x.trailing_vehicle_id, x.leading_vehicle_id, x.anchor_stop_id) for x in found]
+
         self.assertEqual(self.select(reports, positions), [], "선두 차량을 놓치지 않는 구간은 고르지 않음")
-        anchors = self.select(reports, positions, board_rides={("P", 10)})
-        self.assertEqual([(x.target_stop_order, x.trailing_vehicle_id, x.leading_vehicle_id, x.anchor_stop_id)
-                          for x in anchors], [(10, b, a, "S8"), (15, b, a, "S8")], "승차·하차 모두 같은 X")
-        self.assertEqual(self.select(reports, [*positions, self.position(4, 8, "대전75자0004")], board_rides={("P", 10)}), [],
+        self.assertEqual(chain(self.select(reports, positions, missed)), [(10, b, a, "S8")],
+                         "X(S8) 조회 전에는 바로 뒤 차량까지만")
+        at_x = [*reports, self.report("S8", 8, 200, b, 3)]
+        self.assertEqual(chain(self.select(at_x, positions, missed)), [(10, b, a, "S8"), (10, c, b, "S5")],
+                         "B 승차(320초)가 준비 시각(600초) 전이면 그 뒤 차량을 B 위치 기준으로 이음")
+        self.assertEqual(chain(self.select(at_x, positions, {("P", 10): self.AT + timedelta(seconds=300)})),
+                         [(10, b, a, "S8")], "준비 시각 뒤에 오는 차량이 나오면 멈춤")
+        self.assertEqual(self.select(reports, [*positions, self.position(4, 8, "대전75자0004")], missed), [],
                          "선두 차량과 같은 위치에 다른 차량이 있으면 순서가 모호")
 
 

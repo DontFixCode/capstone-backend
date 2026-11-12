@@ -226,15 +226,20 @@ def build_ride_legs(
 ) -> RideLegs:
     """정적 탑승 구간의 차량 옵션을 도착 예상 순서로 구성한다. 응답에 없는 차량을 운행 없음으로 해석하지 않는다.
 
-    승차 정류소 응답에 없는 뒤 차량은 앞차 ETA 기반 근사로 만든 승차 ETA를 옵션에 더한다(following_board_etas).
+    승차 정류소 응답에 없는 뒤 차량은 앞차 ETA 기반 근사로 만든 승차 ETA를 옵션에 더하고(following_board_etas), 그
+    차량의 하차 ETA를 다른 근거로 만들지 못하면 바로 앞 차량의 하차 ETA에 같은 간격을 더한다(_alight_behind_ahead).
     """
-    listed = table.by_position.get((ride.pattern_id, ride.board_position, ride.board_stop_id), ())
+    target = (ride.pattern_id, ride.board_position, ride.board_stop_id)
+    listed = table.by_position.get(target, ())
     following, following_reasons = (
         following_board_etas(ride, table, anchors, evaluated_at) if anchors and evaluated_at is not None else ((), ())
     )
+    ahead_of = {anchor.trailing_vehicle_id: anchor.leading_vehicle_id for anchor in (anchors or {}).values()
+                if (anchor.pattern_id, anchor.target_stop_order, anchor.target_stop_id) == target}
     board_etas = tuple(sorted((*listed, *following), key=_eta_order))
     horizon_end_at = start_at + timedelta(seconds=policy.search_horizon_seconds)
     legs: list[TimedLeg] = []
+    by_vehicle: dict[str, TimedLeg] = {}
     horizon_excluded = 0
     for rank, board_eta in enumerate(board_etas):
         if board_eta.predicted_arrival_at > horizon_end_at:
@@ -242,7 +247,13 @@ def build_ride_legs(
             continue
         alight_eta, leg_reasons = resolve_alight_eta(ride, board_eta, table, durations, policy, anchors, evaluated_at)
         if board_eta.eta_source == "leading_vehicle_gap":
-            leg_reasons = tuple(sorted({*leg_reasons, BOARD_ETA_BY_LEADING_VEHICLE_GAP}))
+            added = {BOARD_ETA_BY_LEADING_VEHICLE_GAP}
+            ahead = by_vehicle.get(ahead_of.get(board_eta.vehicle_id, ""))
+            if alight_eta is None and ahead is not None and evaluated_at is not None:
+                alight_eta = _alight_behind_ahead(ride, board_eta, ahead, evaluated_at)
+                if alight_eta is not None:
+                    added.add(ALIGHT_ETA_BY_LEADING_VEHICLE_GAP)
+            leg_reasons = tuple(sorted({*leg_reasons, *added}))
         legs.append(
             TimedLeg(
                 route_id=ride.route_id,
@@ -265,6 +276,8 @@ def build_ride_legs(
                 reason_codes=leg_reasons,
             )
         )
+        if board_eta.vehicle_id is not None:
+            by_vehicle[board_eta.vehicle_id] = legs[-1]
 
     reasons: set[str] = set(following_reasons)
     if not board_etas:
@@ -301,11 +314,15 @@ def leading_vehicle_gap_eta(
     목록에서 B가 가장 먼저 도착할 차량이고 진행 위치가 승차 예측과 맞을 때만 쓴다. A의 X 통과시각 근거(동일 차량·경유
     위치의 검증된 이벤트)가 없으므로 Δ_A(X)=0(MVP 대체)이다. 여러 정류소의 누적 ETA는 더하지 않는다.
     """
-    pair, reason = _leading_gap_pair(ride.pattern_id, anchor, table)
-    if pair is None:
-        return None, reason
-    a, x = pair
-    if x.run_key != board_eta.run_key:
+    leading = [
+        eta
+        for eta in table.by_position.get((ride.pattern_id, anchor.target_stop_order, anchor.target_stop_id), ())
+        if eta.vehicle_id == anchor.leading_vehicle_id
+    ]
+    if not leading or anchor.leading_vehicle_id == anchor.trailing_vehicle_id:
+        return None, "leading_gap_leading_eta_absent"
+    a, x = leading[0], _trailing_at_anchor(ride.pattern_id, anchor, table)
+    if x is None or x.run_key != board_eta.run_key:
         return None, "leading_gap_trailing_eta_absent"
     hops = anchor.anchor_stop_order - ride.board_position
     if x.stops_away is not None and board_eta.stops_away is not None and x.stops_away - board_eta.stops_away != hops:
@@ -325,51 +342,78 @@ def following_board_etas(
     anchors: GapAnchors,
     evaluated_at: datetime,
 ) -> tuple[tuple[VehicleEta, ...], tuple[str, ...]]:
-    """승차 정류소 D에 앞차 A만 나올 때 그 뒤 차량 B의 승차 ETA(Phase 3B, 검증 전). R_B(D;t0) = R_A(D;t0) + R_B(X;t0).
+    """승차 정류소 D에 앞차만 나올 때 그 뒤 차량들의 승차 ETA(Phase 3B, 검증 전). R_B(D;t0) = R_A(D;t0) + R_B(X;t0).
 
-    차량 조합(A는 D의 선두 차량, B는 노선 위치상 A 바로 뒤 차량, X는 A가 마지막으로 통과한 위치)은 검색이 고른다
-    (workflows.search.leading_gap_anchors). X의 도착 목록에서 B가 가장 먼저 도착할 차량일 때만 만들고, D 응답에 이미
-    나온 차량은 만들지 않는다. 만들지 못한 이유를 함께 돌려준다.
+    차량 조합은 검색이 노선 위치로 고른다(workflows.search.leading_gap_anchors). B는 앞 차량 A 바로 뒤 차량, X는 A가
+    마지막으로 통과한 위치다. A는 D의 선두 차량이거나 이미 이 방식으로 근사한 차량이어서, 다음 차를 놓치면 그 뒤 차량을
+    같은 방식으로 잇는다(B1은 선두 차량 기준, B2는 B1 기준). X의 도착 목록에서 B가 가장 먼저 도착할 차량일 때만 만들고,
+    D 응답에 이미 나온 차량은 만들지 않는다. 만들지 못한 이유를 함께 돌려준다.
     """
     target = (ride.pattern_id, ride.board_position, ride.board_stop_id)
-    listed = {eta.vehicle_id for eta in table.by_position.get(target, ())}
+    known = {eta.vehicle_id: eta for eta in table.by_position.get(target, ()) if eta.vehicle_id is not None}
+    pending = [anchor for _, anchor in sorted(anchors.items())
+               if (anchor.pattern_id, anchor.target_stop_order, anchor.target_stop_id) == target
+               and anchor.trailing_vehicle_id not in known]
     etas: list[VehicleEta] = []
     reasons: set[str] = set()
-    for key in sorted(anchors):
-        anchor = anchors[key]
-        if (anchor.pattern_id, anchor.target_stop_order, anchor.target_stop_id) != target \
-                or anchor.trailing_vehicle_id in listed:
-            continue
-        pair, reason = _leading_gap_pair(ride.pattern_id, anchor, table)
-        remaining = None if pair is None else _leading_gap_remaining(*pair, evaluated_at)
-        if pair is None or remaining is None:
-            reasons.add(reason or "leading_gap_eta_before_evaluation")
-            continue
-        a, x = pair
-        hops = ride.board_position - anchor.anchor_stop_order
-        etas.append(_leading_gap_vehicle_eta(
-            ride.pattern_id, ride.board_stop_id, ride.board_position, anchor.trailing_vehicle_id, x.run_key, a, x,
-            anchor, remaining, evaluated_at, stops_away=None if x.stops_away is None else x.stops_away + hops))
+    while ready := [anchor for anchor in pending if anchor.leading_vehicle_id in known]:
+        for anchor in ready:
+            pending.remove(anchor)
+            lead, x = known[anchor.leading_vehicle_id], _trailing_at_anchor(ride.pattern_id, anchor, table)
+            remaining = None if x is None else _leading_gap_remaining(lead, x, evaluated_at)
+            if x is None or remaining is None:
+                reasons.add("leading_gap_trailing_eta_absent" if x is None else "leading_gap_eta_before_evaluation")
+                continue
+            hops = ride.board_position - anchor.anchor_stop_order
+            known[anchor.trailing_vehicle_id] = eta = _leading_gap_vehicle_eta(
+                ride.pattern_id, ride.board_stop_id, ride.board_position, anchor.trailing_vehicle_id, x.run_key, lead, x,
+                anchor, remaining, evaluated_at, stops_away=None if x.stops_away is None else x.stops_away + hops)
+            etas.append(eta)
+    if pending:
+        reasons.add("leading_gap_leading_eta_absent")
     return tuple(etas), tuple(sorted(reasons))
 
 
-def _leading_gap_pair(
-    pattern_id: str,
-    anchor: GapAnchor,
-    table: EtaTable,
-) -> tuple[tuple[VehicleEta, VehicleEta] | None, str | None]:
-    """목표 정류소 D의 앞차 A 예측과, 기준점 X에 가장 먼저 도착할 차량이 B일 때 그 예측."""
-    leading = [
-        eta
-        for eta in table.by_position.get((pattern_id, anchor.target_stop_order, anchor.target_stop_id), ())
-        if eta.vehicle_id == anchor.leading_vehicle_id
-    ]
-    if not leading or anchor.leading_vehicle_id == anchor.trailing_vehicle_id:
-        return None, "leading_gap_leading_eta_absent"
+def _alight_behind_ahead(
+    ride: StaticRide,
+    board_eta: VehicleEta,
+    ahead: TimedLeg,
+    evaluated_at: datetime,
+) -> VehicleEta | None:
+    """뒤 차량 B의 하차 ETA = 바로 앞 차량 A의 하차 ETA + R_B(X)(Phase 3B를 같은 X로 하차 정류소에 적용, 검증 전).
+
+    B의 승차 근사가 T_B(D) = T_A(D) + R_B(X)이므로 하차 정류소 D'에서도 T_B(D') = T_A(D') + R_B(X)다. A의 하차 ETA가
+    없거나 평가 시각보다 이르면 만들지 않는다.
+    """
+    if ahead.alight_eta is None:
+        return None
+    predicted = ahead.alight_eta.predicted_arrival_at + (board_eta.predicted_arrival_at
+                                                         - ahead.board_eta.predicted_arrival_at)
+    remaining = (predicted - evaluated_at).total_seconds()
+    if remaining < 0 or predicted <= board_eta.predicted_arrival_at:
+        return None
+    return VehicleEta(
+        pattern_id=ride.pattern_id,
+        stop_id=ride.alight_stop_id,
+        stop_order=ride.alight_position,
+        vehicle_id=board_eta.vehicle_id,
+        run_key=board_eta.run_key,
+        predicted_arrival_at=predicted,
+        eta_source="leading_vehicle_gap",
+        model_version=LEADING_VEHICLE_GAP_MODEL_VERSION,
+        horizon_seconds=remaining,
+        basis_at=evaluated_at,
+        source_generated_at=None,
+        collected_at=max(board_eta.collected_at, ahead.alight_eta.collected_at),
+        source_ref=f"leading_vehicle_gap|ahead_alight:{ahead.alight_eta.source_ref}|board:{board_eta.source_ref}",
+        basis_source=board_eta.basis_source if board_eta.basis_source == ahead.alight_eta.basis_source else None,
+    )
+
+
+def _trailing_at_anchor(pattern_id: str, anchor: GapAnchor, table: EtaTable) -> VehicleEta | None:
+    """기준점 X에 가장 먼저 도착할 차량이 B이면 그 예측."""
     at_anchor = table.by_position.get((pattern_id, anchor.anchor_stop_order, anchor.anchor_stop_id), ())
-    if not at_anchor or at_anchor[0].vehicle_id != anchor.trailing_vehicle_id:
-        return None, "leading_gap_trailing_eta_absent"
-    return (leading[0], at_anchor[0]), None
+    return at_anchor[0] if at_anchor and at_anchor[0].vehicle_id == anchor.trailing_vehicle_id else None
 
 
 def _leading_gap_remaining(a: VehicleEta, x: VehicleEta, evaluated_at: datetime) -> float | None:
