@@ -217,6 +217,8 @@ class GapAnchor(FrozenSchema):
     anchor_stop_order: int
     # 순서 판정에 쓴 원천 관측 참조.
     source_ref: str | None = None
+    # 노선 위치상 A가 이미 D에 있어 X를 D 바로 앞 정류소로 잡은 조합. A는 D에 도착했으므로 R_A(D)를 0 아래로 두지 않는다.
+    leading_at_target: bool = False
 
 
 class EvaluationInputs(FrozenSchema):

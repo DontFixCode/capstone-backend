@@ -360,7 +360,8 @@ def following_board_etas(
         for anchor in ready:
             pending.remove(anchor)
             lead, x = known[anchor.leading_vehicle_id], _trailing_at_anchor(ride.pattern_id, anchor, table)
-            remaining = None if x is None else _leading_gap_remaining(lead, x, evaluated_at)
+            remaining = None if x is None else _leading_gap_remaining(lead, x, evaluated_at,
+                                                                      leading_at_target=anchor.leading_at_target)
             if x is None or remaining is None:
                 reasons.add("leading_gap_trailing_eta_absent" if x is None else "leading_gap_eta_before_evaluation")
                 continue
@@ -416,9 +417,15 @@ def _trailing_at_anchor(pattern_id: str, anchor: GapAnchor, table: EtaTable) -> 
     return at_anchor[0] if at_anchor and at_anchor[0].vehicle_id == anchor.trailing_vehicle_id else None
 
 
-def _leading_gap_remaining(a: VehicleEta, x: VehicleEta, evaluated_at: datetime) -> float | None:
-    """R_A(D;t0) + R_B(X;t0). 평가 시각에 어느 예상 도착이 이미 지났으면 None."""
+def _leading_gap_remaining(a: VehicleEta, x: VehicleEta, evaluated_at: datetime, *,
+                           leading_at_target: bool = False) -> float | None:
+    """R_A(D;t0) + R_B(X;t0). 평가 시각에 어느 예상 도착이 이미 지났으면 None.
+
+    leading_at_target(노선 위치상 A가 이미 D에 있음)이면 R_A(D)는 0 아래로 두지 않는다.
+    """
     leading_remaining = (a.predicted_arrival_at - evaluated_at).total_seconds()
+    if leading_at_target:
+        leading_remaining = max(leading_remaining, 0.0)
     trailing_remaining = (x.predicted_arrival_at - evaluated_at).total_seconds()
     if leading_remaining < 0 or trailing_remaining < 0:
         return None
