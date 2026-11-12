@@ -7,7 +7,8 @@
     uv run python -m app.workers.main --no-jobs   # 앱 검색 실행·이동 안내 재계산 스레드를 제외
 
 정적 갱신 차례가 되면 버스 노선 형상도 이어서 수집한다(BACKEND_ROUTE_SHAPE_PROVIDER=odsay이고 일일 호출 한도
-BACKEND_ODSAY_DAILY_CALL_LIMIT이 있을 때만, 남은 한도만큼. app/workflows/route_shapes.py).
+BACKEND_ODSAY_DAILY_CALL_LIMIT이 있을 때만, 남은 한도만큼. app/workflows/route_shapes.py). 연결된 노선의 형상은 한 요청으로
+모두 다시 받으므로 하루 1회 전체 갱신에 보통 1건이 든다.
 
 상시 실행은 두 흐름을 같은 프로세스에서 돌린다: ① 공유 수집 루프(정적 갱신 → 실시간 → 표본 판정),
 ② 앱 작업 스레드(접수된 검색 실행 → 활성 이동 안내 재계산, BACKEND_JOB_POLL_SECONDS 간격). 두 흐름은 대상별 DB 잠금을
@@ -198,7 +199,11 @@ class Worker:
         return result
 
     def collect_route_shapes(self, settings: Settings, db: Database) -> dict[str, Any] | None:
-        """버스 노선 형상 수집(하루 1회, 정적 갱신 직후). 실패해도 수집 루프는 계속한다. 제공처 미설정이면 None."""
+        """버스 노선 형상 수집(하루 1회, 정적 갱신 직후). 실패해도 수집 루프는 계속한다. 제공처 미설정이면 None.
+
+        정적 정보와 같이 하루 1회 전체를 다시 받는다(refresh_all). 연결된 노선은 한 요청에 모두 넣으므로 보통 1건이고,
+        새 노선·ID 미연결 노선이 있으면 노선번호 첫 글자별 검색이 더해진다.
+        """
         if route_shapes_api.configured_provider(settings.route_shape_provider) is None:
             return None
         if settings.odsay_daily_call_limit is None:
@@ -206,7 +211,7 @@ class Worker:
             return {"status": "skipped", "reason": "daily_call_limit_unset"}
         try:
             with self.shape_client_factory(settings) as client:
-                report = route_shapes_flow.collect(db, settings, client, clock=self.clock)
+                report = route_shapes_flow.collect(db, settings, client, refresh_all=True, clock=self.clock)
         except OdsayConfigError as exc:
             logger.warning("형상 수집 건너뜀: %s", exc)
             return {"status": "skipped", "reason": "api_key_unset"}

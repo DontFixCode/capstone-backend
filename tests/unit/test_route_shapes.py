@@ -155,8 +155,7 @@ class StopMatchTest(unittest.TestCase):
         self.assertEqual(shapes.configured_provider(" ODsay "), "odsay")
         self.assertIsNone(shapes.configured_provider("kakao"))
         self.assertIsNone(shapes.configured_provider(None))
-        settings = Settings(_env_file=None, BACKEND_ROUTE_SHAPE_PROVIDER=" ", ODSAY_API_KEY="",
-                            BACKEND_ODSAY_DAILY_CALL_LIMIT="")
+        settings = Settings(_env_file=None, route_shape_provider=" ", ODSAY_API_KEY="", odsay_daily_call_limit="")
         self.assertEqual((settings.route_shape_provider, settings.odsay_api_key, settings.odsay_daily_call_limit),
                          (None, None, None))
 
@@ -348,6 +347,26 @@ class CollectorTest(unittest.TestCase):
         # 묶음 [60, 601]은 선이 1개만 온다: 60은 정류소 대응으로 확인하고 선이 없는 601만 다시 받는다.
         self.assertEqual(self.requests, [("searchBusLane", "1"), ("loadLane", "31278,31198"), ("loadLane", "31014"),
                                          ("loadLane", "31198")])
+
+
+class WorkerShapeHookTest(unittest.TestCase):
+    def test_worker_refreshes_all_shapes_after_static_refresh(self):
+        from app.workers.main import Worker
+        settings = Settings(_env_file=None, route_shape_provider="odsay", ODSAY_API_KEY=FAKE_KEY,
+                            odsay_daily_call_limit="30")
+        worker = Worker(settings_factory=lambda: settings,
+                        shape_client_factory=lambda s: OdsayClient(FAKE_KEY, transport=httpx.MockTransport(
+                            lambda request: httpx.Response(500))))
+        report = mock.Mock(calls=[], shapes_saved=0, pending_shapes=0, pending_mapping=0, stopped=None)
+        with mock.patch("app.workflows.route_shapes.collect", return_value=report) as collect, \
+                mock.patch("app.workers.main.asdict", return_value={}):
+            result = worker.collect_route_shapes(settings, db=mock.sentinel.db)
+        self.assertEqual(result, {"status": "done"})
+        self.assertTrue(collect.call_args.kwargs["refresh_all"])
+        unset = Settings(_env_file=None, route_shape_provider="odsay", ODSAY_API_KEY=FAKE_KEY)
+        self.assertEqual(worker.collect_route_shapes(unset, db=mock.sentinel.db),
+                         {"status": "skipped", "reason": "daily_call_limit_unset"})
+        self.assertIsNone(worker.collect_route_shapes(Settings(_env_file=None), db=mock.sentinel.db))
 
 
 class StaticResponseShapeTest(unittest.TestCase):

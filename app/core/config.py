@@ -139,7 +139,8 @@ class Settings(BaseSettings):
     # 최대한 넣는다. 요청이 실패하면 수집 흐름이 반으로 나눠 다시 시도한다.
     odsay_city_code: str = "3000"
     odsay_lane_batch_size: int = Field(default=200, gt=0, le=1000)
-    # 저장한 형상을 다시 받는 간격(초, 기본 30일). 경유 정류소가 바뀌어 패턴이 달라진 노선은 이 간격과 무관하게 다시 받는다.
+    # 수동 실행에서 저장한 형상을 다시 받는 간격과 ODsay에 없던 노선을 다시 찾는 간격(초, 기본 30일). 워커는 하루 1회 정적
+    # 갱신 뒤 형상 전체를 다시 받으므로 이 간격과 무관하다. 경유 정류소가 바뀌어 패턴이 달라진 노선은 항상 다시 받는다.
     route_shape_refresh_interval_seconds: float = Field(default=2_592_000.0, gt=0)
     # 워커 작업 대기열(검색 접수·이동 재평가)을 확인하는 간격. 공공 API 수집 주기와 별개다.
     job_poll_seconds: float = Field(default=2.0, gt=0)
