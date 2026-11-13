@@ -57,12 +57,13 @@ docker compose -f compose.server.yaml logs -f worker
 ```
 
 - `.env.api`의 로컬 값 중 `BACKEND_DB_HOST`·`BACKEND_DB_PORT`(터널 주소)·`BACKEND_ENV`·`ENABLE_DEVTOOLS`는 compose가 덮어쓴다
-  (DB `db:5432`, `production`, devtools 끔). `BACKEND_AUTH_JWT_ISSUER`는 서버 GoTrue 발급자(`http://localhost:18080/auth/v1`)와 같아야 한다.
+  (DB `db:5432`, `production`, devtools 끔). `BACKEND_AUTH_JWT_ISSUER`는 서버 GoTrue 발급자(`https://121.153.148.189:18443/auth/v1`)와 같아야 한다.
 - DB 이름·비밀번호·JWT 비밀값은 `SUPABASE_ENV_FILE`(Supabase 스택 `.env`)을 컨테이너 `/app/.env`에 읽기 전용으로 연결해 읽는다.
 - API 공개 주소는 `API_PUBLISH`(기본 `0.0.0.0:8001`). 서버 방화벽·공유기에서 그 포트를 열어야 외부(프론트 개발자)에서 접근한다.
   HTTPS·도메인은 앞단 리버스 프록시에서 붙인다. 모바일 앱은 HTTP를 기본 차단하므로(Android cleartext, iOS ATS) HTTP로 쓸 때는 개발 빌드에서 예외를 둔다.
-- 앱의 회원가입·로그인은 Supabase Auth(`/auth/v1`)에 직접 접속한다. 현재 Supabase 게이트웨이는 서버 내부(127.0.0.1:18080)에만 열려 있어
-  외부 공개 방식은 Supabase 스택 쪽에서 따로 정한다. 앱에는 Supabase 주소와 anon key만 주고 JWT 비밀값·service_role key는 주지 않는다.
+- 앱의 회원가입·로그인은 Supabase Auth(`/auth/v1`)에 직접 접속한다. 내부 게이트웨이 `127.0.0.1:18080` 앞에 버스 전용 HTTPS 프록시를 두어
+  앱 API·Auth를 `https://121.153.148.189:18443`으로 공개했다. 앱의 Supabase URL에는 `/auth/v1`을 붙이지 않는다. Studio 관리 접속은 별도 Basic 인증을 사용하는 `https://121.153.148.189:18444`다.
+  앱에는 Supabase 주소와 anon key만 주고 JWT 비밀값·service_role key는 주지 않는다. 실제 배포본과 비공개 환경변수 인수인계는 [서버 배포 설정](../deployment/README.md)을 참고한다.
 - 워커는 서버에 하나만 둔다. 로컬 PC 워커를 같은 DB에 동시에 띄우지 않는다. 서버 워커는 정적 정보 하루 1회 갱신도 수행한다.
 - 코드 갱신: `git pull` 뒤 같은 `up -d --build`. 중지: `docker compose -f compose.server.yaml down`(DB·Supabase 스택에는 영향 없음).
 

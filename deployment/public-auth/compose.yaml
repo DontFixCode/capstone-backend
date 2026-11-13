@@ -1,0 +1,38 @@
+name: bus-public-auth
+
+services:
+  proxy:
+    image: nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
+    environment:
+      NGINX_ENTRYPOINT_WORKER_PROCESSES_AUTOTUNE: "1"
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:18443:443"
+    volumes:
+      - /var/lib/bus-auth/certificates:/etc/bus-certificates:ro
+      - /home/gmlrud/bus-transfer-supabase/deployment/public-auth/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - supabase
+    mem_limit: 128m
+    cpus: 0.5
+
+  studio-proxy:
+    image: nginx:1.28-alpine@sha256:a8b39bd9cf0f83869a2162827a0caf6137ddf759d50a171451b335cecc87d236
+    environment:
+      NGINX_ENTRYPOINT_WORKER_PROCESSES_AUTOTUNE: "1"
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:18444:443"
+    volumes:
+      - /var/lib/bus-auth/certificates:/etc/bus-certificates:ro
+      - /home/gmlrud/bus-transfer-supabase/deployment/public-auth/studio.nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - /var/lib/bus-auth/admin/studio.htpasswd:/etc/nginx/studio.htpasswd:ro
+    networks:
+      - supabase
+    mem_limit: 128m
+    cpus: 1.0
+
+networks:
+  supabase:
+    external: true
+    name: bus-transfer-supabase_default
