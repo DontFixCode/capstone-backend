@@ -39,6 +39,8 @@ from app.integrations.bus_api import TagoClient  # noqa: E402
 from app.integrations.walking_api import TmapWalkingClient  # noqa: E402
 from app.modules.evaluation.schemas import EtaReport  # noqa: E402
 from app.modules.journeys import repository as journey_repository  # noqa: E402
+from app.modules.journeys import state as journey_state  # noqa: E402
+from app.modules.routing import repository as route_repository  # noqa: E402
 from app.modules.routing import service_area  # noqa: E402
 from app.modules.transit import service as transit_service  # noqa: E402
 from app.modules.transit.schemas import RealtimeTarget  # noqa: E402
@@ -452,6 +454,90 @@ class RouteSearchApiTest(Phase4TestCase):
 # ---------------------------------------------------------------- 4. 이동 세션
 
 class JourneyApiTest(Phase4TestCase):
+    def test_current_proposal_acceptance_changes_selected_route(self):
+        journey, selected, search_id = self.start()
+        jid = UUID(journey["journeyId"])
+        with self.db.transaction() as conn:
+            options = route_repository.read_candidates(conn, UUID(search_id))
+            current = journey_repository.get_journey(conn, jid, self.user_a)
+        alternative = next(row for row in options if str(row["id"]) != selected["candidateId"])
+        proposal = {**current["selected_snapshot"],
+                    "candidate_id": str(alternative["id"]), "search_id": search_id,
+                    "static_route_key": alternative["static_route_key"], "option_key": alternative["option_key"],
+                    "legs": alternative["legs"], "evaluation": alternative["evaluation"],
+                    "boarding_count": alternative["boarding_count"],
+                    "walking_seconds": alternative["walking_seconds"],
+                    "nominal_total_seconds": alternative["nominal_total_seconds"],
+                    "expected_total_seconds": alternative["expected_total_seconds"],
+                    "journey_probability": alternative["journey_probability"],
+                    "time_status": alternative["time_status"], "nominally_feasible": alternative["nominally_feasible"],
+                    "ranking_mode": alternative["ranking_mode"], "rank_no": alternative["rank_no"],
+                    "base_state_version": 1, "proposal_version": 1,
+                    "accepted_progress": journey_state.initial_progress(alternative["legs"])}
+        self.query("UPDATE app.journeys SET proposed_candidate_id = %s, proposed_snapshot = %s WHERE id = %s "
+                   "RETURNING id", (alternative["id"], Jsonb(proposal), jid))
+        self.assertEqual(self.detail(str(jid))["proposedRoute"]["candidateId"], str(alternative["id"]))
+        with self.client.websocket_connect(f"/api/v1/journeys/{jid}/stream", headers=self.auth(self.user_a)) as ws:
+            message = ws.receive_json()
+            self.assertEqual(message["proposedRoute"]["candidateId"], str(alternative["id"]))
+
+        accepted = self.event(str(jid), "route_accepted", 1, {"proposalVersion": 1})
+        self.assertEqual(accepted.status_code, 200, accepted.text)
+        detail = self.detail(str(jid))
+        self.assertEqual((detail["stateVersion"], detail["selectionVersion"], detail["proposedRoute"]),
+                         (2, 2, None))
+        self.assertEqual(detail["selectedRoute"]["candidateId"], str(alternative["id"]))
+        self.assertEqual(self.query("SELECT count(*) FROM app.journey_events WHERE journey_id = %s "
+                                    "AND event_type = 'route_accepted'", (jid,)), [(1,)])
+        stale = self.event(str(jid), "route_accepted", 2, {"proposalVersion": 1})
+        self.assertEqual((stale.status_code, stale.json()["error"]["code"]), (409, "PROPOSAL_STALE"))
+
+    def test_missed_bus_persists_and_recalculates_without_missed_vehicle(self):
+        journey, _, _ = self.start()
+        jid = journey["journeyId"]
+        route = journey["selectedRoute"]
+        missed_leg = next(leg for leg in route["legs"] if leg["kind"] == "bus")
+        missed_vehicle = f"V-{missed_leg['route']['externalId']}-0"
+        response = self.event(jid, "missed_bus", 1,
+                              {"legIndex": missed_leg["legIndex"], "vehicleId": missed_vehicle})
+        self.assertEqual(response.status_code, 200, response.text)
+        detail = self.detail(jid)
+        self.assertEqual((detail["stateVersion"], detail["movementState"]), (2, "waiting"))
+        saved = self.query("SELECT current_progress, next_recalc_at FROM app.journeys WHERE id = %s", (UUID(jid),))[0]
+        self.assertEqual(saved[0]["missed_vehicles"][-1]["vehicle_id"], missed_vehicle)
+        self.assertIsNotNone(saved[1], "상태 입력 직후 재평가 예약")
+
+        worker = self.worker(synthetic_provider())
+        worker.run_jobs_pass()
+        detail = self.detail(jid)
+        self.assertEqual(detail["guidanceStatus"], "current")
+        self.assertNotIn(missed_vehicle,
+                         [vehicle["vehicleId"] for vehicle in detail["guidance"]["nextBoarding"]["upcoming"]])
+
+    def test_destination_change_queues_fresh_search_from_current_location(self):
+        journey, _, _ = self.start()
+        jid = journey["journeyId"]
+        location = self.client.put(f"/api/v1/journeys/{jid}/location", headers=self.auth(self.user_a),
+                                   json={"latitude": ORIGIN["latitude"], "longitude": ORIGIN["longitude"],
+                                         "observedAt": datetime.now(UTC).isoformat(), "accuracyM": 8})
+        self.assertEqual(location.status_code, 204, location.text)
+        changed = self.event(jid, "destination_changed", 1,
+                             {"latitude": 36.360, "longitude": 127.380, "name": "변경 목적지"})
+        self.assertEqual(changed.status_code, 200, changed.text)
+        route_search_id, status = self.query(
+            "SELECT selected_snapshot->>'reroute_search_id', selected_snapshot->>'reroute_status' "
+            "FROM app.journeys WHERE id = %s", (UUID(jid),))[0]
+        self.assertIsNotNone(route_search_id)
+        self.assertEqual(status, "queued")
+        self.assertEqual(self.query("SELECT status, source, user_id FROM app.route_searches WHERE id = %s",
+                                    (UUID(route_search_id),)), [("processing", "app", self.user_a)])
+        self.worker(synthetic_provider()).run_jobs_pass()
+        self.assertEqual(self.query("SELECT status FROM app.route_searches WHERE id = %s",
+                                    (UUID(route_search_id),))[0][0], "ready")
+        self.assertGreater(self.query("SELECT count(*) FROM app.route_candidates WHERE search_id = %s",
+                                      (UUID(route_search_id),))[0][0], 0)
+        self.assertEqual(self.detail(jid)["guidanceStatus"], "current")
+
     def test_start_restore_events_and_snapshots(self):
         journey, chosen, search_id = self.start(multi=True)
         jid = journey["journeyId"]
@@ -495,7 +581,7 @@ class JourneyApiTest(Phase4TestCase):
         bus_legs = [leg["legIndex"] for leg in restored["selectedRoute"]["legs"] if leg["kind"] == "bus"]
         self.assertEqual(self.event(jid, "board", 2, {"legIndex": bus_legs[0]}).json()["error"]["code"],
                          "STATE_VERSION_CONFLICT")
-        self.assertEqual(self.event(jid, "missed_bus", 1, {}).json()["error"]["code"], "UNSUPPORTED_EVENT_TYPE")
+        self.assertEqual(self.event(jid, "missed_bus", 1, {}).json()["error"]["code"], "INVALID_PAYLOAD")
         self.assertEqual(self.client.post(f"/api/v1/journeys/{jid}/events", headers=self.auth(self.user_a),
                                           json={"eventType": "board", "stateVersion": 1,
                                                 "payload": {"legIndex": 1}}).status_code, 422, "키 필수")

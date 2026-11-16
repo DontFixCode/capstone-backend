@@ -147,7 +147,7 @@ class JourneyStateTest(unittest.TestCase):
                                      ("board", {"legIndex": 3}, "LEG_NOT_NEXT"),
                                      ("board", {"legIndex": 0}, "INVALID_LEG_INDEX"),
                                      ("board", {"legIndex": 99}, "INVALID_LEG_INDEX"),
-                                     ("missed_bus", {}, "UNSUPPORTED_EVENT_TYPE")]:
+                                     ("missed_bus", {}, "INVALID_LEG_INDEX")]:
             with self.subTest(event=event, payload=payload):
                 with self.assertRaises(state.TransitionError) as ctx:
                     self.apply(self.current, event, payload)
@@ -159,6 +159,42 @@ class JourneyStateTest(unittest.TestCase):
         with self.assertRaises(state.TransitionError) as ctx:
             self.apply(self.current, "alight", {"legIndex": 3})
         self.assertEqual(ctx.exception.code, "LEG_NOT_CURRENT")
+
+    def test_missed_bus_is_recorded_and_keeps_session_waiting(self):
+        transition = self.step("missed_bus", {"legIndex": 1, "vehicleId": "BUS-1"})
+        self.assertEqual(transition.movement_state, "waiting")
+        self.assertEqual(transition.progress["missed_vehicles"][0]["vehicle_id"], "BUS-1")
+        self.assertEqual(transition.progress["next_bus_leg_index"], 1)
+
+    def test_destination_change_returns_new_place_for_snapshot(self):
+        transition = self.step("destination_changed", {"latitude": 36.35, "longitude": 127.38,
+                                                       "name": "new destination"})
+        self.assertEqual(transition.effect["destination"]["lat"], 36.35)
+        self.assertEqual(transition.effect["destination"]["lon"], 127.38)
+        self.assertEqual(transition.lifecycle_status, "active")
+
+    def test_route_alternative_must_preserve_confirmed_completed_bus(self):
+        self.step("board", {"legIndex": 1})
+        self.step("alight", {"legIndex": 1})
+        alternative = legs_two_rides()
+        self.assertTrue(guidance._candidate_matches_completed(alternative, self.current["progress"]))
+        merged, progress = guidance._merge_fixed_prefix(self.legs, alternative, 1)
+        self.assertEqual(merged[1]["route_id"], self.legs[1]["route_id"])
+        self.assertEqual(progress["completed_bus_legs"], [1])
+        self.assertEqual(progress["next_bus_leg_index"], 3)
+        alternative[1]["route_internal_id"] = 999
+        self.assertFalse(guidance._candidate_matches_completed(alternative, self.current["progress"]))
+
+    def test_destination_reroute_tail_keeps_completed_prefix(self):
+        self.step("board", {"legIndex": 1})
+        self.step("alight", {"legIndex": 1})
+        alternative = legs_two_rides()[2:]
+        merged, progress = guidance._merge_fixed_prefix(self.legs, alternative, 1,
+                                                        alternative_has_prefix=False)
+        self.assertEqual([leg["kind"] for leg in merged], ["walk", "bus", "walk", "bus", "walk"])
+        self.assertEqual(merged[1]["route_id"], self.legs[1]["route_id"])
+        self.assertEqual(progress["completed_bus_legs"], [1])
+        self.assertEqual(progress["next_bus_leg_index"], 3)
 
     def test_ended_journey_accepts_only_correction(self):
         board = self.step("board", {"legIndex": 1})
@@ -357,6 +393,10 @@ class ResponseRulesTest(unittest.TestCase):
         self.assertEqual({(t.kind, t.external_id) for t in targets},
                          {("arrivals", "A"), ("arrivals", "C"), ("arrivals", "F"), ("positions", "R10"),
                           ("positions", "R50")})
+        options_snapshot = {**snapshot, "alternative_targets": {"arrivals": ["X", "A"], "positions": ["R99"]}}
+        aggregated = guidance.journey_targets(options_snapshot, progress, "walking", "journey:x")
+        self.assertIn(("arrivals", "X"), {(t.kind, t.external_id) for t in aggregated})
+        self.assertIn(("positions", "R99"), {(t.kind, t.external_id) for t in aggregated})
         done = {**progress, "completed_bus_legs": [1], "next_bus_leg_index": 3}
         rides = guidance.remaining_bus_legs(legs, done, "transferring")
         candidate, walks = guidance.remaining_candidate(snapshot, rides, first_walk_leg=legs[2], static_version="v")

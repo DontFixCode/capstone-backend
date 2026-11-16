@@ -1,12 +1,13 @@
-"""활성 이동의 기본 안내 계산: 선택 경로의 남은 구간 → 공유 수집 최신값 → 기존 평가 엔진 → 안내(guidance).
+"""활성 이동 재평가: 선택 경로·초기 검색의 대안 후보를 공유 최신값으로 다시 평가한다.
 
-- 남은 경로는 선택 스냅샷의 버스 구간으로 기존 StaticCandidate를 다시 구성하고 evaluate_candidates를 그대로 호출한다.
-  핵심 함수의 계약은 바꾸지 않는다. 대안 재탐색·비교·제안은 Phase 5 범위라 여기서 하지 않는다(현재 선택만 평가).
+- 남은 경로와 초기 검색의 대안 후보를 기존 evaluate_candidates로 같은 수집 스냅샷·모드에서 평가하고,
+  최소 개선량을 넘는 경우에만 사용자 확인이 필요한 제안을 만든다. 상태 버전 조건부 저장은 호출자가 한다.
 - 탑승 전(walking·transferring): 다음 승차 정류소부터 평가한다. 출발 도보는 진행 위치를 모르므로 스냅샷의 전체 도보 시간을
   쓰고 그 가정을 사유로 남긴다. 탑승 중: 차량을 사용자가 확인했고 같은 차량의 하차 ETA가 있을 때만 하차 시각을 확정하고,
   이후 구간은 그 시각부터 평가한다. 탑승 중인 차량의 첫 승차 성공 여부를 다시 평가하지 않는다.
 - ETA 기준 시각이 확인되지 않은 TAGO 도착정보는 기존과 같이 eta_basis_unconfirmed로 제외되고 미산출 값은 null과 사유다.
 - 위치는 관측 시각 기준 최신성만 판단한다. 오래된 위치·미수신은 제한 사유이며 이동을 멈추거나 취소하지 않는다.
+- 목적지가 바뀌면 이전 목적지의 도착 예측을 내보내지 않고 fresh-route-search 제한 사유를 반환한다.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from app.modules.evaluation.eta import index_etas
 from app.modules.evaluation.schemas import DESTINATION_REF, ORIGIN_REF, EvaluationInputs, WalkResult
 from app.modules.evaluation.service import evaluate_candidates
 from app.modules.journeys import state as journey_state
+from app.modules.recommendation.change import RouteOption, decide_change
+from app.modules.routing import repository as search_repository
 from app.modules.routing.schemas import (
     CandidateSearchResult,
     Coordinate,
@@ -67,8 +70,12 @@ def journey_targets(snapshot: dict[str, Any], progress: dict[str, Any], movement
                 arrivals.add(stop)
         if leg.get("route_id"):
             positions.add(leg["route_id"])
-    return transit_service.merge_targets([[RealtimeTarget("arrivals", s, srcs) for s in sorted(arrivals)],
-                                          [RealtimeTarget("positions", r, srcs) for r in sorted(positions)]])
+    targets = [[RealtimeTarget("arrivals", s, srcs) for s in sorted(arrivals)],
+               [RealtimeTarget("positions", r, srcs) for r in sorted(positions)]]
+    saved = snapshot.get("alternative_targets") or {}
+    targets.extend([[RealtimeTarget(kind, external_id, srcs) for external_id in sorted(set(saved.get(kind) or []))]
+                    for kind in ("arrivals", "positions")])
+    return transit_service.merge_targets(targets)
 
 
 def _walk_result(leg: dict[str, Any] | None, from_ref: str, to_ref: str) -> WalkResult | None:
@@ -120,6 +127,62 @@ def remaining_candidate(snapshot: dict[str, Any], rides: list[dict[str, Any]], *
         rides=static_rides, transfers=transfers, boarding_count=len(static_rides),
         transfer_count=len(static_rides) - 1, access_straight_line_meters=None, egress_straight_line_meters=None)
     return candidate, walks
+
+
+def _candidate_matches_completed(candidate_legs: list[dict[str, Any]], progress: dict[str, Any]) -> bool:
+    """대안의 고정 구간이 사용자가 확인한 탑승·하차 이력과 일치할 때만 비교한다."""
+    history = progress.get("history") or []
+    completed = progress.get("completed_bus_legs") or []
+    rides = journey_state.bus_legs(candidate_legs)
+    if len(history) < len(completed) or len(rides) <= len(completed):
+        return False
+    for position, record in enumerate(history[:len(completed)]):
+        ride = rides[position]
+        boarded, alighted = record.get("boarded") or {}, record.get("alighted") or {}
+        if (ride.get("route_internal_id") != boarded.get("route_internal_id")
+                or ride.get("pattern_key") != boarded.get("pattern_key")
+                or (ride.get("alight") or {}).get("stop_internal_id") != alighted.get("stop_internal_id")):
+            return False
+    return True
+
+
+def _merge_fixed_prefix(selected_legs: list[dict[str, Any]], alternative_legs: list[dict[str, Any]],
+                        completed_count: int, *, alternative_has_prefix: bool = True
+                        ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """완료된 선택 구간을 보존하고 대안의 남은 구간만 이어 붙인다."""
+    selected_rides = journey_state.bus_legs(selected_legs)
+    alternative_rides = journey_state.bus_legs(alternative_legs)
+    if completed_count and alternative_has_prefix:
+        selected_end = selected_rides[completed_count - 1]["leg_index"]
+        alternative_end = alternative_rides[completed_count - 1]["leg_index"]
+        prefix = [dict(leg) for leg in selected_legs[:selected_end + 1]]
+        tail = [dict(leg) for leg in alternative_legs[alternative_end + 1:]]
+    else:
+        prefix, tail = [], [dict(leg) for leg in alternative_legs]
+        if completed_count:
+            selected_rides = journey_state.bus_legs(selected_legs)
+            selected_end = selected_rides[completed_count - 1]["leg_index"]
+            prefix = [dict(leg) for leg in selected_legs[:selected_end + 1]]
+    merged = prefix + tail
+    bus_indices = []
+    ride_index = 0
+    for index, leg in enumerate(merged):
+        leg["leg_index"] = index
+        if leg.get("kind") == "bus":
+            leg["ride_index"] = ride_index
+            ride_index += 1
+            bus_indices.append(index)
+    progress = {"completed_bus_legs": bus_indices[:completed_count], "boarded": None,
+                "next_bus_leg_index": bus_indices[completed_count] if completed_count < len(bus_indices) else None,
+                "leg_index": (bus_indices[completed_count - 1] + 1 if completed_count else 0)}
+    return merged, progress
+
+
+def _route_signature(legs: list[dict[str, Any]]) -> tuple[tuple[Any, ...], ...]:
+    return tuple((leg.get("route_id"), leg.get("pattern_key"),
+                  (leg.get("board") or {}).get("seq"), (leg.get("alight") or {}).get("seq"),
+                  (leg.get("board") or {}).get("stop_id"), (leg.get("alight") or {}).get("stop_id"))
+                 for leg in journey_state.bus_legs(legs))
 
 
 def _search_result(candidate: StaticCandidate, static_version: str) -> CandidateSearchResult:
@@ -203,6 +266,11 @@ def compute_guidance(
     legs = snapshot.get("legs") or []
     progress = journey.get("current_progress") or {}
     movement = journey["movement_state"]
+    original_snapshot, original_legs, original_progress = snapshot, legs, progress
+    destination_reroute = bool(snapshot.get("destination_changed_at"))
+    reroute_candidates: list[dict[str, Any]] = []
+    reroute_search: dict[str, Any] | None = None
+    reroute_leg_map: dict[int, int] = {}
     reasons: list[str] = []
     guidance: dict[str, Any] = {
         "base_state_version": journey["state_version"], "selection_version": journey["selection_version"],
@@ -212,8 +280,8 @@ def compute_guidance(
         "ranking_mode": snapshot.get("ranking_mode") or "nominal",
         "min_improvement_seconds": policy.min_improvement_seconds,
         "movement_state": movement, "current_leg_index": progress.get("leg_index"),
-        "next_boarding": None, "onboard": None, "arrival": None, "alternatives": None,
-        "alternatives_reason": "phase5_reevaluation_not_implemented",
+        "next_boarding": None, "onboard": None, "arrival": None, "alternatives": [],
+        "alternatives_reason": "not_evaluated",
     }
     loc_max_age = settings.journey_location_max_age_seconds or policy.max_data_age_seconds
     guidance["location"] = location_status(journey, now, loc_max_age)
@@ -221,6 +289,60 @@ def compute_guidance(
         reasons.append("location_not_received")
     elif guidance["location"]["status"] == "stale":
         reasons.append("location_stale")
+
+    if destination_reroute:
+        reroute_id = snapshot.get("reroute_search_id")
+        if not reroute_id:
+            reason = snapshot.get("reroute_reason") or "destination_reroute_not_queued"
+            guidance.update(status="data_limited", arrival=None, alternatives=[], alternatives_reason=reason,
+                            reason_codes=list(dict.fromkeys([*reasons, reason])), data_as_of=None, data_inputs=[])
+            return guidance
+        with db.transaction(isolation="REPEATABLE READ") as conn:
+            reroute_search = search_repository.read_search(conn, UUID(str(reroute_id)))
+            reroute_candidates = search_repository.read_candidates(conn, UUID(str(reroute_id)))
+        if reroute_search is None or reroute_search["status"] == "processing":
+            guidance.update(status="data_limited", arrival=None, alternatives=[],
+                            alternatives_reason="destination_reroute_pending",
+                            reason_codes=list(dict.fromkeys([*reasons, "destination_reroute_pending"])),
+                            reroute_search_id=str(reroute_id), data_as_of=None, data_inputs=[])
+            return guidance
+        if reroute_search["status"] != "ready" or not reroute_candidates:
+            reason = (reroute_search.get("summary") or {}).get("status_reason") or "destination_reroute_no_candidates"
+            guidance.update(status="data_limited", arrival=None, alternatives=[], alternatives_reason=reason,
+                            reason_codes=list(dict.fromkeys([*reasons, reason])),
+                            reroute_search_id=str(reroute_id), data_as_of=None, data_inputs=[])
+            return guidance
+        old_remaining = remaining_bus_legs(original_legs, original_progress, movement)
+        old_signature = tuple((leg.get("route_id"), leg.get("pattern_key"),
+                               (leg.get("board") or {}).get("seq"), (leg.get("alight") or {}).get("seq"),
+                               (leg.get("board") or {}).get("stop_id"), (leg.get("alight") or {}).get("stop_id"))
+                              for leg in old_remaining)
+        baseline = next((row for row in reroute_candidates if _route_signature(row.get("legs") or [])
+                         == old_signature), None)
+        if baseline is None:
+            guidance.update(status="data_limited", arrival=None, alternatives=[],
+                            alternatives_reason="current_route_not_comparable_for_destination",
+                            reason_codes=list(dict.fromkeys([*reasons,
+                                                             "current_route_not_comparable_for_destination"])),
+                            reroute_search_id=str(reroute_id), data_as_of=None, data_inputs=[])
+            return guidance
+        search_summary = reroute_search.get("summary") or {}
+        old_targets = snapshot.get("alternative_targets") or {}
+        new_targets = search_summary.get("realtime_targets") or {}
+        snapshot = {**snapshot, "legs": baseline["legs"], "candidate_id": str(baseline["id"]),
+                    "search_id": str(reroute_id), "static_route_key": baseline["static_route_key"],
+                    "ranking_mode": baseline.get("ranking_mode") or reroute_search.get("ranking_mode") or "nominal",
+                    "origin": {"lat": reroute_search["origin_lat"], "lon": reroute_search["origin_lon"]},
+                    "alternative_targets": {kind: sorted(set((old_targets.get(kind) or [])
+                                                               + (new_targets.get(kind) or [])))
+                                             for kind in ("arrivals", "positions")}}
+        legs = snapshot["legs"]
+        new_bus = journey_state.bus_legs(legs)
+        for old_leg, new_leg in zip(old_remaining, new_bus):
+            reroute_leg_map[new_leg["leg_index"]] = old_leg["leg_index"]
+        # 재탐색 입력은 현재 위치에서 시작하므로 완료 구간은 안내 평가 입력에서 제외한다.
+        progress = journey_state.initial_progress(legs)
+        movement = journey_state.WALKING if legs and legs[0].get("kind") == "walk" else journey_state.WAITING
 
     rides = remaining_bus_legs(legs, progress, movement)
     if not rides:
@@ -251,7 +373,11 @@ def compute_guidance(
                                                    interval_seconds=settings.realtime_interval_seconds,
                                                    max_data_age_seconds=policy.max_data_age_seconds,
                                                    eta_basis_policy=config.eta_basis_policy)
-        segments = search_flow.segment_observations(conn, [leg["pattern_key"] for leg in rides], cohort, until=now)
+        patterns = {leg["pattern_key"] for leg in rides}
+        if destination_reroute:
+            patterns.update(leg["pattern_key"] for row in reroute_candidates
+                            for leg in journey_state.bus_legs(row.get("legs") or []))
+        segments = search_flow.segment_observations(conn, sorted(patterns), cohort, until=now)
         error_samples = sample_rules.transfer_error_samples(
             evaluation_repository.labeled_samples(conn, cohort, before=now))
         scenes = sample_rules.joint_scenes(evaluation_repository.complete_scenes(conn, cohort, before=now))
@@ -269,23 +395,33 @@ def compute_guidance(
             reasons.append("realtime_stale")
         if s.get("last_attempt_failed"):
             reasons.append("realtime_last_attempt_failed")
-    etas = index_etas(realtime.eta_reports, evaluated_at=now, max_data_age_seconds=policy.max_data_age_seconds)
+    # 놓친 차량/회차를 다음 탑승 후보에서 제거한다. 사용자가 차량을 특정하지 않은 경우
+    # 선택 경로에 기록된 계획 회차(run_key)만 제외하고, 다른 차량의 실시간 ETA는 유지한다.
+    missed = progress.get("missed_vehicles") or []
+    excluded_runs = {(item.get("pattern_key"), item.get("run_key")) for item in missed if item.get("run_key")}
+    excluded_vehicles = {(item.get("pattern_key"), item.get("vehicle_id")) for item in missed
+                         if item.get("vehicle_id")}
+    eta_reports = tuple(report for report in realtime.eta_reports
+                        if (report.pattern_id, report.run_key) not in excluded_runs
+                        and (report.pattern_id, report.vehicle_id) not in excluded_vehicles)
+    etas = index_etas(eta_reports, evaluated_at=now, max_data_age_seconds=policy.max_data_age_seconds)
     data_snapshot_id = hashlib.sha256(json.dumps([static_version, sorted(realtime.batch_refs, key=str)],
                                                  default=str).encode()).hexdigest()[:32]
     guidance["data_snapshot_id"] = data_snapshot_id
 
-    def evaluate(remaining: list[dict[str, Any]], first_walk: dict | None, start_at: datetime):
-        candidate, walks = remaining_candidate(snapshot, remaining, first_walk_leg=first_walk,
+    def evaluate(remaining: list[dict[str, Any]], first_walk: dict | None, start_at: datetime,
+                 route_snapshot: dict[str, Any] = snapshot):
+        candidate, walks = remaining_candidate(route_snapshot, remaining, first_walk_leg=first_walk,
                                                static_version=static_version)
         origin = (remaining[0].get("board") or {})
         context = SearchContext(
             origin=Coordinate(lat=origin.get("lat") or snapshot["origin"]["lat"],
                               lon=origin.get("lon") or snapshot["origin"]["lon"]),
-            destination=Coordinate(lat=snapshot["destination"]["lat"], lon=snapshot["destination"]["lon"]),
+            destination=Coordinate(lat=route_snapshot["destination"]["lat"], lon=route_snapshot["destination"]["lon"]),
             start_at=start_at, evaluated_at=now, static_snapshot_id=static_version)
         inputs = EvaluationInputs(
             data_snapshot_id=data_snapshot_id, sample_condition_key=cohort, walks=tuple(walks),
-            eta_reports=tuple(realtime.eta_reports), queried_stop_ids=realtime.queried_stop_ids,
+            eta_reports=eta_reports, queried_stop_ids=realtime.queried_stop_ids,
             segment_observations=tuple(segments), transfer_error_samples=tuple(error_samples),
             joint_scenes=tuple(scenes))
         result = evaluate_candidates(_search_result(candidate, static_version), context, inputs, policy)
@@ -305,6 +441,7 @@ def compute_guidance(
                 "expected_total_seconds": item.expected_total_seconds, "reason_codes": list(item.reason_codes)}
 
     if movement == journey_state.ONBOARD:
+        guidance["alternatives_reason"] = "confirmed_onboard_segment_fixed_until_alight"
         current = rides[0]
         boarded = progress.get("boarded") or {}
         alight = current.get("alight") or {}
@@ -367,10 +504,166 @@ def compute_guidance(
             "slack_seconds": first_conn.slack_seconds if first_conn else None,
             "upcoming": upcoming, "eta_rejections": board_reasons,
         }
+        if destination_reroute:
+            guidance["next_boarding"]["leg_index"] = reroute_leg_map.get(nxt["leg_index"], nxt["leg_index"])
         if first_leg is None:
             reasons.append("next_boarding_eta_unavailable")
             reasons.extend(board_reasons)
         guidance["arrival"] = arrival_from(item)
+        # 같은 최초 검색에 저장된 후보들을 현재 활성 수집 자료와 현재 시각으로 다시 평가한다.
+        if not progress.get("boarded"):
+            original = snapshot.get("search_id")
+            if original and item is not None:
+                if destination_reroute:
+                    alternatives, original_search = reroute_candidates, reroute_search
+                else:
+                    with db.transaction(isolation="REPEATABLE READ") as conn:
+                        alternatives = search_repository.read_candidates(conn, UUID(str(original)))
+                        original_search = search_repository.read_search(conn, UUID(str(original)))
+                coverage = ((original_search or {}).get("summary") or {}).get("search_coverage", {})
+                coverage_complete = not coverage.get("truncated", True)
+                mode = snapshot.get("ranking_mode") or "nominal"
+                comparison_key = f"{static_version}:{data_snapshot_id}:{now.isoformat()}:{mode}"
+                current_cost = (item.expected_total_seconds if mode == "expected" else item.nominal_total_seconds)
+                current_option = RouteOption(str(snapshot.get("candidate_id")), mode, current_cost,
+                                             comparison_key, bool(item.nominally_feasible), coverage_complete)
+                option_rows: dict[str, dict[str, Any]] = {}
+                option_evaluations: dict[str, Any] = {}
+                evaluated_options: list[RouteOption] = []
+                for row in alternatives:
+                    candidate_id = str(row["id"])
+                    if candidate_id == str(snapshot.get("candidate_id")):
+                        continue
+                    if (original_progress.get("rejected_candidate_state_version") == journey["state_version"]
+                            and candidate_id in (original_progress.get("rejected_candidate_ids") or [])):
+                        continue
+                    alt_snapshot = {**snapshot, "legs": row["legs"], "static_route_key": row["static_route_key"]}
+                    alt_all_rides = journey_state.bus_legs(row["legs"] or [])
+                    completed_count = len(progress.get("completed_bus_legs") or [])
+                    if completed_count and not destination_reroute \
+                            and not _candidate_matches_completed(row["legs"] or [], original_progress):
+                        continue
+                    alt_rides = alt_all_rides[completed_count:]
+                    if not alt_rides:
+                        continue
+                    first = alt_rides[0]
+                    first_walk = row["legs"][first["leg_index"] - 1] if first["leg_index"] > 0 else None
+                    alt_item = _pick_option(evaluate(alt_rides, first_walk, now, alt_snapshot),
+                                            (first.get("vehicle") or {}).get("run_key"))
+                    if alt_item is None:
+                        continue
+                    cost = alt_item.expected_total_seconds if mode == "expected" else alt_item.nominal_total_seconds
+                    evaluated_options.append(RouteOption(candidate_id, mode, cost, comparison_key,
+                                                         bool(alt_item.nominally_feasible), coverage_complete,
+                                                         tuple(alt_item.reason_codes)))
+                    option_rows[candidate_id] = row
+                    option_evaluations[candidate_id] = alt_item
+                decision = decide_change(current_option, evaluated_options,
+                                         min_improvement_seconds=policy.min_improvement_seconds)
+                guidance["alternatives"] = [{"candidate_id": option.candidate_id,
+                                              "cost_seconds": option.cost_seconds,
+                                              "improvement_seconds": (current_cost - option.cost_seconds
+                                                                      if current_cost is not None and
+                                                                      option.cost_seconds is not None else None),
+                                              "reason_codes": list(option.reason_codes)}
+                                             for option in evaluated_options]
+                guidance["alternatives_reason"] = decision.reason_codes[0]
+                if decision.status == "propose" and decision.proposed_candidate_id:
+                    chosen = option_rows[decision.proposed_candidate_id]
+                    chosen_eval = option_evaluations[decision.proposed_candidate_id]
+                    merged_completed_count = len(original_progress.get("completed_bus_legs") or [])
+                    fresh_legs, accepted_progress = _merge_fixed_prefix(
+                        original_legs, chosen["legs"], merged_completed_count,
+                        alternative_has_prefix=not destination_reroute)
+                    completed_count = merged_completed_count
+                    ride_index = 0
+                    for leg in fresh_legs:
+                        if leg.get("kind") != "bus":
+                            continue
+                        if ride_index < completed_count:
+                            ride_index += 1
+                            continue
+                        timed_index = ride_index - completed_count
+                        if timed_index >= len(chosen_eval.legs):
+                            break
+                        timed_leg = chosen_eval.legs[timed_index]
+                        leg["vehicle"] = {"vehicle_id": timed_leg.vehicle_id, "run_key": timed_leg.run_key,
+                                          "vehicle_rank": timed_leg.vehicle_rank,
+                                          "match_status": "confirmed" if timed_leg.run_key else "unconfirmed"}
+                        leg["board_eta"] = search_flow._jsonable(timed_leg.board_eta)
+                        leg["alight_eta"] = search_flow._jsonable(timed_leg.alight_eta) if timed_leg.alight_eta else None
+                        leg["ride_seconds"] = timed_leg.ride_seconds
+                        ride_index += 1
+                    fresh_evaluation = dict(chosen["evaluation"] or {})
+                    merged_bus_indices = [leg["leg_index"] for leg in fresh_legs if leg.get("kind") == "bus"]
+                    fresh_transfers = []
+                    for transfer_index in range(1, len(chosen_eval.legs)):
+                        connection = (chosen_eval.connections[transfer_index]
+                                      if transfer_index < len(chosen_eval.connections) else None)
+                        front, following = chosen_eval.legs[transfer_index - 1:transfer_index + 1]
+                        fresh_transfers.append({"transfer_index": transfer_index,
+                                                "front_leg_index": merged_bus_indices[completed_count + transfer_index - 1],
+                                                "next_leg_index": merged_bus_indices[completed_count + transfer_index],
+                                                "slack_seconds": connection.slack_seconds if connection else None,
+                                                "status": connection.status if connection else None,
+                                                "probability": chosen_eval.transfer_probabilities[transfer_index - 1]
+                                                if transfer_index - 1 < len(chosen_eval.transfer_probabilities) else None,
+                                                "reason": list(connection.reason_codes) if connection else [],
+                                                "sample_id": None, "sample_reason": "reevaluated_during_journey",
+                                                "front_alight_eta": search_flow._jsonable(front.alight_eta)
+                                                if front.alight_eta else None,
+                                                "next_board_eta": search_flow._jsonable(following.board_eta),
+                                                "front_vehicle": {"vehicle_id": front.vehicle_id, "run_key": front.run_key},
+                                                "next_vehicle": {"vehicle_id": following.vehicle_id,
+                                                                  "run_key": following.run_key}})
+                    fresh_evaluation["transfers"] = fresh_transfers
+                    fresh_evaluation["connections"] = search_flow._jsonable(chosen_eval.connections)
+                    fresh_evaluation["first_boarding"] = (search_flow._jsonable(chosen_eval.connections[0])
+                                                           if chosen_eval.connections else None)
+                    fresh_evaluation["first_boarding_probability"] = chosen_eval.first_boarding_probability
+                    fresh_evaluation["transfer_probabilities"] = list(chosen_eval.transfer_probabilities)
+                    fresh_evaluation["journey_probability"] = chosen_eval.journey_probability
+                    fresh_evaluation["expected_total_seconds"] = chosen_eval.expected_total_seconds
+                    fresh_evaluation["connection_status"] = chosen_eval.connection_status
+                    fresh_evaluation["limited_at_ride_index"] = chosen_eval.limited_at_ride_index
+                    fresh_evaluation["reason_codes"] = list(chosen_eval.reason_codes)
+                    fresh_evaluation["provenance"] = search_flow._jsonable(chosen_eval.provenance)
+                    fresh_evaluation["times"] = {"walk_seconds": chosen_eval.walk_seconds,
+                                                  "buffer_seconds": chosen_eval.buffer_seconds,
+                                                  "wait_seconds": chosen_eval.wait_seconds,
+                                                  "ride_seconds": chosen_eval.ride_seconds,
+                                                  "egress_walk_seconds": chosen_eval.egress_walk_seconds,
+                                                  "planned_arrival_at": search_flow._jsonable(
+                                                      chosen_eval.planned_arrival_at)}
+                    proposal_base = {**original_snapshot,
+                                     **({"search_id": snapshot.get("search_id"),
+                                         "static_version": static_version,
+                                         "config_version": reroute_search.get("config_version") if reroute_search else None,
+                                         "alternative_targets": snapshot.get("alternative_targets")}
+                                        if destination_reroute else {})}
+                    proposal = {**proposal_base, "candidate_id": decision.proposed_candidate_id,
+                                "static_route_key": chosen["static_route_key"], "option_key": chosen["option_key"],
+                                "legs": fresh_legs, "evaluation": fresh_evaluation,
+                                "boarding_count": len(journey_state.bus_legs(fresh_legs)),
+                                "walking_seconds": chosen_eval.walk_seconds,
+                                "nominal_total_seconds": chosen_eval.nominal_total_seconds,
+                                "expected_total_seconds": chosen_eval.expected_total_seconds,
+                                "journey_probability": chosen_eval.journey_probability,
+                                "time_status": chosen_eval.time_status,
+                                "nominally_feasible": chosen_eval.nominally_feasible,
+                                "ranking_mode": mode, "rank_no": chosen["rank_no"],
+                                "evaluated_at": search_flow._jsonable(chosen_eval.provenance.evaluated_at),
+                                "base_state_version": journey["state_version"],
+                                "proposal_version": journey["selection_version"],
+                                "accepted_progress": {**original_progress, **accepted_progress,
+                                              "history": original_progress.get("history", []),
+                                              "missed_vehicles": [],
+                                              "last_alight": original_progress.get("last_alight")},
+                                "change_decision": {"improvement_seconds": decision.improvement_seconds,
+                                                    "reason_codes": list(decision.reason_codes)}}
+                    guidance["proposal_snapshot"] = search_flow._jsonable(proposal)
+            else:
+                guidance["alternatives_reason"] = "current_route_not_evaluated"
     if guidance["arrival"] and guidance["arrival"].get("reason_codes"):
         reasons.extend(guidance["arrival"]["reason_codes"])
     complete = guidance["arrival"] is not None and guidance["arrival"].get("planned_arrival_at") is not None

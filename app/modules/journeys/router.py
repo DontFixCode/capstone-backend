@@ -56,11 +56,12 @@ def get_journey(journeyId: UUID, user: AuthUser = Depends(active_user), db: Data
 @router.post("/journeys/{journeyId}/events")
 def post_event(journeyId: UUID, body: EventBody,
                idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
-               user: AuthUser = Depends(active_user), db: Database = Depends(get_db)) -> dict:
+               user: AuthUser = Depends(active_user), db: Database = Depends(get_db),
+               settings: Settings = Depends(get_settings)) -> dict:
     key = idempotency_key.strip()
     if not key:
         raise ApiError(422, "VALIDATION_ERROR", "Idempotency-Key가 비어 있습니다.")
-    result = _call(lambda: service.record_event(db, user.user_id, journeyId, key, body, now=_now()))
+    result = _call(lambda: service.record_event(db, user.user_id, journeyId, key, body, now=_now(), settings=settings))
     return {"eventId": str(result["event_id"]), "stateVersionAfter": result["state_version_after"],
             "replayed": result["replayed"]}
 
