@@ -1,9 +1,12 @@
 *
+.env
 .env.api
 !pyproject.toml
 !uv.lock
 !app/
 !app/**
+!data/service_area/
+!data/service_area/**
 app/**/__pycache__/
 app/**/*.py[cod]
 app/**/.env

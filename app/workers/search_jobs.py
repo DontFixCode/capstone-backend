@@ -16,6 +16,7 @@ from typing import Any
 from app.core.config import Settings
 from app.db.session import Database
 from app.integrations.bus_api import TagoClient, TagoConfigError
+from app.integrations.daejeon_bus_api import DaejeonBusClient, DaejeonBusConfigError
 from app.integrations.walking_api import TmapConfigError, TmapWalkingClient
 from app.modules.routing import repository as search_repository
 from app.workflows import search as search_flow
@@ -32,6 +33,7 @@ def process_search_jobs(
     walking_client_factory: Callable[[Settings], TmapWalkingClient | None] | None = None,
     realtime_provider: search_flow.RealtimeProvider | None = None,
     limit: int = 5,
+    daejeon_client_factory: Callable[[Settings], DaejeonBusClient | None] | None = None,
 ) -> list[dict[str, Any]]:
     """대기 중인 앱 검색을 최대 limit건 실행한다. 설정 오류면 아무것도 가져가지 않는다(행은 processing으로 남아 재시도)."""
     try:
@@ -53,11 +55,13 @@ def process_search_jobs(
             results.append({"search_id": str(search_id), "action": claim["action"]})
             continue
         tago = _client(tago_client_factory or _default_tago, settings)
+        daejeon = _client(daejeon_client_factory or _default_daejeon, settings)
         walking = _client(walking_client_factory or _default_walking, settings)
         try:
             outcome = search_flow.SearchWorkflow(
                 db, config, tago_client=tago, walking_client=walking, clock=clock,
-                realtime_provider=realtime_provider, collect=tago is not None,
+                realtime_provider=realtime_provider, collect=tago is not None or daejeon is not None,
+                daejeon_client=daejeon,
             ).run_queued(search_id)
             results.append({"search_id": str(search_id), "action": "finished", "status": outcome.status,
                             "candidates": outcome.saved_candidates, "attempt": claim["attempts"]})
@@ -66,7 +70,7 @@ def process_search_jobs(
             logger.exception("검색 %s 실행 실패", search_id)
             results.append({"search_id": str(search_id), "action": "failed", "error": type(exc).__name__})
         finally:
-            for client in (tago, walking):
+            for client in (tago, daejeon, walking):
                 if client is not None:
                     client.close()
     return results
@@ -75,13 +79,17 @@ def process_search_jobs(
 def _client(factory: Callable[[Settings], Any], settings: Settings) -> Any:
     try:
         return factory(settings)
-    except (TagoConfigError, TmapConfigError) as exc:
+    except (TagoConfigError, TmapConfigError, DaejeonBusConfigError) as exc:
         logger.warning("외부 클라이언트 미설정: %s", exc)
         return None
 
 
 def _default_tago(settings: Settings) -> TagoClient:
     return TagoClient.from_settings(settings)
+
+
+def _default_daejeon(settings: Settings) -> DaejeonBusClient:
+    return DaejeonBusClient.from_settings(settings)
 
 
 def _default_walking(settings: Settings) -> TmapWalkingClient:

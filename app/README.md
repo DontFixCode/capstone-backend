@@ -40,6 +40,33 @@ TAGO 인증키는 실제 TAGO 호출에만 필요하다(아래 Phase 1 참고). 
 Docker 이미지에는 로컬 환경 파일을 포함하지 않으므로 `/health`는 DB 자격증명 없이 실행된다.
 신규 실행 골격에 추가한 의존성은 `pydantic-settings`이고, Phase 1 TAGO 호출을 위해 `httpx`를 추가했다.
 
+## 서버 배포 (DB가 있는 서버)
+
+`compose.server.yaml`은 API·워커를 DB와 같은 서버에서 띄운다. 두 서비스가 Supabase 스택의 Docker 네트워크에 붙어 DB(`db:5432`)에
+직접 접속하므로 SSH 터널이 필요 없고, 둘 다 `restart: unless-stopped`다. 이미지(Python 3.13)에는 코드와 `data/service_area`만 들어가고
+비밀값은 넣지 않는다.
+
+```bash
+# 서버에서 (저장소를 ~/capstone-backend에 둔 경우)
+docker network ls                      # Supabase 네트워크 이름 확인 (기본값 bus-transfer-supabase_default)
+cp <로컬>/.env.api ~/capstone-backend/  # 실행 설정·TAGO·대전시·TMAP 키 (커밋하지 않음)
+SUPABASE_NETWORK=<네트워크 이름> SUPABASE_ENV_FILE=~/bus-transfer-supabase/deployment/.env \
+  docker compose -f compose.server.yaml up -d --build
+curl http://127.0.0.1:8001/health      # 서버 안에서 확인
+docker compose -f compose.server.yaml logs -f worker
+```
+
+- `.env.api`의 로컬 값 중 `BACKEND_DB_HOST`·`BACKEND_DB_PORT`(터널 주소)·`BACKEND_ENV`·`ENABLE_DEVTOOLS`는 compose가 덮어쓴다
+  (DB `db:5432`, `production`, devtools 끔). `BACKEND_AUTH_JWT_ISSUER`는 서버 GoTrue 발급자(`https://121.153.148.189:18443/auth/v1`)와 같아야 한다.
+- DB 이름·비밀번호·JWT 비밀값은 `SUPABASE_ENV_FILE`(Supabase 스택 `.env`)을 컨테이너 `/app/.env`에 읽기 전용으로 연결해 읽는다.
+- API 공개 주소는 `API_PUBLISH`(기본 `0.0.0.0:8001`). 서버 방화벽·공유기에서 그 포트를 열어야 외부(프론트 개발자)에서 접근한다.
+  HTTPS·도메인은 앞단 리버스 프록시에서 붙인다. 모바일 앱은 HTTP를 기본 차단하므로(Android cleartext, iOS ATS) HTTP로 쓸 때는 개발 빌드에서 예외를 둔다.
+- 앱의 회원가입·로그인은 Supabase Auth(`/auth/v1`)에 직접 접속한다. 내부 게이트웨이 `127.0.0.1:18080` 앞에 버스 전용 HTTPS 프록시를 두어
+  앱 API·Auth를 `https://121.153.148.189:18443`으로 공개했다. 앱의 Supabase URL에는 `/auth/v1`을 붙이지 않는다. Studio 관리 접속은 별도 Basic 인증을 사용하는 `https://121.153.148.189:18444`다.
+  앱에는 Supabase 주소와 anon key만 주고 JWT 비밀값·service_role key는 주지 않는다. 실제 배포본과 비공개 환경변수 인수인계는 [서버 배포 설정](../deployment/README.md)을 참고한다.
+- 워커는 서버에 하나만 둔다. 로컬 PC 워커를 같은 DB에 동시에 띄우지 않는다. 서버 워커는 정적 정보 하루 1회 갱신도 수행한다.
+- 코드 갱신: `git pull` 뒤 같은 `up -d --build`. 중지: `docker compose -f compose.server.yaml down`(DB·Supabase 스택에는 영향 없음).
+
 ## 구성과 책임
 
 - `core/`: 실행 설정·로그, 추후 보안·공통 예외 처리.
@@ -189,7 +216,7 @@ Swagger는 `http://127.0.0.1:8001/docs`의 `devtools: TAGO 확인` 태그에 있
 | `/dev/transit/stops/{stop_id}/arrivals` | 정류소 도착예정정보 | http://127.0.0.1:8001/dev/transit/stops/DJB8001378/arrivals |
 | `/dev/daejeon/stops/{bus_stop_id}/arrivals` | 대전시 버스 도착정보(`apis.data.go.kr/6300000/arrive/getArrInfoByStopID`, `BusStopID`) | http://127.0.0.1:8001/dev/daejeon/stops/8001378/arrivals |
 
-대전시 확인 URL은 `DAEJEON_BUS_SERVICE_KEY`(비우면 `TAGO_SERVICE_KEY`)로 1회 호출하고 제공기관 응답을 그대로 돌려준다(본문 바이트·
+대전시 확인 URL은 수집과 같은 `DAEJEON_BUS_SERVICE_KEY`(비우면 `TAGO_SERVICE_KEY`)로 1회 호출하고 제공기관 응답을 그대로 돌려준다(본문 바이트·
 HTTP 상태·Content-Type 유지, 본문에 인증키가 되돌아오면 그 부분만 `***`). 요청·수신 시각(UTC)은 응답 헤더 `X-Upstream-Requested-At`·
 `X-Upstream-Received-At`에만 붙는다. 응답을 받지 못한 경우만 JSON 오류(시간초과 504, 연결 오류 502), 키 미설정은 503이다.
 `BusStopID`가 TAGO `nodeid`의 `DJB` 뒤 숫자와 같은지는 확인 전이다(Notion Backend > 검증 대기 항목 2번).
@@ -275,7 +302,10 @@ uv run python -m app.workers.main                    # 상시 실행(정적 하�
 - 배치의 모든 페이지를 정규화한 뒤 관측과 `published_at`을 함께 공개한다. 정상 빈 응답은 빈 스냅샷으로 공개하고, 부분 수집·실패는 직전 공개본을 유지한다.
   최신 조회는 `fresh`/`stale`/`no_data`, 내용 `items`/`empty`, 마지막 시도 실패 여부, 원천 미제공 항목을 따로 반환한다.
 - 위치의 경유 위치는 nodeid·nodeord가 현재 패턴의 같은 행과 맞을 때만, 도착의 경유 위치는 현재 패턴에서 한 번만 경유할 때만 확정한다.
-  도착정보는 차량번호·기준 시각이 없어 차량을 연결하지 않고 절대 ETA를 계산하지 않는다(`remaining_seconds`는 원값). `collected_at`은 서버 수신 시각이다.
+  도착정보는 대전시 버스 도착정보 API(`getArrInfoByStopID`, 2026-11-09부터 TAGO 도착정보 대체)에서 받는다. 조회 조건 `BusStopID`는 정적 정류소의
+  `stop_no`이고, 응답 `BUS_NODE_ID`·`ROUTE_CD`에 `DJB`를 붙여 TAGO 정류소·노선에 잇는다. 차량번호(`CAR_REG_NO`)를 그대로 저장하고 잔여초(`EXTIME_SEC`)는
+  원값, 기준 시각은 항목별 `INFO_OFFER_TM`(KST, 사용자 결정·검증 전, 출처 `daejeon_info_offer_tm`)으로 절대 ETA를 함께 저장한다. 운행 회차 키는 없다.
+  수집 키는 `daejeon:getArrInfoByStopID?nodeId=<정류소 ID>`, 위치정보는 TAGO 그대로다. `collected_at`은 서버 수신 시각이다.
 
 ### 시험
 
@@ -319,8 +349,10 @@ uv run python -m scripts.search_routes show <search_id>                         
   `same_stop`(같은 정류소 환승, 조회 없음·준비시간은 평가에서 별도). TMAP 오류 코드의 의미가 확인되지 않아 `no_path`로 단정하지 않는다.
 - 실시간 대상(후보의 승하차 정류소 도착·노선 위치)은 검색 행의 `summary.realtime_targets`·`expires_at`으로 등록되어 워커가 공유 수집하고,
   검색 시점에는 Phase 2 수집기로 600초 이내 공개 배치를 재사용·부족한 대상만 조회한다. 평가의 최신성 한도는 `BACKEND_EVAL_MAX_DATA_AGE_SECONDS`로 따로 적용한다.
-- TAGO 도착정보는 기준시각·차량·회차가 없어 기본 정책에서는 ETA를 만들지 않는다(`eta_basis_unconfirmed`). 따라서 실제 데이터로는 하차 ETA가
-  미확인이고 후보는 평가 제한으로 저장되며 검색 상태는 `data_limited`다. 확률·기대시간은 각 자료 요건이 충족될 때만 계산한다.
+- 도착정보(대전시)는 차량번호와 `INFO_OFFER_TM` 기준 절대 ETA가 있어 승차 ETA를 만든다. 하차 ETA는 같은 차량번호의 하차 정류소 예측을 쓰되,
+  운행 회차 키가 없으므로 같은 패턴이고 남은 정류장 수(`STATUS_POS`) 차이가 승하차 경유 순번 차이와 같으며 하차가 승차보다 늦을 때만 잇는다
+  (사유 코드 `alight_linked_by_vehicle_without_run_key`, 검증 전 연결). 모든 탑승 구간이 이어진 후보는 nominal 순위를 받는다. 회차 키가 없어
+  환승 표본·확률은 계속 null이다. 같은 노선 차량이 승하차 정류소 사이에 더 있으면 하차 정류소 목록에 우리 차량이 없어 평가 제한으로 남는다.
 - ETA 기준 시각 정책 `BACKEND_TAGO_ETA_BASIS_POLICY`: 기본 `unconfirmed`. `server_received_at`은 응답 수신 시각 + 잔여초로 절대 ETA를
   근사한다(기준 출처 `server_received_at_approx`, 정책 버전 `tago-arrival-basis-server-received-at/1`이 검색 `params`·`summary`·후보 ETA·
   안내에 남고 표본 조건 키도 분리된다). Notion DB-C04는 검증한 근사 정책만 허용하지만 2026-11-09 사용자 결정으로 검증 전에 켜 둔다

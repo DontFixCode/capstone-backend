@@ -94,8 +94,14 @@ class SearchPolicy(FrozenSchema):
     # 0이면 동일 정류소 환승만 허용한다.
     transfer_radius_meters: NonNegativeFloat
     egress_radius_meters: PositiveFloat
+    # ETA 평가에 넘길 최대 후보 수. 탐색 중단 조건이 아니다.
     max_candidates: PositiveInt
-    # 재현 가능한 탐색 한도. search_budget_ms는 실행 환경에 따라 달라지는 계산시간 한도다.
+    # 환승 라운드(정확한 탑승 횟수)마다 정적 비용 순으로 보관하는 완성 경로 수. 분기 한정의 기준이다.
+    round_pool_size: PositiveInt
+    # 정적 비용에서 도보 직선거리 1 m를 승차 직선거리 몇 m로 볼지.
+    walk_cost_weight: PositiveFloat
+    # 라운드마다 새로 주는 탐색 한도. max_search_states는 확인한 하차 위치 수(재현 가능),
+    # search_budget_ms는 실행 환경에 따라 달라지는 계산시간 한도다.
     max_search_states: PositiveInt
     search_budget_ms: PositiveInt
 
@@ -160,7 +166,7 @@ class SearchCoverage(FrozenSchema):
 
 
 class CandidateSearchResult(FrozenSchema):
-    """후보 생성 결과. candidates는 식별자 순서이며 발견 순서나 추천 순위가 아니다."""
+    """후보 생성 결과. candidates는 ETA 평가 대상으로 고른 후보의 식별자 순서이며 발견 순서나 추천 순위가 아니다."""
 
     static_snapshot_id: str
     candidates: tuple[StaticCandidate, ...]

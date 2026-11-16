@@ -1,0 +1,3 @@
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+17 3,15 * * * root /home/gmlrud/bus-transfer-supabase/deployment/public-auth/renew.sh >> /var/lib/bus-auth/logs/renew-cron.log 2>&1

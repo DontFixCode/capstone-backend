@@ -152,7 +152,8 @@ Request body (대전역 → 대전시청):
 ### 6-2. `GET /api/v1/route-searches/{searchId}`
 searchId = 6-1 값. 워커가 계산하는 몇 초 동안은 `processing`, 이후 다시 실행.
 - 실제 TAGO 자료: **200** `status: "data_limited"`, `reasonCodes`에 `no_rankable_candidate`. 후보(`candidates`)는 있지만
-  `rank: null`(ETA 기준 시각 미확인 → `evaluation.reasonCodes`에 `eta_basis_unconfirmed`). 자료 부족일 뿐인 후보는
+  `rank: null`(하차 ETA를 잇지 못한 후보: `alight_eta_vehicle_absent`·`alight_eta_progress_mismatch` 등). 같은 차량번호로 승하차가 모두 이어진
+  후보는 순위를 받고 `reasonCodes`에 `alight_linked_by_vehicle_without_run_key`가 붙는다. 자료 부족일 뿐인 후보는
   `startable: true`, `startMode: "data_limited"`이다. `evaluation.connectionStatus`가 `confirmed_infeasible`(도보 경로 없음 등)·
   `negative_slack`인 후보는 `startable: false`, `startBlockedReason: "CANDIDATE_NOT_STARTABLE"`.
 - **기록** `startMode`가 `data_limited`(또는 `ranked`)인 후보의 `candidateId` → `candidateId` (7-1에서 사용)
@@ -180,7 +181,7 @@ Request body:
 ```
 - **201** `journeyId`, `stateVersion: 1`, `movementState: "walking"`. **기록** `journeyId`
 - 실제 TAGO 자료(6-2가 `data_limited`)에서는 `selectedRoute.startMode: "data_limited"`, `rank: null`,
-  `startLimitReasons`에 `eta_basis_unconfirmed` 등. 시간·확률은 null이고 수동 탑승·하차·도착 안내는 그대로 동작한다.
+  `startLimitReasons`에 하차 ETA 미연결 사유 등. 시간·확률은 null이고 수동 탑승·하차·도착 안내는 그대로 동작한다.
   순위 후보로 시작하면 `startMode: "ranked"`.
 - 그 밖에: `startable: false` 후보 409 `CANDIDATE_NOT_STARTABLE`, 30분 지난 검색 409 `SEARCH_EXPIRED`,
   진행 중 이동이 있으면 409 `ACTIVE_JOURNEY_EXISTS`, 없는 searchId(`00000000-0000-4000-8000-000000000000`) 404

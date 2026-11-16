@@ -1,3 +1,5 @@
+버스 프로젝트의 실제 운영 서버 설정과 환경변수 전달 방법은 [deployment/README.md](deployment/README.md)를 참고하세요. 루트 `docker-compose.yml`은 기존 Supabase 기본 구성이고, 현재 버스 서버에서 사용하는 구성은 `deployment/supabase/docker-compose.yml`입니다.
+
 <div align="center">
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)

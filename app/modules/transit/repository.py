@@ -16,6 +16,11 @@ from psycopg.types.json import Jsonb
 from app.modules.transit.models import FetchAttemptRow, ObservationRow, RouteRow, RouteStopRow, StopRow
 
 PROVIDER = "tago"
+
+
+def _provider(target_key: str) -> str:
+    """수집 키의 제공처(접두사). 도착정보는 대전시(daejeon), 위치·정적 정보는 TAGO(tago)다."""
+    return target_key.split(":", 1)[0]
 _POINT = "extensions.ST_SetSRID(extensions.ST_MakePoint({lon}, {lat}), 4326)::extensions.geography"
 
 
@@ -81,7 +86,7 @@ def latest_published_pages(conn: psycopg.Connection, api_kind: str, target_key: 
          WHERE f.published_at IS NOT NULL
          ORDER BY f.page_no
         """,
-        {"p": PROVIDER, "k": api_kind, "t": target_key},
+        {"p": _provider(target_key), "k": api_kind, "t": target_key},
     ).fetchall()
     keys = ("id", "batch_key", "page_no", "result_status", "requested_at", "received_at", "published_at", "total_count")
     return [dict(zip(keys, row)) for row in rows]
@@ -96,7 +101,7 @@ def last_attempt(conn: psycopg.Connection, api_kind: str, target_key: str) -> di
          ORDER BY requested_at DESC, id DESC
          LIMIT 1
         """,
-        (PROVIDER, api_kind, target_key),
+        (_provider(target_key), api_kind, target_key),
     ).fetchone()
     if row is None:
         return None
@@ -117,23 +122,24 @@ def target_timings(
     if not target_keys:
         return {}
     result: dict[str, tuple[datetime | None, datetime | None]] = {key: (None, None) for key in target_keys}
+    providers = sorted({_provider(key) for key in target_keys})
     for key, last in conn.execute(
         "SELECT target_key, max(requested_at) FROM app.api_fetches "
-        "WHERE provider = %s AND api_kind = %s AND target_key = ANY(%s) GROUP BY target_key",
-        (PROVIDER, api_kind, list(target_keys)),
+        "WHERE provider = ANY(%s) AND api_kind = %s AND target_key = ANY(%s) GROUP BY target_key",
+        (providers, api_kind, list(target_keys)),
     ):
         result[key] = (last, None)
     for key, collected in conn.execute(
         """
         WITH lb AS (
             SELECT DISTINCT ON (target_key) target_key, batch_key FROM app.api_fetches
-             WHERE provider = %s AND api_kind = %s AND target_key = ANY(%s) AND published_at IS NOT NULL
+             WHERE provider = ANY(%s) AND api_kind = %s AND target_key = ANY(%s) AND published_at IS NOT NULL
              ORDER BY target_key, published_at DESC, id DESC)
         SELECT lb.target_key, min(f.received_at)
           FROM lb JOIN app.api_fetches f ON f.batch_key = lb.batch_key AND f.published_at IS NOT NULL
          GROUP BY lb.target_key
         """,
-        (PROVIDER, api_kind, list(target_keys)),
+        (providers, api_kind, list(target_keys)),
     ):
         result[key] = (result[key][0], collected)
     return result
@@ -428,6 +434,12 @@ def route_ids(conn: psycopg.Connection, external_ids: Iterable[str]) -> dict[str
     ).fetchall())
 
 
+def is_active_stop(conn: psycopg.Connection, external_id: str) -> bool:
+    """현재 활성 정류소인지."""
+    return conn.execute("SELECT 1 FROM app.stops WHERE provider = %s AND is_active AND external_id = %s",
+                        (PROVIDER, external_id)).fetchone() is not None
+
+
 def stop_ids(conn: psycopg.Connection, external_ids: Iterable[str]) -> dict[str, int]:
     ids = sorted(set(external_ids))
     if not ids:
@@ -578,6 +590,16 @@ def route_shape_infos(conn: psycopg.Connection, external_ids: Iterable[str]) -> 
         (PROVIDER, ids)).fetchall())
 
 
+def route_service_infos(conn: psycopg.Connection, external_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
+    """노선별 운행 정보(첫차·막차·배차간격 원값, routes.service_info)."""
+    ids = sorted(set(external_ids))
+    if not ids:
+        return {}
+    return dict(conn.execute(
+        "SELECT external_id, service_info FROM app.routes WHERE provider = %s AND external_id = ANY(%s)",
+        (PROVIDER, ids)).fetchall())
+
+
 def stop_by_id(conn: psycopg.Connection, stop_id: int) -> dict[str, Any] | None:
     row = conn.execute(f"SELECT {_STOP_COLUMNS} FROM app.stops s WHERE s.id = %s", (stop_id,)).fetchone()
     return None if row is None else dict(zip(_STOP_KEYS, row))
@@ -708,3 +730,92 @@ def delete_expired_view_targets(conn: psycopg.Connection, now: datetime) -> int:
     if not view_targets_table_exists(conn):
         return 0
     return conn.execute("DELETE FROM app.realtime_view_targets WHERE expires_at <= %s", (now,)).rowcount
+
+
+# ---------------------------------------------------------------- 버스 노선 형상 수집
+
+def shape_collection_routes(conn: psycopg.Connection) -> list[dict[str, Any]]:
+    """활성 노선의 형상 수집 상태. 좌표는 싣지 않고 제공처 연결(provider)과 패턴별 출처·상태·조회 시각만 읽는다."""
+    rows = conn.execute(
+        """
+        SELECT r.id, r.external_id, r.route_no, r.shape_info -> 'provider',
+               (SELECT jsonb_object_agg(p.key, jsonb_build_object(
+                           'source', p.value -> 'source', 'status', p.value -> 'status',
+                           'fetched_at', p.value -> 'fetched_at'))
+                  FROM jsonb_each(CASE WHEN jsonb_typeof(r.shape_info -> 'patterns') = 'object'
+                                       THEN r.shape_info -> 'patterns' ELSE '{}'::jsonb END) AS p)
+          FROM app.routes r
+         WHERE r.provider = %s AND r.is_active
+         ORDER BY r.route_no NULLS LAST, r.id
+        """,
+        (PROVIDER,),
+    ).fetchall()
+    return [{"id": route_id, "external_id": external_id, "route_no": route_no,
+             "provider": provider if isinstance(provider, dict) else None, "patterns": patterns or {}}
+            for route_id, external_id, route_no, provider, patterns in rows]
+
+
+def pattern_stop_points(conn: psycopg.Connection,
+                        route_ids: Iterable[int]) -> dict[int, dict[str, list[tuple[int, float | None, float | None]]]]:
+    """노선별·패턴별 경유 정류소의 (경유 순서, 경도, 위도). 좌표가 없는 정류소는 None으로 둔다."""
+    ids = sorted(set(route_ids))
+    result: dict[int, dict[str, list[tuple[int, float | None, float | None]]]] = {}
+    if not ids:
+        return result
+    rows = conn.execute(
+        """
+        SELECT rs.route_id, rs.pattern_key, rs.seq, extensions.ST_X(st.location::extensions.geometry),
+               extensions.ST_Y(st.location::extensions.geometry)
+          FROM app.route_stops rs JOIN app.stops st ON st.id = rs.stop_id
+         WHERE rs.route_id = ANY(%s)
+         ORDER BY rs.route_id, rs.pattern_key, rs.seq
+        """,
+        (ids,),
+    ).fetchall()
+    for route_id, pattern_key, seq, lon, lat in rows:
+        result.setdefault(route_id, {}).setdefault(pattern_key, []).append((seq, lon, lat))
+    return result
+
+
+def set_shape_provider(conn: psycopg.Connection, route_id: int, provider: dict[str, Any]) -> None:
+    """형상 제공처 연결 정보만 바꾼다(저장된 패턴 형상은 그대로)."""
+    conn.execute("UPDATE app.routes SET shape_info = shape_info || jsonb_build_object('provider', %s::jsonb) "
+                 "WHERE id = %s", (Jsonb(provider), route_id))
+
+
+def save_shape_patterns(conn: psycopg.Connection, route_id: int, provider: dict[str, Any],
+                        patterns: dict[str, Any]) -> None:
+    """노선의 패턴 형상 전체를 교체한다. 지금 경유 목록에 없는 예전 패턴 키의 형상은 남기지 않는다."""
+    conn.execute("UPDATE app.routes SET shape_info = shape_info || jsonb_build_object('provider', %s::jsonb, "
+                 "'patterns', %s::jsonb) WHERE id = %s", (Jsonb(provider), Jsonb(patterns), route_id))
+
+
+def provider_call_count(conn: psycopg.Connection, provider: str, since: datetime) -> int:
+    """제공처별 실제 HTTP 시도 수(since 이후). 일일 호출 한도 확인에 쓴다."""
+    return conn.execute("SELECT count(*) FROM app.api_fetches WHERE provider = %s AND requested_at >= %s",
+                        (provider, since)).fetchone()[0]
+
+
+def shape_summary(conn: psycopg.Connection) -> dict[str, Any]:
+    """활성 노선의 형상 확보 현황(제공처 연결 상태와 현재 패턴의 형상 상태별 수)."""
+    routes = conn.execute(
+        """
+        SELECT coalesce(shape_info #>> '{provider,status}', 'pending'), count(*)
+          FROM app.routes WHERE provider = %s AND is_active GROUP BY 1 ORDER BY 1
+        """,
+        (PROVIDER,),
+    ).fetchall()
+    patterns = conn.execute(
+        """
+        SELECT coalesce(r.shape_info #>> ARRAY['patterns', p.pattern_key, 'status'], 'missing'),
+               coalesce(r.shape_info #>> ARRAY['patterns', p.pattern_key, 'reason'], ''), count(*)
+          FROM (SELECT DISTINCT route_id, pattern_key FROM app.route_stops) p
+          JOIN app.routes r ON r.id = p.route_id
+         WHERE r.provider = %s AND r.is_active
+         GROUP BY 1, 2 ORDER BY 1, 2
+        """,
+        (PROVIDER,),
+    ).fetchall()
+    return {"routes_by_provider_status": dict(routes),
+            "patterns_by_status": [{"status": status, "reason": reason or None, "count": count}
+                                   for status, reason, count in patterns]}

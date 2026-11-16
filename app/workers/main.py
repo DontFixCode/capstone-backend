@@ -6,6 +6,10 @@
     uv run python -m app.workers.main --no-static # 정적 일일 갱신을 이 실행에서 제외
     uv run python -m app.workers.main --no-jobs   # 앱 검색 실행·이동 안내 재계산 스레드를 제외
 
+정적 갱신 차례가 되면 버스 노선 형상도 이어서 수집한다(BACKEND_ROUTE_SHAPE_PROVIDER=odsay이고 일일 호출 한도
+BACKEND_ODSAY_DAILY_CALL_LIMIT이 있을 때만, 남은 한도만큼. app/workflows/route_shapes.py). 연결된 노선의 형상은 한 요청으로
+모두 다시 받으므로 하루 1회 전체 갱신에 보통 1건이 든다.
+
 상시 실행은 두 흐름을 같은 프로세스에서 돌린다: ① 공유 수집 루프(정적 갱신 → 실시간 → 표본 판정),
 ② 앱 작업 스레드(접수된 검색 실행 → 활성 이동 안내 재계산, BACKEND_JOB_POLL_SECONDS 간격). 두 흐름은 대상별 DB 잠금을
 기다리지 않는 방식(try-lock)으로 같은 수집기를 써서 서로의 완료를 기다리며 막히지 않는다.
@@ -34,11 +38,15 @@ from app.core.config import Settings
 from app.core.logging import configure_logging
 from app.db.session import Database, DbConfigError, DbError
 from app.integrations.bus_api import TagoClient, TagoConfigError
+from app.integrations import route_shapes_api
+from app.integrations.daejeon_bus_api import DaejeonBusClient, DaejeonBusConfigError
+from app.integrations.odsay_api import OdsayClient, OdsayConfigError
 from app.modules.transit import repository as transit_repository
 from app.modules.transit.service import RealtimeCollector, StaticImportService, latest_snapshot, utc_now
 from app.workers import recalculation, scheduler, search_jobs
 from app.workers.collection import collection_targets
 from app.workflows import guidance as guidance_flow
+from app.workflows import route_shapes as route_shapes_flow
 from app.workflows.labeling import label_due
 
 logger = logging.getLogger(__name__)
@@ -50,6 +58,7 @@ class PassResult:
     targets: int = 0
     outcomes: list[dict[str, Any]] = field(default_factory=list)
     static: dict[str, Any] | None = None
+    shapes: dict[str, Any] | None = None
     labels: dict[str, int] | None = None
     next_wake_at: datetime | None = None
 
@@ -66,8 +75,14 @@ class Worker:
         jobs_enabled: bool = True,
         walking_client_factory: Callable[[Settings], Any] | None = None,
         realtime_provider: Callable[..., Any] | None = None,
+        daejeon_client_factory: Callable[[Settings], DaejeonBusClient] = DaejeonBusClient.from_settings,
+        shape_client_factory: Callable[[Settings], OdsayClient] = OdsayClient.from_settings,
     ) -> None:
         self.settings_factory = settings_factory
+        # 버스 노선 형상 제공처(ODsay). 제공처·일일 한도·키가 설정된 경우에만 정적 갱신 뒤에 호출한다.
+        self.shape_client_factory = shape_client_factory
+        # 실시간 도착정보 원천(대전시). 키가 없으면 도착정보 대상은 조회하지 않고 실패로 남긴다(위치정보 수집은 계속).
+        self.daejeon_client_factory = daejeon_client_factory
         self.db_factory = db_factory
         self.client_factory = client_factory
         self.clock = clock
@@ -86,7 +101,8 @@ class Worker:
         db = self.db_factory(settings)
         searches = search_jobs.process_search_jobs(
             db, settings, clock=self.clock, tago_client_factory=lambda s: self.client_factory(s),
-            walking_client_factory=self.walking_client_factory, realtime_provider=self.realtime_provider)
+            walking_client_factory=self.walking_client_factory, realtime_provider=self.realtime_provider,
+            daejeon_client_factory=self.daejeon_client_factory)
         journeys = recalculation.process_due_journeys(db, settings, clock=self.clock, network_cache=self.network_cache,
                                                       realtime_provider=self.realtime_provider)
         return {"searches": searches, "journeys": journeys}
@@ -122,6 +138,7 @@ class Worker:
                 result.static = {"status": report.status, "data_version": report.data_version,
                                  "problems": [asdict(p) for p in report.problems]}
                 logger.info("정적 갱신: %s", report.status)
+                result.shapes = self.collect_route_shapes(settings, db)
                 with db.transaction() as conn:
                     _, due_at = scheduler.static_due(conn, settings.static_refresh_interval_seconds, self.clock())
             wake_candidates.append(due_at)
@@ -143,7 +160,13 @@ class Worker:
         realtime_wake = [p.due.at for p in plans if p.due.at > now]
         if due:
             client = self.client_factory(settings)
-            collector = RealtimeCollector(db, client, interval_seconds=interval, clock=self.clock)
+            try:
+                daejeon = self.daejeon_client_factory(settings)
+            except DaejeonBusConfigError as exc:
+                logger.warning("대전시 버스 API 미설정(도착정보 수집 안 함): %s", exc)
+                daejeon = None
+            collector = RealtimeCollector(db, client, interval_seconds=interval, clock=self.clock,
+                                          daejeon_client=daejeon)
             try:
                 for plan in due:
                     try:
@@ -162,6 +185,8 @@ class Worker:
                                 outcome.http_attempts, outcome.observations)
             finally:
                 client.close()
+                if daejeon is not None:
+                    daejeon.close()
             with db.transaction() as conn:
                 replanned = scheduler.plan_realtime(conn, targets, interval, self.clock(), self.ran_slots)
             realtime_wake = [p.due.at for p in replanned]
@@ -172,6 +197,30 @@ class Worker:
         poll_limit = self.clock() + timedelta(seconds=settings.worker_poll_seconds)
         result.next_wake_at = min([poll_limit, *wake_candidates])
         return result
+
+    def collect_route_shapes(self, settings: Settings, db: Database) -> dict[str, Any] | None:
+        """버스 노선 형상 수집(하루 1회, 정적 갱신 직후). 실패해도 수집 루프는 계속한다. 제공처 미설정이면 None.
+
+        정적 정보와 같이 하루 1회 전체를 다시 받는다(refresh_all). 연결된 노선은 한 요청에 모두 넣으므로 보통 1건이고,
+        새 노선·ID 미연결 노선이 있으면 노선번호 첫 글자별 검색이 더해진다.
+        """
+        if route_shapes_api.configured_provider(settings.route_shape_provider) is None:
+            return None
+        if settings.odsay_daily_call_limit is None:
+            logger.warning("형상 수집 건너뜀: BACKEND_ODSAY_DAILY_CALL_LIMIT이 비어 있습니다.")
+            return {"status": "skipped", "reason": "daily_call_limit_unset"}
+        try:
+            with self.shape_client_factory(settings) as client:
+                report = route_shapes_flow.collect(db, settings, client, refresh_all=True, clock=self.clock)
+        except OdsayConfigError as exc:
+            logger.warning("형상 수집 건너뜀: %s", exc)
+            return {"status": "skipped", "reason": "api_key_unset"}
+        except Exception:
+            logger.exception("형상 수집 중 오류. 다음 정적 갱신 때 다시 시도합니다.")
+            return {"status": "error"}
+        logger.info("형상 수집: 호출 %d회, 저장 %d개 패턴, 남은 노선 %d개(ID 연결 %d), 중단 사유 %s", len(report.calls),
+                    report.shapes_saved, report.pending_shapes, report.pending_mapping, report.stopped)
+        return {"status": "done", **asdict(report)}
 
     def run_forever(self, stop: threading.Event, sleep: Callable[[float], None] | None = None) -> None:
         wait = sleep or (lambda seconds: stop.wait(seconds))
