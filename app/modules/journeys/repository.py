@@ -134,6 +134,83 @@ def update_location(conn: psycopg.Connection, journey_id: UUID, *, lat: float, l
     return row is not None
 
 
+def evaluation_snapshot(conn: psycopg.Connection, journey_id: UUID, snapshot_key: str) -> dict[str, Any] | None:
+    """이 이동에서 결과 전에 고정한 예측(system evaluation_snapshot) 하나. 다른 이동·사용자의 키는 찾지 않는다."""
+    row = conn.execute(
+        "SELECT id, journey_id, idempotency_key, event_type, source, occurred_at, received_at, state_version_after, "
+        "payload FROM app.journey_events WHERE journey_id = %s AND event_type = 'evaluation_snapshot' "
+        "AND source = 'system' AND payload->>'snapshot_key' = %s ORDER BY id LIMIT 1",
+        (journey_id, snapshot_key)).fetchone()
+    return None if row is None else dict(zip(_EVENT_KEYS, row))
+
+
+def result_events(conn: psycopg.Connection, journey_id: UUID) -> list[dict[str, Any]]:
+    """환승 결과와 그 수정 이벤트(effect.kind = transfer_result)를 저장 순서로."""
+    rows = conn.execute(
+        "SELECT id, journey_id, idempotency_key, event_type, source, occurred_at, received_at, state_version_after, "
+        "payload FROM app.journey_events WHERE journey_id = %s AND event_type IN ('transfer_result', 'correction') "
+        "AND payload->'effect'->>'kind' = 'transfer_result' ORDER BY id", (journey_id,)).fetchall()
+    return [dict(zip(_EVENT_KEYS, row)) for row in rows]
+
+
+def user_active_journeys(conn: psycopg.Connection, user_id: UUID) -> list[dict[str, Any]]:
+    """사용자의 활성 이동을 잠근다(탈퇴 접수용). 정책상 1개지만 목록으로 다룬다."""
+    rows = conn.execute(f"SELECT {_COLUMNS} FROM app.journeys j WHERE j.user_id = %s "
+                        "AND j.lifecycle_status = 'active' ORDER BY j.started_at, j.id FOR UPDATE",
+                        (user_id,)).fetchall()
+    return [dict(zip(_KEYS, row)) for row in rows]
+
+
+# ---------------------------------------------------------------- 기록 삭제(종료된 이동 1건)
+
+def reevaluation_search_ids(conn: psycopg.Connection, journey_id: UUID) -> list[UUID]:
+    """이 이동에 소속된 재평가·재탐색 검색(journey_id). 삭제 전에 잠근다."""
+    rows = conn.execute("SELECT id FROM app.route_searches WHERE journey_id = %s ORDER BY id FOR UPDATE",
+                        (journey_id,)).fetchall()
+    return [r[0] for r in rows]
+
+
+def lock_search(conn: psycopg.Connection, search_id: UUID, user_id: UUID) -> bool:
+    """같은 사용자의 검색 행을 잠근다. 동시에 그 검색으로 이동을 시작하는 요청(FOR SHARE)과 순서를 맞춘다."""
+    row = conn.execute("SELECT id FROM app.route_searches WHERE id = %s AND user_id = %s FOR UPDATE",
+                       (search_id, user_id)).fetchone()
+    return row is not None
+
+
+def search_referenced_elsewhere(conn: psycopg.Connection, search_id: UUID, journey_id: UUID) -> bool:
+    """다른 이동이 이 검색을 시작 검색으로 쓰거나, 그 후보를 선택·제안으로 참조하는지."""
+    row = conn.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM app.journeys o
+             WHERE o.id <> %(jid)s
+               AND (o.initial_search_id = %(sid)s
+                    OR o.selected_candidate_id IN (SELECT id FROM app.route_candidates WHERE search_id = %(sid)s)
+                    OR o.proposed_candidate_id IN (SELECT id FROM app.route_candidates WHERE search_id = %(sid)s))
+        )
+        """, {"jid": journey_id, "sid": search_id}).fetchone()
+    return bool(row[0])
+
+
+def delete_events(conn: psycopg.Connection, journey_id: UUID) -> int:
+    return conn.execute("DELETE FROM app.journey_events WHERE journey_id = %s", (journey_id,)).rowcount
+
+
+def delete_searches(conn: psycopg.Connection, search_ids: list[UUID]) -> tuple[int, int]:
+    """검색과 그 후보를 지운다(후보는 FK CASCADE와 같은 범위를 명시적으로 먼저 지운다). (검색 수, 후보 수)."""
+    if not search_ids:
+        return 0, 0
+    candidates = conn.execute("DELETE FROM app.route_candidates WHERE search_id = ANY(%s)", (search_ids,)).rowcount
+    searches = conn.execute("DELETE FROM app.route_searches WHERE id = ANY(%s)", (search_ids,)).rowcount
+    return searches, candidates
+
+
+def delete_journey(conn: psycopg.Connection, journey_id: UUID, user_id: UUID) -> bool:
+    row = conn.execute("DELETE FROM app.journeys WHERE id = %s AND user_id = %s AND lifecycle_status <> 'active' "
+                       "RETURNING id", (journey_id, user_id)).fetchone()
+    return row is not None
+
+
 def list_journeys(conn: psycopg.Connection, user_id: UUID, *, status: str | None,
                   before: tuple[datetime, UUID] | None, limit: int) -> list[dict[str, Any]]:
     """본인 이동을 시작 시각·ID 내림차순으로. before는 이전 페이지 마지막 항목(커서)."""

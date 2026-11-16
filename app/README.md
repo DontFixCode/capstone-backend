@@ -364,7 +364,7 @@ uv run python -m scripts.search_routes show <search_id>                         
 ## 앱 API·이동 세션 (Phase 4A~4C)
 
 인증된 사용자가 검색을 접수하고(API) 워커가 계산한 후보를 비교해 이동을 시작한 뒤, 수동 탑승·하차로 도착까지 진행한다.
-API 서버는 TAGO·TMAP을 호출하지 않고 DB만 읽고 쓴다. 검색 계산·공유 수집·안내 재계산은 워커가, 앱 전달은 API 서버의 WebSocket이
+API 서버는 TAGO·TMAP을 호출하지 않고 DB만 읽고 쓴다(장소 검색만 카카오 로컬 API를 직접 호출해 중계). 검색 계산·공유 수집·안내 재계산은 워커가, 앱 전달은 API 서버의 WebSocket이
 DB에 저장된 버전을 확인해 수행한다(프로세스 간 메모리 공유 없음).
 
 | 위치 | 책임 |
@@ -377,7 +377,7 @@ DB에 저장된 버전을 확인해 수행한다(프로세스 간 메모리 공�
 | `app/modules/journeys/` | `/journeys`: 시작·조회·이벤트(멱등·상태 버전)·위치. `state.py`가 전이 규칙 |
 | `app/workflows/guidance.py`, `app/workers/recalculation.py` | 선택 경로 남은 구간을 기존 평가 엔진으로 재계산(1분 + 입력 즉시), 상태 버전 조건부 저장, 예측 스냅샷 |
 | `app/realtime/` | `WS /api/v1/journeys/{id}/stream`: 인증·소유권 확인 후 최신 상태 전송, 버전 변경 동기화 |
-| `app/integrations/places_api.py`, `route_shapes_api.py` | 장소 검색·버스 형상 제공처 계약(현재 설정된 제공처 없음 → 503 / 미확보 사유) |
+| `app/integrations/places_api.py`, `route_shapes_api.py` | 장소 검색 제공처 계약과 카카오 로컬 API 어댑터(미설정 → 503), 버스 형상 제공처 계약(미설정 → 미확보 사유) |
 | `migrations/09_profiles_soft_delete.sql` | `profiles.deleted_at`·`auth_blocked_at`·CHECK를 재실행 가능하게 추가(02로 만든 DB에는 변화 없음) |
 
 ### 실행
@@ -388,23 +388,43 @@ uv run python -m app.workers.main                                    # 워커: �
 ```
 
 - 인증: `Authorization: Bearer <Supabase access token>`. places·stops·routes도 Phase 4에서는 인증을 요구한다. 탈퇴(`deleted_at`) 계정은
-  유효한 토큰이어도 403 `ACCOUNT_DELETED`이며 프로필을 다시 만들지 않는다. `DELETE /me`·Auth 차단 작업은 Phase 6 범위다.
+  유효한 토큰이어도 403 `ACCOUNT_DELETED`이며 프로필을 다시 만들지 않는다. `DELETE /me`·Auth 차단은 아래 Phase 6 참고.
 - 검색: `POST /api/v1/route-searches` → 202 `{searchId, status: processing}` → 워커 계산 → `GET`으로 `ready`/`data_limited`/`no_path`/
   `out_of_scope`/`error` 확인. 후보의 `startMode`: 순위 후보는 `ranked`, 자료 부족으로 순위가 없는 후보는 `data_limited`(시간·확률은
   null과 사유로 안내, 이동 상세 `selectedRoute.startMode`·`startLimitReasons`). 기준 ETA상 연결 불가(`negative_slack`)·실행 불가 확인
   (`confirmed_infeasible`, 도보 경로 없음 포함) 후보는 409 `CANDIDATE_NOT_STARTABLE`, 만료 검색은 409 `SEARCH_EXPIRED`.
 - 이동: `POST /journeys`(사용자당 활성 1개, 409 `ACTIVE_JOURNEY_EXISTS`), `POST /journeys/{id}/events`(헤더 `Idempotency-Key` 필수,
   `stateVersion` 불일치 409, 지원: `board`·`alight`·`completed`·`cancelled`·`correction`; `missed_bus`·`destination_changed`·
-  `route_accepted/rejected`는 Phase 5, `transfer_result`는 Phase 6이라 422 `UNSUPPORTED_EVENT_TYPE`), `PUT /journeys/{id}/location`(역순 무시).
+  `route_accepted/rejected`는 Phase 5라 422 `UNSUPPORTED_EVENT_TYPE`; `transfer_result`는 Phase 6), `PUT /journeys/{id}/location`(역순 무시).
 - WebSocket: 헤더 인증이 기본이며, 헤더를 보낼 수 없으면 연결 후 첫 메시지 `{"type":"auth","accessToken":"..."}`(제한 시간 내).
   종료 코드 4401(인증)·4403(탈퇴)·4404(없음/타인). 토큰을 URL에 넣지 않는다.
+
+### 장소 검색 (카카오 로컬 API)
+
+`GET /api/v1/places/search?q=`는 [places_api.py](integrations/places_api.py)의 카카오 어댑터로 검색어를 **키워드 장소 검색**과
+**주소 검색** 두 API에 보내고 주소 결과 → 장소 결과 순으로 합쳐 `items[]`(name·address·latitude·longitude·provider·externalId)로
+반환한다. 결과는 저장하지 않으며, 사용자가 고른 항목만 앱이 `POST /route-searches`의 출발지·목적지로 넘긴다.
+
+- 설정(`.env.api`): `BACKEND_PLACES_PROVIDER=kakao`, `KAKAO_REST_API_KEY`(카카오 디벨로퍼스 앱의 REST API 키, 앱에서 카카오맵
+  사용 설정 ON 필요), `BACKEND_KAKAO_TIMEOUT_SECONDS`(기본 5), `BACKEND_PLACES_SEARCH_RECT`(선택).
+- 범위: `BACKEND_PLACES_SEARCH_RECT`(최소 경도,최소 위도,최대 경도,최대 위도)를 넣으면 키워드 검색은 카카오 `rect`로 제한하고
+  주소 결과는 같은 사각형으로 거른다. 비우면 전국 결과다(예: `시청` → 다른 도시가 먼저 나옴). 예시 파일 값은 대전 경계를 둘러싼 사각형.
+- 장소 결과의 `address`는 도로명 주소, 없으면 지번 주소, 둘 다 없으면 null. `externalId`는 카카오 장소 ID이고 주소 결과는 null.
+  1쪽만 조회한다(장소 최대 15건 + 주소 최대 10건).
+- 오류: 카카오 429·쿼터 초과(code -10) → 429 `PLACES_RATE_LIMITED`, 401·403(키 오류·카카오맵 사용 설정 OFF·허용 IP 불일치)·키 미설정 →
+  503 `PLACES_NOT_CONFIGURED`, 5xx·점검·연결 실패 → 503 `PLACES_UNAVAILABLE`, 그 밖의 오류·해석 실패 → 502 `PLACES_UPSTREAM_ERROR`,
+  시간 초과 → 504 `PLACES_TIMEOUT`. 두 호출 중 하나라도 실패하면 전체가 실패다. 카카오가 준 오류 내용은 서버 로그에만 남긴다.
+- 검색어가 100자를 넘으면 카카오를 호출하지 않고 422 `VALIDATION_ERROR`(카카오 키워드 검색의 검색어 한도, 실응답 확인).
+- 실호출 확인(2026-11-16, 대전 범위 설정): `대전역` 15건, `대전 서구 둔산로 100` 주소 1건 + 장소 15건, `서울역` 0건, 없는 검색어 0건,
+  요청당 60~180 ms. 범위는 사각형이라 `시청`에 세종·계룡시청처럼 사각형에 걸친 주변 지역 장소도 나온다.
 
 ### 시험
 
 ```powershell
 uv run python -m unittest discover -s tests/unit
 $env:TEST_POSTGIS_DSN = "postgresql://postgres:<임의값>@127.0.0.1:55437/postgres"   # 임시 PostGIS 컨테이너
-uv run python -m unittest discover -s tests/integration                  # Phase 2·3·4 DB 격리 시험
+uv run python -m unittest tests.integration.test_transit_db tests.integration.test_search_db `
+  tests.integration.test_phase4_api tests.integration.test_phase6_api   # Phase 2·3·4·6 DB 격리 시험
 uv run python tests/e2e/phase4_flow.py [--real-tmap]                     # API·워커 별도 프로세스 E2E(HTTP·WebSocket)
 ```
 
@@ -441,3 +461,29 @@ docker run --rm -v ${PWD}:/work -w /work ghcr.io/osgeo/gdal:ubuntu-small-3.10.3 
 - 워커는 유효한 화면 수요를 개발 설정·검색·활성 이동 대상과 같은 키로 합친다. 최신 공개본이 없으면 다음 회차(최대 `BACKEND_WORKER_POLL_SECONDS`)에
   최초 수집하고 이후 600초 간격으로 갱신한다. 재조회는 갱신 시각을 바꾸지 않고 외부 호출을 일으키지 않는다. 만료된 행은 워커가 정리한다.
 - 비활성 대상·인증 실패·형식 오류·없는 ID는 등록·연장하지 않는다. 첫 조회는 공개본이 없으면 `unavailable`, 이후 조회에서 워커 공개본을 읽는다.
+
+## 기록 관리·회원탈퇴 (Phase 6 선행 개발)
+
+Phase 5(이동 중 재평가·대안 추천) 없이 동작하는 범위만 구현했다. `proposedRoute`는 대안이 없으므로 항상 `null`이고, 대안 수락·거절
+이벤트는 계속 422다. 현장·배포 검증 절차는 [docs/phase6-manual-verification.md](../docs/phase6-manual-verification.md), 호출 예시는
+[docs/api-examples.md](../docs/api-examples.md) 7-4·7-6·10.
+
+| 위치 | 책임 |
+|---|---|
+| `app/modules/journeys/service.py` | 환승 결과(`transfer_result`)·결과 수정(`correction`) 검증·저장, 기록 삭제, 탈퇴 시 활성 이동 취소, 상세 `transferResults` |
+| `app/modules/evaluation/user_results.py` | 수정 사슬에서 유효 결과 1건 결정, 실제 이용 연결과 계획 비교, 당시 예측과 대조·집계(DB·HTTP 없음) |
+| `app/modules/users/service.py`, `router.py` | `DELETE /api/v1/me` 소프트 삭제 접수(202), Auth 신규 로그인 차단·기록, 차단 대기 재시도 |
+| `app/integrations/supabase_auth.py` | GoTrue 관리자 `PUT /admin/users/{id}` `{"ban_duration"}`(물리 삭제 없음), 키·응답 본문 비노출 |
+| `app/workers/main.py` | 앱 작업 스레드에서 차단 대기 계정 재시도(`BACKEND_AUTH_BLOCK_RETRY_INTERVAL_SECONDS`) |
+| `migrations/11_route_searches_journey_fk.sql` | `route_searches.journey_id` → `journeys` FK(ON DELETE CASCADE). 이미 있으면 변화 없음 |
+
+- 환승 결과: 이동 시작 때 고정한 `evaluation_snapshot`(상세 `transferResults[]`)의 `snapshotKey`·`selectionVersion`·`transferIndex`에만
+  연결한다. 이동 상태 버전을 올리지 않고 종료된 이동에서도 받는다. 같은 환승의 결과는 1건이고, 바꾸려면 가장 최근 응답을 가리키는
+  `correction`(원본은 그대로). `unknown`·미응답·다른 연결 이용은 실패로 세지 않는다. 사용자 결과는 공통 관측·`transfer_samples`를 바꾸지 않는다.
+- 기록 삭제: 종료된 본인 이동만(활성 409). 이벤트, 이 이동의 재평가 검색·후보, 다른 이동이 참조하지 않는 시작 검색·후보를 한 트랜잭션에서
+  지운다. 공통 관측·비식별 표본·다른 사용자 자료와 계정은 그대로다.
+- 탈퇴: `profiles.deleted_at` 기록과 활성 이동 취소를 한 트랜잭션으로 커밋한 뒤(이후 API 403·WebSocket 4403), 트랜잭션 밖에서 Auth 차단을
+  시도해 성공하면 `auth_blocked_at`. 실패·미설정은 대기로 남아 재요청·워커가 재시도한다. UUID·이메일·개인 기록은 보존하고 표시용 ID만
+  `<UUID>_deleted`. 개인 기록을 바꾸는 트랜잭션은 `profiles`를 FOR SHARE로 잠가 탈퇴 접수와 순서를 맞춘다(잠금 순서 profiles → journeys).
+  탈퇴 계정의 접수 검색은 워커가 계산하지 않고 `error`(`account_deleted`)로 끝내며, 그 검색의 실시간 수집 대상도 뺀다.
+- 설정: `BACKEND_AUTH_ADMIN_URL`(필수, 기본값 없음), `BACKEND_AUTH_SERVICE_ROLE_KEY`(비우면 루트 `.env` `SERVICE_ROLE_KEY`) — `.env.api.example` 참고.

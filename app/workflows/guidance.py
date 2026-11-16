@@ -381,6 +381,13 @@ def compute_guidance(
 
 # ---------------------------------------------------------------- 예측 스냅샷 (결과 전에 고정)
 
+def _planned_route(leg: dict[str, Any]) -> dict[str, Any] | None:
+    if not leg:
+        return None
+    return {"route_internal_id": leg.get("route_internal_id"), "route_external_id": leg.get("route_id"),
+            "route_no": leg.get("route_no"), "pattern_key": leg.get("pattern_key")}
+
+
 def evaluation_snapshots(journey_id: UUID, candidate: dict[str, Any], *, selection_version: int,
                          config_version: str | None, fixed_at: datetime) -> list[tuple[str, dict[str, Any]]]:
     """선택 후보의 환승별 예측을 사용자 결과 전에 고정한다. (idempotency_key, payload) 목록.
@@ -406,6 +413,8 @@ def evaluation_snapshots(journey_id: UUID, candidate: dict[str, Any], *, selecti
             "front_leg_index": transfer.get("front_leg_index"), "next_leg_index": transfer.get("next_leg_index"),
             "front_alight_eta": front.get("alight_eta"), "next_board_eta": nxt.get("board_eta"),
             "front_vehicle": front.get("vehicle"), "next_vehicle": nxt.get("vehicle"),
+            # 실제 이용 연결과 비교할 계획 노선(검색·후보가 정리된 뒤에도 남도록 고정 시점에 복사).
+            "front_route": _planned_route(front), "next_route": _planned_route(nxt),
             "evaluated_at": _iso(candidate["evaluated_at"]) if isinstance(candidate.get("evaluated_at"), datetime)
             else candidate.get("evaluated_at"),
             "data_snapshot_id": provenance.get("data_snapshot_id"),

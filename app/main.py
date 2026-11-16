@@ -27,17 +27,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # devtools가 첫 확인 요청 때 만든 TAGO 클라이언트의 연결을 닫는다.
     if app.state.tago_client is not None:
         app.state.tago_client.close()
+    # 장소 검색 제공처(카카오)가 첫 검색 때 만든 HTTP 연결을 닫는다. 시험용 제공처에는 close가 없을 수 있다.
+    close_places = getattr(app.state.places_provider, "close", None)
+    if close_places is not None:
+        close_places()
 
 
 # Swagger 태그 순서 = 앱 시험 순서(회원정보 → 정적 교통정보 → 장소·경로 검색 → 이동 세션).
 OPENAPI_TAGS = [
-    {"name": "me", "description": "1. 회원정보: 첫 조회에서 프로필 초기화"},
+    {"name": "me", "description": "1. 회원정보: 첫 조회에서 프로필 초기화, 탈퇴(소프트 삭제) 접수"},
     {"name": "static-data", "description": "2. 정적 교통정보 공개본 버전"},
     {"name": "stops", "description": "3. 정류소 조회·도착정보"},
     {"name": "routes", "description": "4. 노선·패턴·경유 순서·형상·차량 위치"},
-    {"name": "places", "description": "5. 장소 검색(제공처 미설정 시 503)"},
+    {"name": "places", "description": "5. 장소·주소 검색(카카오 로컬 API 중계, 제공처 미설정 시 503)"},
     {"name": "route-searches", "description": "6. 경로 검색 접수(202) → 결과 조회"},
-    {"name": "journeys", "description": "7. 이동 시작·복구·수동 탑승/하차·위치. 스트림은 WS /api/v1/journeys/{journeyId}/stream"},
+    {"name": "journeys", "description": "7. 이동 시작·복구·수동 탑승/하차·위치·환승 결과·기록 조회/삭제. "
+                                       "스트림은 WS /api/v1/journeys/{journeyId}/stream"},
 ]
 app = FastAPI(lifespan=lifespan, openapi_tags=OPENAPI_TAGS)
 app.state.settings = settings
@@ -46,6 +51,8 @@ app.state.tago_client = None
 app.state.db = None
 app.state.token_verifier = None
 app.state.places_provider = None
+# 탈퇴 계정 Auth 신규 로그인 차단용 관리자 클라이언트 생성 함수(None이면 설정으로 만든다). 시험은 가짜를 주입한다.
+app.state.auth_admin_factory = None
 install_error_handlers(app)
 app.include_router(users_router)
 app.include_router(transit_router)

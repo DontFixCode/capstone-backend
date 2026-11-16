@@ -64,8 +64,7 @@ def prepare_db(admin_dsn: str) -> tuple[str, str, str]:
         conn.execute("CREATE TABLE auth.users (id uuid PRIMARY KEY)")
         for path in sorted((ROOT / "migrations").glob("[0-9]*.sql")):
             conn.execute(ddl(path))
-        conn.execute("ALTER TABLE app.route_searches ADD CONSTRAINT route_searches_journey_id_fkey "
-                     "FOREIGN KEY (journey_id) REFERENCES app.journeys(id) ON DELETE CASCADE")
+        # route_searches.journey_id FK는 migrations/11_route_searches_journey_fk.sql이 추가한다.
         conn.execute("INSERT INTO auth.users (id) VALUES (%s)", (user,))
     url = urlparse(dsn)
     db = Database(DbParams(url.hostname, url.port or 5432, name, url.username, url.password or "", 10))

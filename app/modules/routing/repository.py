@@ -98,14 +98,15 @@ def mark_search_error(conn: psycopg.Connection, search_id: UUID, summary_patch: 
     )
 
 
-def read_search(conn: psycopg.Connection, search_id: UUID) -> dict[str, Any] | None:
+def read_search(conn: psycopg.Connection, search_id: UUID, *, for_share: bool = False) -> dict[str, Any] | None:
+    lock = " FOR SHARE" if for_share else ""
     row = conn.execute(
-        """
+        f"""
         SELECT id, user_id, journey_id, source, extensions.ST_Y(origin::extensions.geometry),
                extensions.ST_X(origin::extensions.geometry), extensions.ST_Y(destination::extensions.geometry),
                extensions.ST_X(destination::extensions.geometry), place_info, start_at, static_version,
                config_version, params, ranking_mode, status, summary, expires_at, created_at
-          FROM app.route_searches WHERE id = %s
+          FROM app.route_searches WHERE id = %s{lock}
         """,
         (search_id,),
     ).fetchone()
@@ -135,11 +136,13 @@ def read_candidates(conn: psycopg.Connection, search_id: UUID) -> list[dict[str,
 
 
 def active_search_targets(conn: psycopg.Connection, now: datetime) -> list[dict[str, Any]]:
-    """유효기간 안의 검색이 등록한 실시간 수집 대상. 실패(error) 검색은 제외한다."""
+    """유효기간 안의 검색이 등록한 실시간 수집 대상. 실패(error) 검색과 탈퇴 계정의 검색은 제외한다(CLI 검색은 사용자 없음)."""
     rows = conn.execute(
         """
-        SELECT id, summary->'realtime_targets' FROM app.route_searches
-         WHERE expires_at > %s AND status <> 'error' AND summary ? 'realtime_targets'
+        SELECT s.id, s.summary->'realtime_targets' FROM app.route_searches s
+          LEFT JOIN app.profiles p ON p.user_id = s.user_id
+         WHERE s.expires_at > %s AND s.status <> 'error' AND s.summary ? 'realtime_targets'
+           AND p.deleted_at IS NULL
         """,
         (now,),
     ).fetchall()
@@ -163,24 +166,32 @@ def claim_queued_search(conn: psycopg.Connection, now: datetime, *, lease_second
                         max_attempts: int) -> dict[str, Any] | None:
     """임대가 없거나 지난 앱 검색 하나를 가져간다(FOR UPDATE SKIP LOCKED). 호출자는 바로 커밋한 뒤 계산한다.
 
-    반환: {"search_id", "action": "run"|"expired"|"exhausted", "attempts"}. 만료·시도 소진은 error로 끝낸다.
+    반환: {"search_id", "action": "run"|"expired"|"exhausted"|"account_deleted", "attempts"}. 만료·시도 소진·탈퇴 계정은
+    error로 끝낸다.
     """
     row = conn.execute(
         """
-        SELECT id, summary, expires_at FROM app.route_searches
-         WHERE source = 'app' AND status = 'processing'
-           AND COALESCE((summary->'job'->>'lease_until')::timestamptz, '-infinity'::timestamptz) <= %s
-         ORDER BY created_at, id
+        SELECT s.id, s.summary, s.expires_at, p.deleted_at IS NOT NULL FROM app.route_searches s
+          LEFT JOIN app.profiles p ON p.user_id = s.user_id
+         WHERE s.source = 'app' AND s.status = 'processing'
+           AND COALESCE((s.summary->'job'->>'lease_until')::timestamptz, '-infinity'::timestamptz) <= %s
+         ORDER BY s.created_at, s.id
          LIMIT 1
-         FOR UPDATE SKIP LOCKED
+         FOR UPDATE OF s SKIP LOCKED
         """,
         (now,),
     ).fetchone()
     if row is None:
         return None
-    search_id, summary, expires_at = row
+    search_id, summary, expires_at, account_deleted = row
     job = dict((summary or {}).get("job") or {})
     attempts = int(job.get("attempts") or 0)
+    if account_deleted:
+        # 탈퇴 계정의 접수 검색은 계산·외부 호출 없이 끝낸다(검색 행은 보존).
+        job.update(state="failed", failed_at=now.isoformat(), reason="account_deleted")
+        conn.execute("UPDATE app.route_searches SET status = 'error', summary = summary || %s WHERE id = %s",
+                     (Jsonb({"job": job, "error": "account_deleted"}), search_id))
+        return {"search_id": search_id, "action": "account_deleted", "attempts": attempts}
     if expires_at <= now:
         job.update(state="failed", failed_at=now.isoformat(), reason="search_expired_before_processing")
         conn.execute("UPDATE app.route_searches SET status = 'error', summary = summary || %s WHERE id = %s",
@@ -198,9 +209,13 @@ def claim_queued_search(conn: psycopg.Connection, now: datetime, *, lease_second
     return {"search_id": search_id, "action": "run", "attempts": attempts + 1}
 
 
-def read_user_search(conn: psycopg.Connection, search_id: UUID, user_id: UUID) -> dict[str, Any] | None:
-    """사용자 소유의 앱 검색만 반환한다. 다른 사용자·CLI·워커 검색은 None(404와 같게 처리)."""
-    row = read_search(conn, search_id)
+def read_user_search(conn: psycopg.Connection, search_id: UUID, user_id: UUID, *,
+                     for_share: bool = False) -> dict[str, Any] | None:
+    """사용자 소유의 앱 검색만 반환한다. 다른 사용자·CLI·워커 검색은 None(404와 같게 처리).
+
+    for_share: 이 검색으로 이동을 시작할 때 잠가, 동시에 진행되는 기록 삭제(시작 검색 정리)가 참조 확인 전에 지우지 않게 한다.
+    """
+    row = read_search(conn, search_id, for_share=for_share)
     if row is None or row["user_id"] != user_id or row["source"] != "app":
         return None
     return row

@@ -103,8 +103,7 @@ class Phase4TestCase(unittest.TestCase):
             conn.execute("CREATE TABLE auth.users (id uuid PRIMARY KEY)")
             for path in sorted((ROOT / "migrations").glob("[0-9]*.sql")):
                 conn.execute(ddl_text(path))
-            conn.execute("ALTER TABLE app.route_searches ADD CONSTRAINT route_searches_journey_id_fkey "
-                         "FOREIGN KEY (journey_id) REFERENCES app.journeys(id) ON DELETE CASCADE")
+            # route_searches.journey_id FK는 migrations/11_route_searches_journey_fk.sql이 추가한다.
             self.user_a, self.user_b, self.user_c = uuid4(), uuid4(), uuid4()
             for uid in (self.user_a, self.user_b, self.user_c):
                 conn.execute("INSERT INTO auth.users (id) VALUES (%s)", (uid,))

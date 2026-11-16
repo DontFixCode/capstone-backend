@@ -2,11 +2,13 @@
 
 검색 접수(POST)는 입력을 검증해 processing으로 저장하고 202를 반환한다. 계산(DFS·TMAP·공유 수집·평가·추천·저장)은
 워커가 같은 행을 가져가 실행하므로 API 서버는 공공 교통 API·TMAP을 호출하지 않는다.
+장소 검색만 API 서버가 지도 제공처(카카오 로컬 API)를 요청마다 직접 호출해 중계한다.
 """
 
 from __future__ import annotations
 
 import math
+import threading
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -25,6 +27,7 @@ from app.modules.routing import views
 from app.workflows import search as search_flow
 
 router = APIRouter(prefix="/api/v1")
+_places_lock = threading.Lock()
 
 
 def _now() -> datetime:
@@ -34,10 +37,15 @@ def _now() -> datetime:
 # ---------------------------------------------------------------- 장소 검색
 
 def places_provider(request: Request) -> places_api.PlacesProvider:
-    provider = getattr(request.app.state, "places_provider", None)
-    if provider is not None:
-        return provider
-    return places_api.provider_from_settings(request.app.state.settings)
+    """제공처는 첫 요청 때 설정으로 만들어 app.state에 두고 다시 쓴다(HTTP 연결 재사용). 미설정이면 저장하지 않는다."""
+    state = request.app.state
+    provider = getattr(state, "places_provider", None)
+    if provider is None:
+        with _places_lock:
+            provider = getattr(state, "places_provider", None)
+            if provider is None:
+                provider = state.places_provider = places_api.provider_from_settings(state.settings)
+    return provider
 
 
 @router.get("/places/search", tags=["places"])
