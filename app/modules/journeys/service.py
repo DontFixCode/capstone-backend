@@ -21,6 +21,7 @@ from uuid import UUID
 
 import psycopg
 from pydantic import ValidationError
+from psycopg.types.json import Jsonb
 
 from app.core.config import Settings
 from app.db.session import Database
@@ -31,6 +32,7 @@ from app.modules.routing import repository as search_repository
 from app.modules.routing import views as route_views
 from app.modules.transit import repository as transit_repository
 from app.workflows.guidance import evaluation_snapshots
+from app.workflows import search as search_flow
 
 PAGE_SIZE = 20
 
@@ -46,6 +48,27 @@ class JourneyError(Exception):
 
 def _iso(value: Any) -> Any:
     return value.isoformat() if isinstance(value, datetime) else value
+
+
+def _queue_destination_reroute(db: Database, user_id: UUID, snapshot: dict[str, Any], *,
+                               origin: search_flow.PlaceInput, now: datetime,
+                               settings: Settings | None) -> dict[str, Any]:
+    if settings is None:
+        return {**snapshot, "reroute_status": "search_unavailable", "reroute_reason": "search_settings_unavailable"}
+    try:
+        config = search_flow.load_search_config(settings)
+        destination = snapshot["destination"]
+        request = search_flow.SearchRequest(
+            origin,
+            search_flow.PlaceInput(destination["lat"], destination["lon"], name=destination.get("name"),
+                                   address=destination.get("address"), provider=destination.get("provider"),
+                                   external_id=destination.get("external_id")),
+            start_at=now, source=search_flow.SOURCE_APP)
+        accepted = search_flow.accept_app_search(db, config, user_id, request, now=now)
+        return {**snapshot, "reroute_search_id": str(accepted["search_id"]), "reroute_status": "queued",
+                "reroute_reason": None}
+    except (search_flow.SearchConfigError, search_flow.StaticDataUnavailable):
+        return {**snapshot, "reroute_status": "search_unavailable", "reroute_reason": "route_search_unavailable"}
 
 
 # ---------------------------------------------------------------- 시작
@@ -97,6 +120,8 @@ def start_journey(db: Database, user_id: UUID, search_id: UUID, candidate_id: UU
             "destination": place("destination", search["destination_lat"], search["destination_lon"]),
             "search_start_at": _iso(search["start_at"]), "static_version": str(search["static_version"]),
             "config_version": search["config_version"], "selected_at": _iso(now),
+            # 활성 세션은 최초 검색이 만료된 뒤에도 대안 후보의 조회 대상을 유지한다.
+            "alternative_targets": (search.get("summary") or {}).get("realtime_targets") or {},
         }
         conn.execute("SAVEPOINT start_journey")
         try:
@@ -161,7 +186,7 @@ def request_fingerprint(body: EventBody) -> tuple[dict[str, Any], str]:
 
 
 def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key: str, body: EventBody, *,
-                 now: datetime) -> dict[str, Any]:
+                 now: datetime, settings: Settings | None = None) -> dict[str, Any]:
     canonical, fingerprint = request_fingerprint(body)
     with db.transaction() as conn:
         journey = repository.get_journey(conn, journey_id, user_id, for_update=True)
@@ -187,6 +212,14 @@ def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key:
                                details={"currentStateVersion": journey["state_version"]})
         resolved = _resolve_references(conn, journey_id, body.eventType, payload)
         legs = (journey["selected_snapshot"] or {}).get("legs") or []
+        proposed_snapshot = journey.get("proposed_snapshot") or {}
+        if body.eventType in ("route_accepted", "route_rejected"):
+            if (not proposed_snapshot or payload.get("proposalVersion") != proposed_snapshot.get("proposal_version")
+                    or proposed_snapshot.get("base_state_version") != journey["state_version"]
+                    or str(journey.get("proposed_candidate_id")) != str(proposed_snapshot.get("candidate_id"))):
+                raise JourneyError(409, "PROPOSAL_STALE", "현재 상태에서 유효한 대안 제안이 없습니다.")
+            if body.eventType == "route_accepted" and journey["movement_state"] == journey_state.ONBOARD:
+                raise JourneyError(409, "CANNOT_SWITCH_ONBOARD", "현재 탑승 구간을 하차 확인한 뒤 대안을 수락할 수 있습니다.")
         try:
             transition = journey_state.apply(
                 lifecycle_status=journey["lifecycle_status"], movement_state=journey["movement_state"],
@@ -207,6 +240,85 @@ def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key:
             progress=progress, state_version=version, ended_at=now if transition.ended else journey["ended_at"],
             # 상태가 바뀌면 즉시 재평가를 예약하고, 완료·취소면 예약을 해제한다(수집 대상도 함께 빠진다).
             next_recalc_at=now if active else None)
+        if body.eventType == "destination_changed":
+            snapshot = dict(journey["selected_snapshot"] or {})
+            snapshot["destination"] = transition.effect["destination"]
+            snapshot["destination_changed_at"] = now.isoformat()
+            snapshot.pop("reroute_search_id", None)
+            if journey["movement_state"] == journey_state.ONBOARD:
+                snapshot.update(reroute_status="deferred_until_alight",
+                                reroute_reason="confirmed_onboard_segment_fixed_until_alight")
+            else:
+                try:
+                    config = search_flow.load_search_config(settings) if settings is not None else None
+                    max_age = (settings.journey_location_max_age_seconds or config.evaluation_policy.max_data_age_seconds
+                               if config is not None and settings is not None else 0)
+                except search_flow.SearchConfigError:
+                    config, max_age = None, 0
+                observed = journey.get("location_observed_at")
+                fresh = observed is not None and (now - observed).total_seconds() <= max_age
+                if fresh:
+                    snapshot = _queue_destination_reroute(
+                        db, user_id, snapshot,
+                        origin=search_flow.PlaceInput(journey["location_lat"], journey["location_lon"]),
+                        now=now, settings=settings)
+                else:
+                    snapshot.update(reroute_status="location_unavailable",
+                                    reroute_reason="fresh_location_required_for_destination_change")
+            repository.update_destination(conn, journey_id, snapshot)
+        elif body.eventType == "route_rejected":
+            conn.execute("UPDATE app.journeys SET proposed_candidate_id = NULL, proposed_snapshot = NULL WHERE id = %s",
+                         (journey_id,))
+            progress.setdefault("rejected_candidate_ids", [])
+            progress["rejected_candidate_ids"] = sorted(set([*progress["rejected_candidate_ids"],
+                                                              str(proposed_snapshot.get("candidate_id"))]))
+            progress["rejected_candidate_state_version"] = version
+            conn.execute("UPDATE app.journeys SET current_progress = %s WHERE id = %s",
+                         (Jsonb(progress), journey_id))
+        elif body.eventType == "alight":
+            snapshot = dict(journey["selected_snapshot"] or {})
+            if snapshot.get("destination_changed_at") and snapshot.get("reroute_status") == "deferred_until_alight":
+                alighted_leg = legs[transition.effect["alighted"]["leg_index"]]
+                point = alighted_leg.get("alight") or {}
+                if point.get("lat") is not None and point.get("lon") is not None:
+                    snapshot = _queue_destination_reroute(
+                        db, user_id, snapshot,
+                        origin=search_flow.PlaceInput(point["lat"], point["lon"]), now=now, settings=settings)
+                else:
+                    snapshot.update(reroute_status="location_unavailable",
+                                    reroute_reason="fresh_location_required_after_alight")
+                repository.update_destination(conn, journey_id, snapshot)
+        elif body.eventType == "route_accepted":
+            chosen = dict(proposed_snapshot)
+            accepted_progress = chosen.get("accepted_progress")
+            chosen.pop("base_state_version", None)
+            chosen.pop("proposal_version", None)
+            chosen.pop("accepted_progress", None)
+            chosen.pop("change_decision", None)
+            chosen.pop("destination_changed_at", None)
+            chosen.pop("reroute_search_id", None)
+            chosen.pop("reroute_status", None)
+            chosen.pop("reroute_reason", None)
+            chosen["selection_version"] = journey["selection_version"] + 1
+            chosen["selected_at"] = now.isoformat()
+            progress = accepted_progress or journey_state.initial_progress(chosen.get("legs") or [])
+            repository.set_route_selection(conn, journey_id,
+                                           selected_candidate_id=UUID(str(proposed_snapshot["candidate_id"]))
+                                           if proposed_snapshot.get("candidate_id") else None,
+                                           selected_snapshot=chosen,
+                                           selection_version=journey["selection_version"] + 1)
+            repository.update_state(conn, journey_id, lifecycle_status=journey["lifecycle_status"],
+                                    movement_state=journey["movement_state"],
+                                    progress=progress, state_version=version, ended_at=journey["ended_at"],
+                                    next_recalc_at=now)
+            accepted_candidate = {**chosen, "id": chosen["candidate_id"]}
+            for key, snapshot_payload in evaluation_snapshots(
+                    journey_id, accepted_candidate, selection_version=journey["selection_version"] + 1,
+                    config_version=chosen.get("config_version"), fixed_at=now):
+                repository.insert_event(conn, journey_id=journey_id, idempotency_key=key,
+                                        event_type="evaluation_snapshot", source="system", occurred_at=None,
+                                        received_at=now, state_version_after=version,
+                                        payload=snapshot_payload, skip_existing=True)
         return {"event_id": event_id, "state_version_after": version, "replayed": False}
 
 
@@ -245,9 +357,17 @@ def update_location(db: Database, user_id: UUID, journey_id: UUID, body: Locatio
             raise JourneyError(409, "JOURNEY_ENDED", "이미 종료된 이동입니다.")
         previous = journey["location_observed_at"]
         was_limited = previous is None or (now - previous).total_seconds() > max_age_seconds
-        return repository.update_location(conn, journey_id, lat=body.latitude, lon=body.longitude,
-                                          observed_at=observed, received_at=now, accuracy_m=body.accuracyM,
-                                          recalc_now=was_limited)
+        updated = repository.update_location(conn, journey_id, lat=body.latitude, lon=body.longitude,
+                                             observed_at=observed, received_at=now, accuracy_m=body.accuracyM,
+                                             recalc_now=was_limited)
+        snapshot = journey.get("selected_snapshot") or {}
+        if (updated and snapshot.get("destination_changed_at") and not snapshot.get("reroute_search_id")
+                and snapshot.get("reroute_status") == "location_unavailable"):
+            snapshot = _queue_destination_reroute(
+                db, user_id, dict(snapshot), origin=search_flow.PlaceInput(body.latitude, body.longitude),
+                now=now, settings=settings)
+            repository.update_destination(conn, journey_id, snapshot)
+        return updated
 
 
 # ---------------------------------------------------------------- 응답 구성
@@ -315,6 +435,7 @@ def guidance_view(journey: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
     if not guidance or guidance.get("base_state_version") != journey["state_version"]:
         return None, "pending" if journey["lifecycle_status"] == journey_state.ACTIVE else "ended"
     view = _camel(guidance)
+    view.pop("proposalSnapshot", None)
     for key in ("nextBoarding", "onboard"):
         if isinstance(view.get(key), dict):
             for id_key in ("routeId", "stopId", "alightStopId"):

@@ -394,17 +394,23 @@ uv run python -m app.workers.main                                    # 워커: �
   null과 사유로 안내, 이동 상세 `selectedRoute.startMode`·`startLimitReasons`). 기준 ETA상 연결 불가(`negative_slack`)·실행 불가 확인
   (`confirmed_infeasible`, 도보 경로 없음 포함) 후보는 409 `CANDIDATE_NOT_STARTABLE`, 만료 검색은 409 `SEARCH_EXPIRED`.
 - 이동: `POST /journeys`(사용자당 활성 1개, 409 `ACTIVE_JOURNEY_EXISTS`), `POST /journeys/{id}/events`(헤더 `Idempotency-Key` 필수,
-  `stateVersion` 불일치 409, 지원: `board`·`alight`·`completed`·`cancelled`·`correction`; `missed_bus`·`destination_changed`·
-  `route_accepted/rejected`는 Phase 5, `transfer_result`는 Phase 6이라 422 `UNSUPPORTED_EVENT_TYPE`), `PUT /journeys/{id}/location`(역순 무시).
+  `stateVersion` 불일치 409, 지원: `board`·`alight`·`completed`·`cancelled`·`correction`·`missed_bus`·`destination_changed`·
+  `route_accepted/rejected`. 입력은 상태 버전을 올리고 재평가를 예약한다. 대안 수락은 현재
+  selectionVersion의 제안만 허용하고 확인된 탑승 중에는 거부한다. `transfer_result`는 Phase 6이라 422 `UNSUPPORTED_EVENT_TYPE`이며,
+  `PUT /journeys/{id}/location`은 역순 위치를 무시한다.
 - WebSocket: 헤더 인증이 기본이며, 헤더를 보낼 수 없으면 연결 후 첫 메시지 `{"type":"auth","accessToken":"..."}`(제한 시간 내).
   종료 코드 4401(인증)·4403(탈퇴)·4404(없음/타인). 토큰을 URL에 넣지 않는다.
+- Phase 5: `missed_bus`는 현재 회차를 제외하고 최초 검색의 실행 가능한 대안을 공유 수집 자료로 다시 평가한다. 동일 모드·자료 시점에서
+  최소 개선량을 넘을 때만 `proposedRoute`를 만든다. `destination_changed`는 최신 위치로 일반 앱 경로 검색을 접수하고,
+  워커 결과가 준비되면 현재 남은 버스 구간과 일치하는 경로를 기준으로 다시 비교한다. 위치가 오래됐거나 현재 경로와 비교할 수 없으면
+  `guidanceStatus=current`, `guidance.status=data_limited`와 제한 사유를 반환한다. 탑승 중 목적지를 바꾸면 확인된 현재 탑승을 유지하고 하차 후 검색한다.
 
 ### 시험
 
 ```powershell
 uv run python -m unittest discover -s tests/unit
 $env:TEST_POSTGIS_DSN = "postgresql://postgres:<임의값>@127.0.0.1:55437/postgres"   # 임시 PostGIS 컨테이너
-uv run python -m unittest discover -s tests/integration                  # Phase 2·3·4 DB 격리 시험
+uv run python -m unittest discover -s tests/integration                  # Phase 2·3·4·5 DB 격리 시험
 uv run python tests/e2e/phase4_flow.py [--real-tmap]                     # API·워커 별도 프로세스 E2E(HTTP·WebSocket)
 ```
 
