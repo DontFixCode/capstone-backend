@@ -81,6 +81,35 @@ class TransferResultPayload(BaseModel):
     actualConnection: ActualConnection | None = None
 
 
+class MissedBusPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    legIndex: int = Field(ge=0)
+    vehicleId: str | None = Field(default=None, max_length=50)
+
+
+class DestinationChangedPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    name: str | None = Field(default=None, max_length=200)
+    address: str | None = Field(default=None, max_length=300)
+    provider: str | None = Field(default=None, max_length=50)
+    externalId: str | None = Field(default=None, max_length=200)
+
+    @field_validator("latitude", "longitude")
+    @classmethod
+    def finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("유한한 좌표여야 합니다.")
+        return value
+
+
+class ProposalPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    proposalVersion: int = Field(ge=1)
+    reason: str | None = Field(default=None, max_length=200)
+
+
 class CorrectionPayload(BaseModel):
     """탑승·하차 수정(노선·패턴·방향·차량 / 정류소·순번) 또는 환승 결과 수정(result·actualConnection)."""
 
@@ -102,7 +131,10 @@ MOVEMENT_CORRECTION_FIELDS = ("routeId", "patternKey", "directionCode", "vehicle
 
 PAYLOADS: dict[str, type[BaseModel]] = {"board": BoardPayload, "alight": AlightPayload,
                                          "completed": CompletedPayload, "cancelled": CancelledPayload,
-                                         "correction": CorrectionPayload, "transfer_result": TransferResultPayload}
+                                         "correction": CorrectionPayload, "transfer_result": TransferResultPayload,
+                                         "missed_bus": MissedBusPayload,
+                                         "destination_changed": DestinationChangedPayload,
+                                         "route_accepted": ProposalPayload, "route_rejected": ProposalPayload}
 
 
 class LocationBody(BaseModel):

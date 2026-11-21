@@ -55,8 +55,16 @@ def journey_targets(conn: psycopg.Connection) -> list[RealtimeTarget]:
 
     targets: list[RealtimeTarget] = []
     for row in journey_repository.active_journey_snapshots(conn):
-        targets.extend(targets_for(row["selected_snapshot"] or {}, row["current_progress"] or {},
-                                   row["movement_state"], f"{JOURNEY_SOURCE}:{row['id']}"))
+        snapshot = row["selected_snapshot"] or {}
+        source = f"{JOURNEY_SOURCE}:{row['id']}"
+        targets.extend(targets_for(snapshot, row["current_progress"] or {}, row["movement_state"], source))
+        # 이동 중에도 최초 검색의 실행 가능한 후보들을 같은 공유 수집 루프에서 갱신한다.
+        for kind in ("arrivals", "positions"):
+            ids = [*((snapshot.get("alternative_targets") or {}).get(kind, []) or []),
+                   *((row.get("reroute_targets") or {}).get(kind, []) or [])]
+            for external_id in ids:
+                if isinstance(external_id, str) and external_id:
+                    targets.append(RealtimeTarget(kind, external_id, frozenset({source})))
     return targets
 
 

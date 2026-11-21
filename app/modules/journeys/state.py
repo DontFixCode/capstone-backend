@@ -7,7 +7,7 @@
 | active                             | cancelled  | cancelled, 종료 시각·사유 기록 |
 | completed / cancelled              | 이동 입력   | 거부(수정 correction만 허용) |
 
-버스 놓침·목적지 변경·대안 수락/거절은 Phase 5 범위라 이 단계에서는 받지 않는다.
+버스 놓침·목적지 변경·대안 수락/거절은 Phase 5 이벤트다.
 환승 결과(transfer_result)와 그 수정(correction)은 이동 상태를 바꾸지 않는 기록이라 이 전이표를 거치지 않는다(journeys.service).
 이 모듈은 DB·HTTP에 의존하지 않는다. 시각·차량 미확인 값을 확인된 진행 상태로 만들지 않는다.
 """
@@ -21,13 +21,10 @@ from typing import Any
 
 ACTIVE, COMPLETED, CANCELLED = "active", "completed", "cancelled"
 WALKING, WAITING, ONBOARD, TRANSFERRING, ARRIVED = "walking", "waiting", "onboard", "transferring", "arrived"
-STATE_EVENTS = ("board", "alight", "completed", "cancelled")
+STATE_EVENTS = ("board", "alight", "completed", "cancelled", "missed_bus", "destination_changed",
+                "route_accepted", "route_rejected")
 SUPPORTED_EVENTS = (*STATE_EVENTS, "correction", "transfer_result")
 DEFERRED_EVENTS = {
-    "missed_bus": "Phase 5(이동 중 재평가·대안 추천)",
-    "destination_changed": "Phase 5(이동 중 재평가·대안 추천)",
-    "route_accepted": "Phase 5(이동 중 재평가·대안 추천)",
-    "route_rejected": "Phase 5(이동 중 재평가·대안 추천)",
 }
 
 
@@ -98,6 +95,28 @@ def apply(
         return _correction(lifecycle_status, movement_state, progress, payload, resolved, when)
     if lifecycle_status != ACTIVE:
         raise TransitionError(409, "JOURNEY_ENDED", "종료된 이동에는 수정(correction) 외 입력을 받을 수 없습니다.")
+
+    if event_type == "missed_bus":
+        leg = _leg(legs, payload.get("legIndex"))
+        if leg.get("kind") != "bus" or leg["leg_index"] != progress.get("next_bus_leg_index"):
+            raise TransitionError(409, "LEG_NOT_NEXT", "놓친 버스는 다음 버스 구간이어야 합니다.")
+        missed = [*progress.get("missed_vehicles", []), {"leg_index": leg["leg_index"],
+                  "vehicle_id": payload.get("vehicleId"),
+                  "run_key": (leg.get("vehicle") or {}).get("run_key"),
+                  "pattern_key": leg.get("pattern_key"), **when}]
+        progress["missed_vehicles"] = missed
+        return Transition(ACTIVE, WAITING, progress, False, {"missed_bus": missed[-1]})
+
+    if event_type == "destination_changed":
+        destination = {"lat": payload["latitude"], "lon": payload["longitude"],
+                       "name": payload.get("name"), "address": payload.get("address"),
+                       "provider": payload.get("provider"), "external_id": payload.get("externalId")}
+        progress["destination_changed_at"] = when
+        return Transition(ACTIVE, movement_state, progress, False, {"destination": destination})
+
+    if event_type in ("route_accepted", "route_rejected"):
+        return Transition(ACTIVE, movement_state, progress, False,
+                          {"proposal_version": payload["proposalVersion"], "accepted": event_type == "route_accepted"})
 
     if event_type == "board":
         if movement_state not in (WALKING, WAITING, TRANSFERRING):

@@ -108,11 +108,25 @@ def update_state(conn: psycopg.Connection, journey_id: UUID, *, lifecycle_status
         """
         UPDATE app.journeys
            SET lifecycle_status = %s, movement_state = %s, current_progress = %s, state_version = %s,
-               ended_at = %s, next_recalc_at = %s
+               ended_at = %s, next_recalc_at = %s, proposed_candidate_id = NULL, proposed_snapshot = NULL
          WHERE id = %s
         """,
         (lifecycle_status, movement_state, Jsonb(progress), state_version, ended_at, next_recalc_at, journey_id),
     )
+
+
+def set_route_selection(conn: psycopg.Connection, journey_id: UUID, *, selected_candidate_id: UUID | None,
+                        selected_snapshot: dict[str, Any], selection_version: int) -> None:
+    """선택 경로·제안 상태를 같은 트랜잭션에서 교체한다."""
+    conn.execute("""UPDATE app.journeys SET selected_candidate_id = %s, selected_snapshot = %s,
+                   proposed_candidate_id = NULL, proposed_snapshot = NULL, selection_version = %s
+                   WHERE id = %s""",
+                 (selected_candidate_id, Jsonb(selected_snapshot), selection_version, journey_id))
+
+
+def update_destination(conn: psycopg.Connection, journey_id: UUID, snapshot: dict[str, Any]) -> None:
+    conn.execute("UPDATE app.journeys SET selected_snapshot = %s, proposed_candidate_id = NULL, "
+                 "proposed_snapshot = NULL WHERE id = %s", (Jsonb(snapshot), journey_id))
 
 
 def update_location(conn: psycopg.Connection, journey_id: UUID, *, lat: float, lon: float, observed_at: datetime,
@@ -258,18 +272,23 @@ def save_guidance(conn: psycopg.Connection, journey_id: UUID, *, expected_state_
 
     계산 중 새 입력·위치가 예약을 바꿨으면(next_recalc_at이 임대 값과 다름) 그 예약을 늦추지 않는다.
     """
+    proposal = guidance.get("proposal_snapshot")
+    proposal_id = UUID(str(proposal["candidate_id"])) if proposal and proposal.get("candidate_id") else None
     row = conn.execute(
         """
         UPDATE app.journeys j
            SET guidance = jsonb_set(%(g)s::jsonb, '{result_version}', to_jsonb(j.result_version + 1)),
                result_version = j.result_version + 1,
+               proposed_candidate_id = %(proposal_id)s, proposed_snapshot = %(proposal)s,
                next_recalc_at = CASE WHEN j.next_recalc_at = %(lease)s THEN %(next)s ELSE j.next_recalc_at END
           FROM app.profiles p
          WHERE j.id = %(id)s AND p.user_id = j.user_id AND p.deleted_at IS NULL
            AND j.state_version = %(sv)s AND j.lifecycle_status = 'active'
         RETURNING j.result_version
         """,
-        {"g": Jsonb(guidance), "lease": leased_until, "next": next_recalc_at, "id": journey_id,
+        {"g": Jsonb(guidance), "proposal_id": proposal_id,
+         "proposal": Jsonb(proposal) if proposal else None,
+         "lease": leased_until, "next": next_recalc_at, "id": journey_id,
          "sv": expected_state_version},
     ).fetchone()
     return row[0] if row else None
@@ -285,9 +304,13 @@ def release_stale_lease(conn: psycopg.Connection, journey_id: UUID, *, leased_un
 def active_journey_snapshots(conn: psycopg.Connection) -> list[dict[str, Any]]:
     """공유 수집 대상 취합용: 재평가가 예약된 활성 이동의 선택 스냅샷·진행 상태."""
     rows = conn.execute(
-        "SELECT id, selected_snapshot, current_progress, movement_state FROM app.journeys "
-        "WHERE lifecycle_status = 'active' AND next_recalc_at IS NOT NULL").fetchall()
-    return [{"id": r[0], "selected_snapshot": r[1], "current_progress": r[2], "movement_state": r[3]} for r in rows]
+        "SELECT j.id, j.selected_snapshot, j.current_progress, j.movement_state, "
+        "COALESCE(s.summary->'realtime_targets', '{}'::jsonb) "
+        "FROM app.journeys j LEFT JOIN app.route_searches s "
+        "ON s.id = NULLIF(j.selected_snapshot->>'reroute_search_id', '')::uuid "
+        "WHERE j.lifecycle_status = 'active' AND j.next_recalc_at IS NOT NULL").fetchall()
+    return [{"id": r[0], "selected_snapshot": r[1], "current_progress": r[2],
+             "movement_state": r[3], "reroute_targets": r[4]} for r in rows]
 
 
 # ---------------------------------------------------------------- 연결 상태(WebSocket)

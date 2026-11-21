@@ -1,4 +1,4 @@
-"""이동 세션 HTTP API (/api/v1/journeys). 대안 수락·거절(route_accepted·route_rejected)은 Phase 5 범위라 아직 받지 않는다."""
+"""이동 세션과 이용 결과 HTTP API (/api/v1/journeys)."""
 
 from __future__ import annotations
 
@@ -69,7 +69,8 @@ def post_event(journeyId: UUID, body: EventBody,
     if not key:
         raise ApiError(422, "VALIDATION_ERROR", "Idempotency-Key가 비어 있습니다.")
     result = _call(lambda: service.record_event(db, user.user_id, journeyId, key, body, now=_now(),
-                                                clock_skew_seconds=settings.location_max_future_skew_seconds))
+                                                clock_skew_seconds=settings.location_max_future_skew_seconds,
+                                                settings=settings))
     return {"eventId": str(result["event_id"]), "stateVersionAfter": result["state_version_after"],
             "replayed": result["replayed"]}
 
