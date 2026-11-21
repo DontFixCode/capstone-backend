@@ -11,7 +11,8 @@ BACKEND_ODSAY_DAILY_CALL_LIMIT이 있을 때만, 남은 한도만큼. app/workfl
 모두 다시 받으므로 하루 1회 전체 갱신에 보통 1건이 든다.
 
 상시 실행은 두 흐름을 같은 프로세스에서 돌린다: ① 공유 수집 루프(정적 갱신 → 실시간 → 표본 판정),
-② 앱 작업 스레드(접수된 검색 실행 → 활성 이동 안내 재계산, BACKEND_JOB_POLL_SECONDS 간격). 두 흐름은 대상별 DB 잠금을
+② 앱 작업 스레드(접수된 검색 실행 → 활성 이동 안내 재계산, BACKEND_JOB_POLL_SECONDS 간격 → 탈퇴 계정의 Auth 신규 로그인
+차단 재시도, BACKEND_AUTH_BLOCK_RETRY_INTERVAL_SECONDS 간격). 두 흐름은 대상별 DB 잠금을
 기다리지 않는 방식(try-lock)으로 같은 수집기를 써서 서로의 완료를 기다리며 막히지 않는다.
 
 실시간 대상은 .env.api의 BACKEND_REALTIME_POSITION_ROUTE_IDS·BACKEND_REALTIME_ARRIVAL_STOP_IDS(쉼표 구분)이며,
@@ -41,7 +42,9 @@ from app.integrations.bus_api import TagoClient, TagoConfigError
 from app.integrations import route_shapes_api
 from app.integrations.daejeon_bus_api import DaejeonBusClient, DaejeonBusConfigError
 from app.integrations.odsay_api import OdsayClient, OdsayConfigError
+from app.integrations.supabase_auth import SupabaseAuthAdmin, load_auth_admin
 from app.modules.transit import repository as transit_repository
+from app.modules.users import service as user_service
 from app.modules.transit.service import RealtimeCollector, StaticImportService, latest_snapshot, utc_now
 from app.workers import recalculation, scheduler, search_jobs
 from app.workers.collection import collection_targets
@@ -77,6 +80,7 @@ class Worker:
         realtime_provider: Callable[..., Any] | None = None,
         daejeon_client_factory: Callable[[Settings], DaejeonBusClient] = DaejeonBusClient.from_settings,
         shape_client_factory: Callable[[Settings], OdsayClient] = OdsayClient.from_settings,
+        auth_admin_factory: Callable[[Settings], SupabaseAuthAdmin] = load_auth_admin,
     ) -> None:
         self.settings_factory = settings_factory
         # 버스 노선 형상 제공처(ODsay). 제공처·일일 한도·키가 설정된 경우에만 정적 갱신 뒤에 호출한다.
@@ -92,6 +96,9 @@ class Worker:
         self.walking_client_factory = walking_client_factory
         self.realtime_provider = realtime_provider
         self.network_cache = guidance_flow.NetworkCache()
+        # 탈퇴 계정 Auth 차단 재시도(관리자 API). 마지막 재시도 시각은 프로세스 메모리에만 두며, 재시작하면 바로 한 번 시도한다.
+        self.auth_admin_factory = auth_admin_factory
+        self.last_auth_block_pass: datetime | None = None
         # 이 프로세스가 대상별로 마지막에 조회한 (위상 슬롯, 조회 종료 시각). 재시작하면 비며 그때는 간격 이상을 지킨다.
         self.ran_slots: dict[str, tuple[datetime, datetime]] = {}
 
@@ -105,7 +112,24 @@ class Worker:
             daejeon_client_factory=self.daejeon_client_factory)
         journeys = recalculation.process_due_journeys(db, settings, clock=self.clock, network_cache=self.network_cache,
                                                       realtime_provider=self.realtime_provider)
-        return {"searches": searches, "journeys": journeys}
+        return {"searches": searches, "journeys": journeys, "auth_blocks": self.retry_auth_blocks(settings, db)}
+
+    def retry_auth_blocks(self, settings: Settings, db: Database, *, force: bool = False) -> list[dict[str, Any]]:
+        """탈퇴했지만 Auth 신규 로그인 차단을 확인하지 못한 계정을 간격마다 다시 시도한다. 실패해도 다음 간격에 또 시도한다."""
+        now = self.clock()
+        interval = timedelta(seconds=settings.auth_block_retry_interval_seconds)
+        if not force and self.last_auth_block_pass is not None and now - self.last_auth_block_pass < interval:
+            return []
+        self.last_auth_block_pass = now
+        try:
+            return user_service.retry_pending_auth_blocks(
+                db, admin_factory=lambda: self.auth_admin_factory(settings), clock=self.clock,
+                limit=settings.auth_block_retry_batch_size)
+        except DbError:
+            raise
+        except Exception:  # 외부 연동 오류가 검색·재평가 작업을 멈추지 않게 한다.
+            logger.exception("Auth 차단 재시도 중 오류. 다음 간격에 다시 시도합니다.")
+            return []
 
     def run_jobs_forever(self, stop: threading.Event, sleep: Callable[[float], None] | None = None) -> None:
         wait = sleep or (lambda seconds: stop.wait(seconds))

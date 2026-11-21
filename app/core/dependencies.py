@@ -60,6 +60,19 @@ def get_db(request: Request) -> Database:
     return database_for(request.app)
 
 
+def auth_admin_factory(app):
+    """Supabase Auth 관리자 클라이언트 생성 함수(탈퇴 계정 신규 로그인 차단). 시험은 app.state.auth_admin_factory를 주입한다.
+
+    설정이 없으면 생성 시 AuthAdminConfigError가 나고, 호출자는 차단을 대기 상태로 남긴다(워커 재시도).
+    """
+    injected = getattr(app.state, "auth_admin_factory", None)
+    if injected is not None:
+        return injected
+    from app.integrations.supabase_auth import load_auth_admin
+
+    return lambda: load_auth_admin(app.state.settings)
+
+
 def authenticate(verifier: TokenVerifier, authorization: str | None) -> AuthUser:
     try:
         return verifier.verify(bearer_token(authorization))

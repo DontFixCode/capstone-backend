@@ -71,9 +71,7 @@ class SearchDbTestCase(unittest.TestCase):
             conn.execute("CREATE TABLE auth.users (id uuid PRIMARY KEY)")
             for path in sorted((ROOT / "migrations").glob("[0-9]*.sql")):
                 conn.execute(ddl_text(path))
-            # 실제 DB 카탈로그에 있으나 DDL 파일에는 없는 FK(2026-11-07 확인).
-            conn.execute("ALTER TABLE app.route_searches ADD CONSTRAINT route_searches_journey_id_fkey "
-                         "FOREIGN KEY (journey_id) REFERENCES app.journeys(id) ON DELETE CASCADE")
+            # route_searches.journey_id FK는 migrations/11_route_searches_journey_fk.sql이 추가한다.
         self.db = Database(DbParams(url.hostname, url.port or 5432, self.dbname, url.username, url.password or "", 10))
         self.tago = FakeTago(w.world())
         self.tmap = w.FakeTmap()

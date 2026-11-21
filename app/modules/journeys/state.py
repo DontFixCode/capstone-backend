@@ -7,7 +7,8 @@
 | active                             | cancelled  | cancelled, 종료 시각·사유 기록 |
 | completed / cancelled              | 이동 입력   | 거부(수정 correction만 허용) |
 
-환승 결과 입력은 Phase 6 범위다.
+버스 놓침·목적지 변경·대안 수락/거절은 Phase 5 이벤트다.
+환승 결과(transfer_result)와 그 수정(correction)은 이동 상태를 바꾸지 않는 기록이라 이 전이표를 거치지 않는다(journeys.service).
 이 모듈은 DB·HTTP에 의존하지 않는다. 시각·차량 미확인 값을 확인된 진행 상태로 만들지 않는다.
 """
 
@@ -22,9 +23,8 @@ ACTIVE, COMPLETED, CANCELLED = "active", "completed", "cancelled"
 WALKING, WAITING, ONBOARD, TRANSFERRING, ARRIVED = "walking", "waiting", "onboard", "transferring", "arrived"
 STATE_EVENTS = ("board", "alight", "completed", "cancelled", "missed_bus", "destination_changed",
                 "route_accepted", "route_rejected")
-SUPPORTED_EVENTS = (*STATE_EVENTS, "correction")
+SUPPORTED_EVENTS = (*STATE_EVENTS, "correction", "transfer_result")
 DEFERRED_EVENTS = {
-    "transfer_result": "Phase 6(기록 관리·이용 결과)",
 }
 
 

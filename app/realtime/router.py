@@ -7,13 +7,15 @@
 
 연결 후: 저장된 최신 상태(journey_state)를 먼저 보내고, ws_poll_seconds마다 DB의 state/result 버전을 확인해 바뀌면 다시 보낸다.
 앱 메시지 {"type": "sync"}는 즉시 현재 상태를, {"type": "ping"}은 pong을 돌려준다. 연결이 끊겨도 이동·재평가는 계속된다.
-완료·취소되면 journey_ended를 보내고 닫는다. 탈퇴 처리되면 4403으로 닫는다.
+완료·취소되면 journey_ended를 보내고 닫는다. 탈퇴 처리되면(다른 API 프로세스에서 접수돼도 DB로 확인) 다음 확인 때
+journey_ended를 보내지 않고 바로 4403으로 닫는다. 탈퇴 계정의 새 연결은 인증 직후 4403으로 거부한다.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -92,24 +94,30 @@ async def journey_stream(websocket: WebSocket, journeyId: UUID) -> None:
     await run_in_threadpool(publisher.mark_connection, db, journeyId, "connected")
     seen = publisher.Seen(message["stateVersion"], message["resultVersion"])
     close = (events.CLOSE_NORMAL, "JOURNEY_ENDED")
+    poll = settings.ws_poll_seconds
     try:
         await websocket.send_json(message)
         if message["type"] == "journey_ended":
             return
+        last_poll = time.monotonic()
         while True:
             if datetime.now(timezone.utc) >= user.expires_at:
                 close = (events.CLOSE_UNAUTHORIZED, "TOKEN_EXPIRED")
                 return
+            wait = max(0.01, poll - (time.monotonic() - last_poll))
             try:
-                incoming = await asyncio.wait_for(websocket.receive_json(), timeout=settings.ws_poll_seconds)
+                incoming = await asyncio.wait_for(websocket.receive_json(), timeout=wait)
             except asyncio.TimeoutError:
                 incoming = None
             except ValueError:
                 incoming = {"type": "invalid"}
             if isinstance(incoming, dict) and incoming.get("type") == "ping":
                 await websocket.send_json({"type": "pong", "sentAt": datetime.now(timezone.utc).isoformat()})
-                continue
             force = isinstance(incoming, dict) and incoming.get("type") == "sync"
+            # 앱 메시지가 잦아도 DB 확인(상태·결과 버전, 탈퇴 여부)은 poll 간격마다 반드시 한다.
+            if not force and time.monotonic() - last_poll < poll:
+                continue
+            last_poll = time.monotonic()
             versions = await run_in_threadpool(publisher.poll_versions, db, journeyId)
             if versions is None:
                 close = (events.CLOSE_NOT_FOUND, "NOT_FOUND")

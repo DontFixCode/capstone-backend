@@ -125,8 +125,14 @@ class Settings(BaseSettings):
     # 앱 검색 지원 범위 판정용 대전광역시 행정경계 GeoJSON(features[0].geometry, EPSG:4326). 비우면 저장소의
     # data/service_area/daejeon.geojson을 쓴다. 파일이 없거나 읽을 수 없으면 경계 자료 없음으로 보고 정류소 기준만 적용한다.
     service_area_geojson: str | None = None
-    # 장소 검색 제공처. 프론트엔드와 지도 제공처를 확정하기 전이라 비어 있고, 비어 있으면 /places/search는 503이다.
+    # 장소 검색 제공처. 지원 값은 kakao(카카오 로컬 API: 키워드 장소 검색 + 주소 검색)이며 비우면 /places/search는 503이다.
     places_provider: str | None = None
+    # 카카오 REST API 키(developers.kakao.com 앱 키). 접두사 없이 읽는다. 앱의 카카오맵 사용 설정이 켜져 있어야 한다.
+    kakao_rest_api_key: SecretStr | None = Field(default=None, validation_alias="KAKAO_REST_API_KEY")
+    kakao_timeout_seconds: float = Field(default=5.0, gt=0)
+    # 장소 검색 범위(카카오 rect 형식: 최소 경도,최소 위도,최대 경도,최대 위도). 넣으면 이 사각형 안의 결과만 반환하고
+    # 비우면 전국 결과를 그대로 반환한다.
+    places_search_rect: str | None = None
     # 버스 노선 지도 형상 제공처. 지원 값은 odsay이며 비우면 형상을 수집하지 않는다(기존 저장분은 그대로 반환).
     route_shape_provider: str | None = None
     # ODsay API 키(lab.odsay.com, 서버 플랫폼 키는 호출하는 서버의 IP를 등록해야 한다). 접두사 없이 읽는다.
@@ -158,6 +164,19 @@ class Settings(BaseSettings):
     ws_poll_seconds: float = Field(default=2.0, gt=0)
     ws_auth_timeout_seconds: float = Field(default=10.0, gt=0)
 
+    # ---- 회원탈퇴·기록 관리 (Phase 6) ----
+    # Supabase Auth 관리자 API 주소(GoTrue). 서버 Docker 네트워크에서는 예: http://auth:9999, 게이트웨이 경유는 .../auth/v1.
+    # 근거 없는 기본값을 두지 않는다. 비우면 탈퇴 접수 후 Auth 신규 로그인 차단을 보류하고(auth_blocked_at NULL) 설정되면 재시도한다.
+    auth_admin_url: str | None = None
+    # service_role 키. 비우면 루트 .env의 SERVICE_ROLE_KEY를 쓴다. 로그·응답·업무 DB에 남기지 않는다.
+    auth_service_role_key: SecretStr | None = None
+    auth_admin_timeout_seconds: float = Field(default=5.0, gt=0)
+    # 신규 로그인 차단 기간(GoTrue ban_duration, Go duration 형식). 기본 876000h(약 100년)는 사실상 영구 차단이다.
+    auth_ban_duration: str = Field(default="876000h", pattern=r"^[0-9]+h$")
+    # 워커가 차단 대기 계정(deleted_at 있음·auth_blocked_at 없음)을 다시 시도하는 간격과 한 번에 처리할 최대 계정 수.
+    auth_block_retry_interval_seconds: float = Field(default=300.0, gt=0)
+    auth_block_retry_batch_size: int = Field(default=20, ge=1, le=500)
+
     @field_validator(
         "search_max_boardings", "search_access_radius_meters", "search_transfer_radius_meters",
         "search_egress_radius_meters", "search_max_candidates", "search_round_pool_size", "search_walk_cost_weight",
@@ -171,7 +190,8 @@ class Settings(BaseSettings):
         "sample_label_deadline_seconds", "tmap_app_key", "auth_jwt_secret", "auth_jwt_issuer",
         "stops_nearby_default_radius_meters", "stops_nearby_max_radius_meters", "places_provider",
         "journey_location_max_age_seconds", "service_area_geojson", "route_shape_provider", "odsay_api_key",
-        "odsay_daily_call_limit",
+        "odsay_daily_call_limit", "auth_admin_url", "auth_service_role_key", "kakao_rest_api_key",
+        "places_search_rect",
         mode="before",
     )
     @classmethod

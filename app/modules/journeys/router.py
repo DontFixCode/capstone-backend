@@ -1,4 +1,4 @@
-"""이동 세션 HTTP API (/api/v1/journeys). 기록 삭제(DELETE)·환승 결과 입력은 Phase 6, 대안 수락·거절은 Phase 5 범위다."""
+"""이동 세션과 이용 결과 HTTP API (/api/v1/journeys)."""
 
 from __future__ import annotations
 
@@ -53,6 +53,13 @@ def get_journey(journeyId: UUID, user: AuthUser = Depends(active_user), db: Data
     return service.journey_view(journey, _now())
 
 
+@router.delete("/journeys/{journeyId}", status_code=204)
+def delete_journey(journeyId: UUID, user: AuthUser = Depends(active_user), db: Database = Depends(get_db)) -> Response:
+    """완료·취소된 본인 이동 기록을 지운다. 진행 중이면 409 JOURNEY_ACTIVE, 없거나 타인 소유면 404."""
+    _call(lambda: service.delete_journey_record(db, user.user_id, journeyId))
+    return Response(status_code=204)
+
+
 @router.post("/journeys/{journeyId}/events")
 def post_event(journeyId: UUID, body: EventBody,
                idempotency_key: str = Header(alias="Idempotency-Key", min_length=1, max_length=200),
@@ -61,7 +68,9 @@ def post_event(journeyId: UUID, body: EventBody,
     key = idempotency_key.strip()
     if not key:
         raise ApiError(422, "VALIDATION_ERROR", "Idempotency-Key가 비어 있습니다.")
-    result = _call(lambda: service.record_event(db, user.user_id, journeyId, key, body, now=_now(), settings=settings))
+    result = _call(lambda: service.record_event(db, user.user_id, journeyId, key, body, now=_now(),
+                                                clock_skew_seconds=settings.location_max_future_skew_seconds,
+                                                settings=settings))
     return {"eventId": str(result["event_id"]), "stateVersionAfter": result["state_version_after"],
             "replayed": result["replayed"]}
 

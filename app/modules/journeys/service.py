@@ -1,4 +1,4 @@
-"""이동 시작·조회·수동 입력·위치 반영의 업무 규칙.
+"""이동 시작·조회·수동 입력·위치 반영·기록 삭제의 업무 규칙.
 
 - 시작: 검색 소유권·유효기간·후보의 검색 소속과 시작 방식(routing.views.start_mode)을 확인한다. 순위 후보는 ranked,
   자료 부족으로 순위가 없는 후보는 data_limited로 시작하고(시간·확률은 null과 사유), 기준 ETA상 연결 불가·실행 불가가
@@ -6,8 +6,16 @@
   목적지)을 저장하고 최초 재평가를 바로 예약하며, 환승별 예측을 evaluation_snapshot 이벤트로 결과 전에 고정한다.
 - 입력: 세션 행을 잠그고 Idempotency-Key 중복을 먼저 검사한다(같은 입력은 기존 결과, 다른 입력은 409). 이어서 stateVersion·
   종료 여부·전이를 확인하고 이벤트 저장·상태 전이·버전 증가·재평가 예약(또는 종료 시 해제)을 한 트랜잭션에서 처리한다.
+- 환승 결과(transfer_result)·결과 수정(correction): 이동 상태를 바꾸지 않는 기록이라 상태 버전을 올리거나 재평가를 예약하지
+  않으며 종료된 이동에서도 받는다. 결과는 이 이동에서 결과 전에 고정한 evaluation_snapshot의 snapshotKey·선택 버전·환승 순번과
+  일치해야 하고, 발생 시각·환승 도달 여부·실제 이용 연결을 확인한다. 한 환승의 결과는 1건이며, 바꾸려면 가장 최근 응답을
+  supersedesEventId로 가리키는 correction을 보낸다(원본은 수정·삭제하지 않음). 사용자 결과는 공공 관측·transfer_samples를 바꾸지 않는다.
 - 위치: 관측 시각이 더 새로울 때만 반영하고 수신 시각을 따로 기록한다. 위치가 없거나 오래됐던 상태에서 새 위치가 오면
   즉시 재평가를 예약한다.
+- 기록 삭제: 종료된 본인 이동만 지운다(활성은 409). 이벤트·이 이동의 재평가 검색과 후보, 다른 이동이 참조하지 않는 시작 검색과
+  후보를 한 트랜잭션에서 정리하고 공통 관측·비식별 표본·다른 사용자 자료는 건드리지 않는다. 계정 탈퇴(소프트 삭제)와 다르다.
+- 탈퇴 계정: 개인 기록을 바꾸는 트랜잭션은 같은 트랜잭션에서 profiles 행을 FOR SHARE로 잠가 탈퇴 여부를 다시 확인한다.
+  탈퇴 접수(FOR UPDATE)와 순서가 정해져 접수 직후 새 이동 시작·입력이 끼어들지 않는다(잠금 순서 profiles → journeys).
 """
 
 from __future__ import annotations
@@ -25,16 +33,21 @@ from psycopg.types.json import Jsonb
 
 from app.core.config import Settings
 from app.db.session import Database
+from app.modules.evaluation import user_results
 from app.modules.journeys import repository
 from app.modules.journeys import state as journey_state
-from app.modules.journeys.schemas import PAYLOADS, EventBody, LocationBody
+from app.modules.journeys.schemas import (MOVEMENT_CORRECTION_FIELDS, PAYLOADS, RESULT_CORRECTION_FIELDS, EventBody,
+                                          LocationBody)
 from app.modules.routing import repository as search_repository
 from app.modules.routing import views as route_views
 from app.modules.transit import repository as transit_repository
+from app.modules.users import repository as profile_repository
 from app.workflows.guidance import evaluation_snapshots
 from app.workflows import search as search_flow
 
 PAGE_SIZE = 20
+ACCOUNT_DELETED_CANCEL_KEY = "system:account_deleted"
+ACCOUNT_DELETED_REASON = "account_deleted"
 
 
 class JourneyError(Exception):
@@ -48,6 +61,16 @@ class JourneyError(Exception):
 
 def _iso(value: Any) -> Any:
     return value.isoformat() if isinstance(value, datetime) else value
+
+
+def _require_writable_profile(conn: psycopg.Connection, user_id: UUID) -> None:
+    """같은 트랜잭션에서 탈퇴 여부를 다시 확인하고 탈퇴 접수와 순서를 맞춘다(profiles FOR SHARE).
+
+    인증 의존성의 확인과 이 트랜잭션 사이에 탈퇴가 커밋돼도 개인 기록을 바꾸지 않는다. 프로필이 없으면 이 사용자의 이동도 없다.
+    """
+    profile = profile_repository.get_profile(conn, user_id, for_share=True)
+    if profile is not None and profile["deleted_at"] is not None:
+        raise JourneyError(403, "ACCOUNT_DELETED", "탈퇴 처리된 계정입니다.")
 
 
 def _queue_destination_reroute(db: Database, user_id: UUID, snapshot: dict[str, Any], *,
@@ -75,7 +98,8 @@ def _queue_destination_reroute(db: Database, user_id: UUID, snapshot: dict[str, 
 
 def start_journey(db: Database, user_id: UUID, search_id: UUID, candidate_id: UUID, *, now: datetime) -> dict:
     with db.transaction() as conn:
-        search = search_repository.read_user_search(conn, search_id, user_id)
+        _require_writable_profile(conn, user_id)
+        search = search_repository.read_user_search(conn, search_id, user_id, for_share=True)
         if search is None:
             raise JourneyError(404, "NOT_FOUND", "검색이 없거나 요청 사용자 소유가 아닙니다.")
         candidate = search_repository.read_candidate(conn, candidate_id)
@@ -139,7 +163,9 @@ def start_journey(db: Database, user_id: UUID, search_id: UUID, candidate_id: UU
             repository.insert_event(conn, journey_id=journey_id, idempotency_key=key,
                                     event_type="evaluation_snapshot", source="system", occurred_at=None,
                                     received_at=now, state_version_after=1, payload=payload, skip_existing=True)
-        return repository.get_journey(conn, journey_id, user_id)
+        journey = repository.get_journey(conn, journey_id, user_id)
+        journey["transfer_rows"] = transfer_rows(conn, journey)
+        return journey
 
 
 # ---------------------------------------------------------------- 조회
@@ -171,9 +197,18 @@ def list_user_journeys(db: Database, user_id: UUID, *, status: str | None,
 def get_user_journey(db: Database, user_id: UUID, journey_id: UUID) -> dict[str, Any]:
     with db.transaction() as conn:
         row = repository.get_journey(conn, journey_id, user_id)
-    if row is None:
-        raise JourneyError(404, "NOT_FOUND", "이동이 없거나 요청 사용자 소유가 아닙니다.")
+        if row is None:
+            raise JourneyError(404, "NOT_FOUND", "이동이 없거나 요청 사용자 소유가 아닙니다.")
+        row["transfer_rows"] = transfer_rows(conn, row)
     return row
+
+
+def transfer_rows(conn: psycopg.Connection, journey: dict[str, Any]) -> list[dict[str, Any]]:
+    """고정 예측(환승별)과 그 유효 사용자 결과. 상세 응답의 transferResults 재료."""
+    snapshots = [e for e in repository.events(conn, journey["id"], "evaluation_snapshot") if e["source"] == "system"]
+    effective = user_results.resolve(repository.result_events(conn, journey["id"]))
+    return [{"snapshot": e["payload"], "fixed_at": e["received_at"],
+             "effective": effective.get(e["payload"].get("snapshot_key"))} for e in snapshots]
 
 
 # ---------------------------------------------------------------- 입력
@@ -186,9 +221,11 @@ def request_fingerprint(body: EventBody) -> tuple[dict[str, Any], str]:
 
 
 def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key: str, body: EventBody, *,
-                 now: datetime, settings: Settings | None = None) -> dict[str, Any]:
+                 now: datetime, clock_skew_seconds: float = 60.0,
+                 settings: Settings | None = None) -> dict[str, Any]:
     canonical, fingerprint = request_fingerprint(body)
     with db.transaction() as conn:
+        _require_writable_profile(conn, user_id)
         journey = repository.get_journey(conn, journey_id, user_id, for_update=True)
         if journey is None:
             raise JourneyError(404, "NOT_FOUND", "이동이 없거나 요청 사용자 소유가 아닙니다.")
@@ -210,6 +247,17 @@ def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key:
         if body.stateVersion != journey["state_version"]:
             raise JourneyError(409, "STATE_VERSION_CONFLICT", "앱이 확인한 상태 버전이 현재와 다릅니다.",
                                details={"currentStateVersion": journey["state_version"]})
+        request = {"canonical": canonical, "fingerprint": fingerprint, "key": idempotency_key, "body": body,
+                   "now": now, "skew": clock_skew_seconds}
+        if body.eventType == "transfer_result":
+            return _record_transfer_result(conn, journey, payload, request)
+        if body.eventType == "correction":
+            target = repository.get_event(conn, journey_id, int(payload["supersedesEventId"]))
+            if target is not None and _is_result_event(target):
+                return _record_result_correction(conn, journey, target, payload, request)
+            if target is not None and target["event_type"] in ("board", "alight") and \
+                    any(k in payload for k in RESULT_CORRECTION_FIELDS):
+                raise JourneyError(422, "INVALID_CORRECTION", "result·actualConnection은 환승 결과 수정에만 쓸 수 있습니다.")
         resolved = _resolve_references(conn, journey_id, body.eventType, payload)
         legs = (journey["selected_snapshot"] or {}).get("legs") or []
         proposed_snapshot = journey.get("proposed_snapshot") or {}
@@ -337,9 +385,208 @@ def _resolve_references(conn, journey_id: UUID, event_type: str, payload: dict[s
     if event_type == "correction":
         target = repository.get_event(conn, journey_id, int(payload["supersedesEventId"]))
         if target is None or target["event_type"] not in ("board", "alight"):
-            raise JourneyError(422, "INVALID_CORRECTION_TARGET", "수정할 탑승·하차 이벤트가 이 이동에 없습니다.")
+            raise JourneyError(422, "INVALID_CORRECTION_TARGET",
+                               "수정할 탑승·하차·환승 결과 이벤트가 이 이동에 없습니다.")
         resolved["target"] = {"id": target["id"], "event_type": target["event_type"]}
     return resolved
+
+
+# ---------------------------------------------------------------- 환승 결과·결과 수정
+
+def _is_result_event(event: dict[str, Any]) -> bool:
+    return event["event_type"] in ("transfer_result", "correction") and \
+        ((event["payload"] or {}).get("effect") or {}).get("kind") == user_results.EFFECT_KIND
+
+
+def _check_result_time(journey: dict[str, Any], snapshot_event: dict[str, Any], occurred_at: datetime | None,
+                       now: datetime, skew: float) -> None:
+    """결과 발생 시각은 예측 고정·이동 시작 이후이고 서버 수신 시각보다 미래가 아니어야 한다(기기 시계 오차 skew 허용)."""
+    if occurred_at is None:
+        return
+    if (occurred_at - now).total_seconds() > skew:
+        raise JourneyError(422, "OCCURRED_AT_IN_FUTURE", "occurredAt이 서버 수신 시각보다 미래입니다.")
+    earliest = max(snapshot_event["received_at"], journey["started_at"])
+    if (earliest - occurred_at).total_seconds() > skew:
+        raise JourneyError(422, "OCCURRED_BEFORE_SNAPSHOT", "occurredAt이 예측을 고정한 이동 시작보다 이릅니다.",
+                           details={"snapshotFixedAt": earliest})
+
+
+def _planned_snapshot(journey: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    """예측 스냅샷에 계획 노선이 없으면(이 기능 이전에 고정한 스냅샷) 같은 선택 버전의 선택 스냅샷 구간에서 채운다."""
+    snap = dict(snapshot)
+    selected = journey["selected_snapshot"] or {}
+    if selected.get("selection_version", 1) != snap.get("selection_version"):
+        return snap
+    legs = {leg.get("leg_index"): leg for leg in selected.get("legs") or []}
+    for side, index_key in (("front_route", "front_leg_index"), ("next_route", "next_leg_index")):
+        if snap.get(side) is None and legs.get(snap.get(index_key)):
+            leg = legs[snap[index_key]]
+            snap[side] = {"route_internal_id": leg.get("route_internal_id"), "route_external_id": leg.get("route_id"),
+                          "route_no": leg.get("route_no"), "pattern_key": leg.get("pattern_key")}
+    return snap
+
+
+def _recorded_connection(progress: dict[str, Any], snapshot: dict[str, Any]) -> dict[str, Any]:
+    """이동 중 탑승 확인(board, 수정 반영)으로 기록된 앞·다음 구간의 노선·차량. 기록이 없으면 None 값."""
+    boarded = {b["leg_index"]: b for b in
+               [h.get("boarded") for h in progress.get("history") or []] + [progress.get("boarded")]
+               if isinstance(b, dict) and "leg_index" in b}
+    front, nxt = boarded.get(snapshot.get("front_leg_index")) or {}, boarded.get(snapshot.get("next_leg_index")) or {}
+    return {"front_route": front.get("route_internal_id"), "front_vehicle": front.get("vehicle_no"),
+            "next_route": nxt.get("route_internal_id"), "next_vehicle": nxt.get("vehicle_no")}
+
+
+def _check_connection_routes(conn: psycopg.Connection, actual: dict[str, Any]) -> None:
+    for key in ("frontRouteId", "nextRouteId"):
+        if actual.get(key) is not None and transit_repository.route_by_id(conn, int(actual[key])) is None:
+            raise JourneyError(422, "ROUTE_NOT_FOUND", f"{key}에 해당하는 노선이 없습니다.")
+
+
+def _result_effect(conn: psycopg.Connection, journey: dict[str, Any], snapshot_event: dict[str, Any], *,
+                   result: str, actual: dict[str, Any], occurred_at: datetime | None,
+                   now: datetime) -> dict[str, Any]:
+    """이 응답까지 반영한 결과 전체. 사슬의 마지막 effect가 유효 결과가 된다(evaluation.user_results)."""
+    _check_connection_routes(conn, actual)
+    snap = _planned_snapshot(journey, snapshot_event["payload"])
+    recorded = _recorded_connection(journey["current_progress"] or {}, snap)
+    match, evidence, differences = user_results.match_connection(snap, actual, recorded)
+    return {
+        "kind": user_results.EFFECT_KIND, "snapshot_key": snap["snapshot_key"],
+        "snapshot_event_id": snapshot_event["id"], "selection_version": snap["selection_version"],
+        "transfer_index": snap["transfer_index"], "front_leg_index": snap.get("front_leg_index"),
+        "next_leg_index": snap.get("next_leg_index"), "result": result, "actual_connection": actual,
+        "recorded_connection": recorded, "connection_match": match, "connection_evidence": evidence,
+        "excluded_reasons": user_results.exclusion_reasons(result, match, differences),
+        "occurred_at": _iso(occurred_at), "received_at": now.isoformat(),
+        "journey_lifecycle_status": journey["lifecycle_status"],
+        "journey_selection_version": journey["selection_version"],
+    }
+
+
+def _insert_result_event(conn: psycopg.Connection, journey: dict[str, Any], event_type: str,
+                         effect: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    """결과 기록은 이동 상태를 바꾸지 않는다: 상태 버전·재평가 예약을 그대로 두고 이벤트만 추가한다."""
+    version = journey["state_version"]
+    event_id = repository.insert_event(
+        conn, journey_id=journey["id"], idempotency_key=request["key"], event_type=event_type, source="manual",
+        occurred_at=request["body"].occurredAt, received_at=request["now"], state_version_after=version,
+        payload={"request": request["canonical"], "request_hash": request["fingerprint"],
+                 "state_version_before": version, "snapshot_key": effect["snapshot_key"], "effect": effect})
+    return {"event_id": event_id, "state_version_after": version, "replayed": False}
+
+
+def _record_transfer_result(conn: psycopg.Connection, journey: dict[str, Any], payload: dict[str, Any],
+                            request: dict[str, Any]) -> dict[str, Any]:
+    snapshot_event = repository.evaluation_snapshot(conn, journey["id"], payload["snapshotKey"])
+    if snapshot_event is None:
+        raise JourneyError(422, "SNAPSHOT_NOT_FOUND", "이 이동에서 결과 전에 고정한 예측(snapshotKey)이 없습니다.")
+    snap = snapshot_event["payload"]
+    if (snap.get("selection_version"), snap.get("transfer_index")) != (payload["selectionVersion"],
+                                                                         payload["transferIndex"]):
+        raise JourneyError(422, "SNAPSHOT_MISMATCH", "snapshotKey의 선택 버전·환승 순번과 요청 값이 다릅니다.",
+                           details={"selectionVersion": snap.get("selection_version"),
+                                    "transferIndex": snap.get("transfer_index")})
+    _check_result_time(journey, snapshot_event, request["body"].occurredAt, request["now"], request["skew"])
+    existing = user_results.resolve(repository.result_events(conn, journey["id"])).get(payload["snapshotKey"])
+    if existing is not None:
+        raise JourneyError(409, "TRANSFER_RESULT_EXISTS", "이 환승의 결과가 이미 있습니다. 바꾸려면 correction을 보내세요.",
+                           details={"eventId": str(existing.effective_event_id),
+                                    "originalEventId": str(existing.original_event_id)})
+    progress = journey["current_progress"] or {}
+    if journey["lifecycle_status"] == journey_state.ACTIVE and \
+            snap.get("front_leg_index") not in (progress.get("completed_bus_legs") or []):
+        raise JourneyError(409, "TRANSFER_NOT_REACHED", "아직 앞 버스에서 하차하지 않은 환승입니다.",
+                           details={"frontLegIndex": snap.get("front_leg_index")})
+    effect = _result_effect(conn, journey, snapshot_event, result=payload["result"],
+                            actual=payload.get("actualConnection") or {}, occurred_at=request["body"].occurredAt,
+                            now=request["now"])
+    return _insert_result_event(conn, journey, "transfer_result", effect, request)
+
+
+def _record_result_correction(conn: psycopg.Connection, journey: dict[str, Any], target: dict[str, Any],
+                              payload: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    """환승 결과 수정: 가장 최근 응답을 가리키는 새 이벤트로 남긴다. 원본·이전 수정은 그대로 둔다."""
+    if any(k in payload for k in MOVEMENT_CORRECTION_FIELDS):
+        raise JourneyError(422, "INVALID_CORRECTION", "환승 결과 수정은 result·actualConnection만 바꿀 수 있습니다.")
+    if not any(k in payload for k in RESULT_CORRECTION_FIELDS):
+        raise JourneyError(422, "INVALID_CORRECTION", "수정할 값이 없습니다.")
+    events = repository.result_events(conn, journey["id"])
+    chain = user_results.chain_of(events, target["id"])
+    if chain is None:
+        raise JourneyError(422, "INVALID_CORRECTION_TARGET", "수정할 환승 결과가 이 이동에 없습니다.")
+    if target["id"] != chain.effective_event_id:
+        raise JourneyError(409, "CORRECTION_TARGET_SUPERSEDED", "이미 수정된 응답입니다. 가장 최근 응답을 수정하세요.",
+                           details={"latestEventId": str(chain.effective_event_id)})
+    head = next(e for e in events if e["id"] == chain.effective_event_id)["payload"]["effect"]
+    snapshot_event = repository.evaluation_snapshot(conn, journey["id"], chain.snapshot_key)
+    if snapshot_event is None:  # 원 결과가 검증한 스냅샷이므로 없을 수 없지만, 근거 없는 결과는 만들지 않는다.
+        raise JourneyError(422, "SNAPSHOT_NOT_FOUND", "결과에 연결된 예측 스냅샷이 없습니다.")
+    _check_result_time(journey, snapshot_event, request["body"].occurredAt, request["now"], request["skew"])
+    result = payload.get("result") or head["result"]
+    actual = (payload.get("actualConnection") or {}) if "actualConnection" in payload \
+        else dict(head.get("actual_connection") or {})
+    effect = _result_effect(conn, journey, snapshot_event, result=result, actual=actual,
+                            occurred_at=request["body"].occurredAt, now=request["now"])
+    effect.update(supersedes_event_id=target["id"], original_event_id=chain.original_event_id,
+                  changes={k: payload[k] for k in RESULT_CORRECTION_FIELDS if k in payload},
+                  reason=payload.get("reason"))
+    return _insert_result_event(conn, journey, "correction", effect, request)
+
+
+# ---------------------------------------------------------------- 탈퇴에 따른 이동 취소
+
+def cancel_for_account_deletion(conn: psycopg.Connection, user_id: UUID, *, now: datetime) -> list[UUID]:
+    """탈퇴 접수 트랜잭션 안에서 활성 이동을 cancelled로 바꾸고 재평가 예약을 해제한다(이동 수집 대상도 함께 빠진다).
+
+    사용자 취소와 같은 상태 전이를 쓰되 출처는 system, 사유는 account_deleted다. 이미 계산 중인 재평가는 저장 단계에서
+    상태 버전·활성 여부·탈퇴 여부를 다시 확인하므로 결과가 반영되지 않는다(journeys.repository.save_guidance).
+    """
+    cancelled = []
+    for journey in repository.user_active_journeys(conn, user_id):
+        transition = journey_state.apply(
+            lifecycle_status=journey["lifecycle_status"], movement_state=journey["movement_state"],
+            progress=journey["current_progress"] or {}, legs=(journey["selected_snapshot"] or {}).get("legs") or [],
+            event_type="cancelled", payload={"reason": ACCOUNT_DELETED_REASON}, occurred_at=None, received_at=now)
+        progress = transition.progress
+        progress["cancelled"] = {**progress.get("cancelled", {}), "by": "system"}
+        version = journey["state_version"] + 1
+        repository.insert_event(
+            conn, journey_id=journey["id"], idempotency_key=ACCOUNT_DELETED_CANCEL_KEY, event_type="cancelled",
+            source="system", occurred_at=None, received_at=now, state_version_after=version,
+            payload={"reason": ACCOUNT_DELETED_REASON, "state_version_before": journey["state_version"],
+                     "effect": transition.effect}, skip_existing=True)
+        repository.update_state(conn, journey["id"], lifecycle_status=transition.lifecycle_status,
+                                movement_state=transition.movement_state, progress=progress, state_version=version,
+                                ended_at=now, next_recalc_at=None)
+        cancelled.append(journey["id"])
+    return cancelled
+
+
+# ---------------------------------------------------------------- 기록 삭제
+
+def delete_journey_record(db: Database, user_id: UUID, journey_id: UUID) -> dict[str, Any]:
+    """종료된 본인 이동 1건과 개인 연결 기록을 지운다. 반환: 지운 범위(로그·시험용)."""
+    with db.transaction() as conn:
+        _require_writable_profile(conn, user_id)
+        journey = repository.get_journey(conn, journey_id, user_id, for_update=True)
+        if journey is None:
+            raise JourneyError(404, "NOT_FOUND", "이동이 없거나 요청 사용자 소유가 아닙니다.")
+        if journey["lifecycle_status"] == journey_state.ACTIVE:
+            raise JourneyError(409, "JOURNEY_ACTIVE", "진행 중인 이동은 삭제할 수 없습니다. 먼저 완료하거나 취소하세요.")
+        reevaluation = repository.reevaluation_search_ids(conn, journey_id)
+        initial = journey["initial_search_id"]
+        events = repository.delete_events(conn, journey_id)
+        reeval_searches, reeval_candidates = repository.delete_searches(conn, reevaluation)
+        repository.delete_journey(conn, journey_id, user_id)
+        initial_deleted = initial_candidates = 0
+        # 시작 검색은 다른 이동(같은 검색으로 다시 시작한 이동 등)이 참조하지 않을 때만 지운다. 잠근 뒤 확인해 동시 시작과 순서를 맞춘다.
+        if initial is not None and repository.lock_search(conn, initial, user_id) \
+                and not repository.search_referenced_elsewhere(conn, initial, journey_id):
+            initial_deleted, initial_candidates = repository.delete_searches(conn, [initial])
+    return {"journey_id": str(journey_id), "events": events, "reevaluation_searches": reeval_searches,
+            "reevaluation_candidates": reeval_candidates, "initial_search_deleted": bool(initial_deleted),
+            "initial_search_preserved": initial is not None and not initial_deleted,
+            "initial_candidates": initial_candidates}
 
 
 # ---------------------------------------------------------------- 위치
@@ -350,6 +597,7 @@ def update_location(db: Database, user_id: UUID, journey_id: UUID, body: Locatio
     if (observed - now).total_seconds() > settings.location_max_future_skew_seconds:
         raise JourneyError(422, "OBSERVED_AT_IN_FUTURE", "observedAt이 서버 수신 시각보다 미래입니다.")
     with db.transaction() as conn:
+        _require_writable_profile(conn, user_id)
         journey = repository.get_journey(conn, journey_id, user_id, for_update=True)
         if journey is None:
             raise JourneyError(404, "NOT_FOUND", "이동이 없거나 요청 사용자 소유가 아닙니다.")
@@ -453,6 +701,33 @@ def location_view(journey: dict[str, Any], now: datetime) -> dict[str, Any] | No
             "ageSeconds": (now - journey["location_observed_at"]).total_seconds()}
 
 
+def transfer_results_view(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """환승별 고정 예측과 유효 사용자 결과. 앱은 snapshotKey·selectionVersion·transferIndex로 transfer_result를 보낸다.
+
+    evaluationStatus: no_response(미응답) / unknown(확인 불가) / excluded(다른 연결 이용 등으로 대조 제외) / counted(대조 대상).
+    """
+    out = []
+    effective = {r["snapshot"].get("snapshot_key"): r["effective"] for r in rows if r["effective"] is not None}
+    status = {r["snapshot_key"]: r for r in user_results.comparison_rows([r["snapshot"] for r in rows], effective)}
+    for row in sorted(rows, key=lambda r: (r["snapshot"].get("selection_version") or 0,
+                                           r["snapshot"].get("transfer_index") or 0)):
+        snap, found = row["snapshot"], row["effective"]
+        out.append({
+            "snapshotKey": snap.get("snapshot_key"), "selectionVersion": snap.get("selection_version"),
+            "transferIndex": snap.get("transfer_index"), "frontLegIndex": snap.get("front_leg_index"),
+            "nextLegIndex": snap.get("next_leg_index"),
+            "prediction": {"probability": snap.get("predicted_probability"), "slackSeconds": snap.get("slack_seconds"),
+                           "connectionStatus": snap.get("connection_status"), "fixedAt": row["fixed_at"]},
+            "result": None if found is None else {
+                "value": found.result, "eventId": str(found.effective_event_id),
+                "originalEventId": str(found.original_event_id),
+                "correctionEventIds": [str(e) for e in found.chain[1:]],
+                "connectionMatch": found.connection_match, "excludedReasons": list(found.excluded_reasons)},
+            "evaluationStatus": status[snap.get("snapshot_key")]["status"],
+        })
+    return out
+
+
 def journey_view(journey: dict[str, Any], now: datetime) -> dict[str, Any]:
     guidance, guidance_status = guidance_view(journey)
     return {
@@ -468,6 +743,8 @@ def journey_view(journey: dict[str, Any], now: datetime) -> dict[str, Any]:
         "location": location_view(journey, now),
         "initialSearchId": _sid(journey["initial_search_id"]),
         "startedAt": journey["started_at"], "endedAt": journey["ended_at"],
+        # 환승별 고정 예측과 사용자 결과(상세·시작 응답). 스트림 메시지에는 넣지 않는다.
+        "transferResults": transfer_results_view(journey.get("transfer_rows") or []),
     }
 
 
