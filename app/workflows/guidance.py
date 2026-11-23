@@ -28,6 +28,8 @@ from app.modules.evaluation.eta import index_etas
 from app.modules.evaluation.schemas import DESTINATION_REF, ORIGIN_REF, EvaluationInputs, WalkResult
 from app.modules.evaluation.service import evaluate_candidates
 from app.modules.journeys import state as journey_state
+from app.modules.journeys import presence as journey_presence
+from app.modules.journeys import repository as journey_repository
 from app.modules.recommendation.change import RouteOption, decide_change
 from app.modules.routing import repository as search_repository
 from app.modules.routing.schemas import (
@@ -282,6 +284,8 @@ def compute_guidance(
         "movement_state": movement, "current_leg_index": progress.get("leg_index"),
         "next_boarding": None, "onboard": None, "arrival": None, "alternatives": [],
         "alternatives_reason": "not_evaluated",
+        "boarding_estimate": {"status": "insufficient_evidence", "reason_codes": ["not_evaluated"],
+                              "suggestion": None, "evaluated_at": _iso(now)},
     }
     loc_max_age = settings.journey_location_max_age_seconds or policy.max_data_age_seconds
     guidance["location"] = location_status(journey, now, loc_max_age)
@@ -381,6 +385,23 @@ def compute_guidance(
         error_samples = sample_rules.transfer_error_samples(
             evaluation_repository.labeled_samples(conn, cohort, before=now))
         scenes = sample_rules.joint_scenes(evaluation_repository.complete_scenes(conn, cohort, before=now))
+        if movement != journey_state.ONBOARD:
+            route_ids = sorted({str(leg["route_id"]) for leg in rides if leg.get("route_id") is not None}
+                               | set((snapshot.get("alternative_targets") or {}).get("positions") or []))
+            gps_history, vehicle_history = journey_repository.recent_presence_samples(
+                conn, journey["id"], route_ids, since=now - timedelta(minutes=5))
+        else:
+            gps_history, vehicle_history = [], []
+    if movement != journey_state.ONBOARD:
+        estimate = journey_presence.estimate_boarding(
+            gps_history, vehicle_history, now=now, max_gps_age_seconds=loc_max_age)
+        if estimate.get("suggestion") is not None and rides:
+            estimate["suggestion"]["leg_index"] = rides[0]["leg_index"]
+        estimate["evaluated_at"] = _iso(now)
+        guidance["boarding_estimate"] = estimate
+    else:
+        guidance["boarding_estimate"] = {"status": "not_applicable", "reason_codes": ["already_confirmed_onboard"],
+                                         "suggestion": None, "evaluated_at": _iso(now)}
     states = {k: {key: v.get(key) for key in ("kind", "external_id", "state", "content", "collected_at",
                                                "age_seconds", "last_attempt_failed")}
               for k, v in realtime.target_states.items()}

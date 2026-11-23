@@ -113,6 +113,8 @@ def update_state(conn: psycopg.Connection, journey_id: UUID, *, lifecycle_status
         """,
         (lifecycle_status, movement_state, Jsonb(progress), state_version, ended_at, next_recalc_at, journey_id),
     )
+    if lifecycle_status != "active":
+        conn.execute("DELETE FROM app.journey_location_samples WHERE journey_id = %s", (journey_id,))
 
 
 def set_route_selection(conn: psycopg.Connection, journey_id: UUID, *, selected_candidate_id: UUID | None,
@@ -145,7 +147,46 @@ def update_location(conn: psycopg.Connection, journey_id: UUID, *, lat: float, l
         {"lat": lat, "lon": lon, "obs": observed_at, "recv": received_at, "acc": accuracy_m, "recalc": recalc_now,
          "id": journey_id},
     ).fetchone()
+    if row is not None:
+        # 짧은 궤적만 유지해 같은 버스와의 이동 일치 여부를 추정한다.
+        conn.execute(
+            f"""INSERT INTO app.journey_location_samples
+                (journey_id, observed_at, received_at, location, accuracy_m)
+                VALUES (%(id)s, %(obs)s, %(recv)s, {_POINT}, %(acc)s)
+                ON CONFLICT (journey_id, observed_at) DO NOTHING""",
+            {"id": journey_id, "obs": observed_at, "recv": received_at, "lat": lat, "lon": lon, "acc": accuracy_m},
+        )
+        conn.execute("DELETE FROM app.journey_location_samples WHERE journey_id = %s AND observed_at < %s",
+                     (journey_id, received_at - timedelta(minutes=5)))
     return row is not None
+
+
+def recent_presence_samples(conn: psycopg.Connection, journey_id: UUID, route_ids: list[str], *, since: datetime
+                            ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """짧은 사용자 GPS 이력과 대상 노선의 최근 공개 차량 위치 이력을 읽는다."""
+    gps_rows = conn.execute(
+        """SELECT extensions.ST_Y(location::extensions.geometry), extensions.ST_X(location::extensions.geometry),
+                  accuracy_m, observed_at
+             FROM app.journey_location_samples WHERE journey_id = %s AND observed_at >= %s
+             ORDER BY observed_at""", (journey_id, since)).fetchall()
+    gps = [{"lat": r[0], "lon": r[1], "accuracy_m": r[2], "observed_at": r[3]} for r in gps_rows]
+    if not route_ids:
+        return gps, []
+    vehicle_rows = conn.execute(
+        """SELECT r.id, o.pattern_key, rs.direction_code, o.vehicle_no,
+                  extensions.ST_Y(o.location::extensions.geometry), extensions.ST_X(o.location::extensions.geometry),
+                  o.collected_at
+             FROM app.transit_observations o
+             JOIN app.api_fetches f ON f.id = o.fetch_id AND f.published_at IS NOT NULL
+             JOIN app.routes r ON r.id = o.route_id
+             LEFT JOIN app.route_stops rs ON rs.route_id = o.route_id AND rs.pattern_key = o.pattern_key
+                                            AND rs.seq = o.stop_seq
+            WHERE o.kind = 'position' AND o.location IS NOT NULL AND o.vehicle_no IS NOT NULL
+              AND r.external_id = ANY(%s) AND o.collected_at >= %s
+            ORDER BY o.collected_at""", (route_ids, since)).fetchall()
+    vehicles = [{"route_id": r[0], "pattern_key": r[1], "direction_code": r[2], "vehicle_id": r[3],
+                 "lat": r[4], "lon": r[5], "observed_at": r[6]} for r in vehicle_rows]
+    return gps, vehicles
 
 
 def evaluation_snapshot(conn: psycopg.Connection, journey_id: UUID, snapshot_key: str) -> dict[str, Any] | None:

@@ -494,3 +494,7 @@ Phase 5(이동 중 재평가·대안 추천) 없이 동작하는 범위만 구�
   `<UUID>_deleted`. 개인 기록을 바꾸는 트랜잭션은 `profiles`를 FOR SHARE로 잠가 탈퇴 접수와 순서를 맞춘다(잠금 순서 profiles → journeys).
   탈퇴 계정의 접수 검색은 워커가 계산하지 않고 `error`(`account_deleted`)로 끝내며, 그 검색의 실시간 수집 대상도 뺀다.
 - 설정: `BACKEND_AUTH_ADMIN_URL`(필수, 기본값 없음), `BACKEND_AUTH_SERVICE_ROLE_KEY`(비우면 루트 `.env` `SERVICE_ROLE_KEY`) — `.env.api.example` 참고.
+
+## 자동 탑승 추정 (Phase 7)
+
+`migrations/12_journey_presence.sql`은 추정에 필요한 짧은 GPS 표본을 저장한다. 표본은 이동 종료 시 지우고, 계속 이동하는 동안 새 위치를 받을 때 5분보다 오래된 표본을 정리한다. 탑승 후보는 `guidance.boardingEstimate`에 반환하며 자동으로 탑승 확정 상태를 바꾸지 않는다. 상세 계약과 프론트엔드가 결정할 하차·환승 알림 항목은 [docs/phase7-auto-boarding-contract.md](../docs/phase7-auto-boarding-contract.md)에 있다.
