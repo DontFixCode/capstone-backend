@@ -143,6 +143,8 @@ def build_sample_records(
             "segment_model_version": policy.segment_model_version,
         }
         probability = candidate.transfer_probabilities[index - 1]
+        details = candidate.transfer_probability_details
+        detail = details[index - 1] if len(details) >= index else None
         counts = candidate.provenance.transfer_sample_counts
         rejections = candidate.provenance.transfer_sample_rejections
         records.append((index, SampleRecord(
@@ -174,6 +176,11 @@ def build_sample_records(
                 "sample_policy_version": policy.sample_policy_version,
                 "cohort_key": cohort,
                 "reason": None if probability is not None else "transfer_probability_unavailable",
+                # 확률의 근거(paired_ecdf / marginal_ecdf / None). marginal_ecdf면 predicted_probability는 범위의 하한이다.
+                "probability_source": detail.source if detail else None,
+                "probability_range": list(detail.probability_range) if detail and detail.probability_range else None,
+                "probability_sample_counts": dict(detail.sample_counts) if detail else {},
+                "probability_reason_codes": list(detail.reason_codes) if detail else [],
             },
             label_deadline_at=evaluated_at + timedelta(seconds=label_deadline_seconds),
         )))

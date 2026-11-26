@@ -120,6 +120,12 @@ class Settings(BaseSettings):
     # 환승 여유시간 등급의 경계(초, "하한,상한"). 여유 m이 0 미만이면 missed, 0 이상 하한 미만 tight, 하한 이상 상한 미만
     # moderate, 상한 이상 comfortable이다. 근거 있는 공통 수치가 없어 기본값을 두지 않으며, 비우면 등급을 만들지 않는다(null).
     eval_slack_grade_thresholds_seconds: Annotated[tuple[float, ...], NoDecode] = ()
+    # 환승 확률의 두 번째 단계: 짝지은 두 차량의 판정 표본이 부족하면 단일 차량 ETA 오차 표본(app.eta_error_samples)의 두
+    # 분포를 결합해 확률 범위를 낸다. 기본은 꺼짐이다. 켜면 아래 두 값과 BACKEND_ETA_ERROR_HORIZON_EDGES_SECONDS가 있어야
+    # 하고, 비어 있으면 검색 설정 오류다. 최근 며칠의 표본을 쓸지와 앞·다음 차량 각각의 최소 표본 수(독립 운행 기준)다.
+    eval_marginal_probability_enabled: bool = False
+    eval_marginal_window_days: float | None = Field(default=None, gt=0)
+    eval_min_marginal_samples: int | None = Field(default=None, gt=0)
     # 최초 검색 결과·필요 실시간 대상의 유효기간(초). 이 동안 워커가 대상을 공유 수집한다.
     search_expires_seconds: float | None = None
     # TMAP 보행자 경로 searchOption(0 추천, 4 추천+대로우선, 10 최단, 30 최단+계단제외)과 검색당 최대 조회 수.
@@ -235,7 +241,7 @@ class Settings(BaseSettings):
     # 같은 차량의 위치 기록 간격이 이 시간(초)을 넘으면 다른 운행으로 나눈다.
     eta_error_run_gap_seconds: float | None = Field(default=None, gt=0)
 
-    @field_validator("eta_error_sampling_enabled", mode="before")
+    @field_validator("eta_error_sampling_enabled", "eval_marginal_probability_enabled", mode="before")
     @classmethod
     def blank_flag_is_off(cls, value: object) -> object:
         if isinstance(value, str) and not value.strip():
@@ -243,7 +249,8 @@ class Settings(BaseSettings):
         return value
 
     @field_validator("eta_error_sampling_interval_seconds", "eta_error_sampling_daily_call_limit",
-                     "eta_error_match_window_seconds", "eta_error_run_gap_seconds", mode="before")
+                     "eta_error_match_window_seconds", "eta_error_run_gap_seconds", "eval_marginal_window_days",
+                     "eval_min_marginal_samples", mode="before")
     @classmethod
     def blank_eta_error_setting_is_missing(cls, value: object) -> object:
         if isinstance(value, str):

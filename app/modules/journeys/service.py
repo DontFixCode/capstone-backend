@@ -736,6 +736,8 @@ def transfer_results_view(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "transferIndex": snap.get("transfer_index"), "frontLegIndex": snap.get("front_leg_index"),
             "nextLegIndex": snap.get("next_leg_index"),
             "prediction": {"probability": snap.get("predicted_probability"), "slackSeconds": snap.get("slack_seconds"),
+                           "probabilitySource": snap.get("probability_source"),
+                           "probabilityRange": snap.get("probability_range"),
                            "slackGrade": snap.get("slack_grade"), "slackEstimated": snap.get("slack_estimated"),
                            "connectionStatus": snap.get("connection_status"), "fixedAt": row["fixed_at"]},
             "result": None if found is None else {

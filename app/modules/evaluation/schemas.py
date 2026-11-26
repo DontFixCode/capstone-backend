@@ -34,8 +34,21 @@ ConnectionStatus = Literal["feasible", "negative_slack", "time_unknown", "confir
 WalkStatus = Literal["available", "no_route", "lookup_failed"]
 EventType = Literal["arrival", "departure", "passage", "unknown"]
 MatchStatus = Literal["matched", "uncertain", "unmatched"]
+# 환승 확률의 근거: 짝지은 두 차량의 상대 오차 표본 / 단일 차량 오차 표본의 결합(app.modules.evaluation.probability).
+ProbabilitySource = Literal["paired_ecdf", "marginal_ecdf"]
 Version = Annotated[str, Field(min_length=1)]
 Probability = Annotated[float, Field(ge=0, le=1)]
+
+
+class MarginalProbabilityPolicy(FrozenSchema):
+    """환승 확률의 두 번째 단계(단일 차량 오차 결합) 설정. 근거 있는 공통 수치가 없어 모두 설정에서 받는다."""
+
+    # 앞 차량·다음 차량 각각에 필요한 최소 표본 수(독립 운행 기준).
+    min_samples: PositiveInt
+    # 이 일수 안에 도착한 표본만 쓴다(호출자가 표본을 읽을 때 적용).
+    window_days: PositiveFloat
+    # 잔여시간 구간 경계(초). 표본을 만들 때와 같은 값이어야 같은 구간의 표본이 선정된다.
+    horizon_edges_seconds: tuple[PositiveFloat, ...]
 
 
 class EvaluationPolicy(SearchPolicy):
@@ -65,6 +78,8 @@ class EvaluationPolicy(SearchPolicy):
     segment_model_version: Version
     # 환승 여유시간 등급의 경계(하한, 상한 초). None이면 등급을 만들지 않는다(app.modules.evaluation.transfer.slack_grade).
     slack_grade_thresholds_seconds: tuple[PositiveFloat, PositiveFloat] | None = None
+    # 짝 표본이 부족한 환승에 단일 차량 오차 결합을 시도할지. None이면 시도하지 않는다(기존과 같은 결과).
+    marginal_probability: MarginalProbabilityPolicy | None = None
 
 
 class WalkResult(FrozenSchema):
@@ -273,6 +288,8 @@ class EvaluationInputs(FrozenSchema):
     queried_stop_ids: frozenset[str] = frozenset()
     segment_observations: tuple[SegmentObservation, ...] = ()
     transfer_error_samples: tuple[TransferErrorSample, ...] = ()
+    # 단일 차량 ETA 오차 표본. 짝 표본이 부족한 환승의 확률을 두 분포의 결합으로 낼 때만 쓴다(정책이 켜져 있을 때).
+    eta_error_samples: tuple[EtaErrorSample, ...] = ()
     joint_scenes: tuple[JointScene, ...] = ()
     # 앞차 ETA 기반 승하차 ETA 근사의 차량 조합. 비면 이 근사를 쓰지 않는다.
     gap_anchors: tuple[GapAnchor, ...] = ()
@@ -376,6 +393,20 @@ class CandidateProvenance(FrozenSchema):
     expected_scenario_count: int | None
 
 
+class TransferProbability(FrozenSchema):
+    """환승 하나의 확률과 근거. 단계 순서는 짝 표본(paired_ecdf) → 단일 차량 오차 결합(marginal_ecdf) → 없음(None)이다.
+
+    probability는 marginal_ecdf일 때 범위의 하한이다. probability_range는 (하한, 상한)이며 paired_ecdf는 두 값이 같다.
+    sample_counts는 선정한 표본 수다(paired: 짝 표본, front·next: 앞 차량·다음 차량의 단일 차량 표본).
+    """
+
+    probability: Probability | None = None
+    source: ProbabilitySource | None = None
+    probability_range: tuple[Probability, Probability] | None = None
+    sample_counts: dict[str, int] = Field(default_factory=dict)
+    reason_codes: tuple[str, ...] = ()
+
+
 class EvaluatedCandidate(FrozenSchema):
     """차량·시각 조합별 평가 결과. 필드 의미는 Phase 3 Algorithms의 출력 계약을 따른다."""
 
@@ -403,6 +434,8 @@ class EvaluatedCandidate(FrozenSchema):
     expected_comparison_key: str | None
     reason_codes: tuple[str, ...]
     provenance: CandidateProvenance
+    # 환승별 확률의 근거(transfer_probabilities와 같은 순서). 확률 값의 뜻은 바꾸지 않고 출처·범위·표본 수를 더한다.
+    transfer_probability_details: tuple[TransferProbability, ...] = ()
 
 
 class EvaluationCoverage(FrozenSchema):

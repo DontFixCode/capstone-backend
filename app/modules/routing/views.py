@@ -120,6 +120,10 @@ def evaluation_view(row: dict[str, Any]) -> dict[str, Any]:
             # 예측이 아닌 ETA가 들어갔는지. 확률이 없어도 시간이 계산된 환승마다 준다.
             "slackGrade": t.get("slack_grade"), "slackEstimated": t.get("slack_estimated"),
             "status": t.get("status"), "probability": t.get("probability"),
+            # 확률의 근거: paired_ecdf(짝지은 두 차량의 판정 표본) / marginal_ecdf(단일 차량 오차 결합) / null(확률 없음).
+            # probabilityRange는 [하한, 상한]이고 marginal_ecdf면 probability는 하한이다.
+            "probabilitySource": t.get("probability_source"), "probabilityRange": t.get("probability_range"),
+            "probabilitySampleCounts": t.get("probability_sample_counts") or {},
             "reasonCodes": t.get("reason") or [],
         } for t in ev.get("transfers") or []],
         "evaluatedAt": row.get("evaluated_at"), "dataSnapshotId": provenance.get("data_snapshot_id"),

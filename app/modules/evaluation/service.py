@@ -15,12 +15,20 @@ from datetime import datetime, timedelta
 
 from app.modules.evaluation.eta import EtaTable, build_ride_legs, index_etas, index_segment_durations
 from app.modules.evaluation.probability import (
+    MARGINAL_ECDF,
+    MARGINAL_ERROR_SAMPLES_INSUFFICIENT,
+    MARGINAL_ERROR_SOURCE_UNSUPPORTED,
+    MARGINAL_ERROR_SOURCES,
+    PAIRED_ECDF,
+    TRANSFER_PROBABILITY_BY_MARGINAL_ERRORS,
     RecoveryOptions,
     estimate_expected_total_seconds,
     estimate_journey_probability,
     estimate_transfer_probability,
+    marginal_transfer_probability_bounds,
     select_error_pairs,
     select_joint_scenes,
+    select_marginal_errors,
 )
 from app.modules.evaluation.schemas import (
     DESTINATION_REF,
@@ -36,6 +44,8 @@ from app.modules.evaluation.schemas import (
     PlannedJourney,
     RideLegs,
     TimedLeg,
+    TransferProbability,
+    VehicleEta,
     WalkResult,
 )
 from app.modules.evaluation.transfer import assess_connection, resolve_walk_seconds
@@ -58,6 +68,16 @@ class _SharedData:
     headways: dict[str, float] = field(default_factory=dict)
     ride_legs: dict[tuple[str, int, int], RideLegs] = field(default_factory=dict)
     recovery_search_truncated: bool = False
+    # (생성 방식, 모델 버전, 기준 시각 출처, 잔여시간) → 선정한 단일 차량 오차. 같은 예측이 여러 차량 조합에 쓰여 한 번만 고른다.
+    marginal_errors: dict[tuple, tuple[tuple[float, float], ...]] = field(default_factory=dict)
+
+    def marginal_errors_for(self, eta: VehicleEta) -> tuple[tuple[float, float], ...]:
+        key = (eta.eta_source, eta.model_version, eta.basis_source, eta.horizon_seconds)
+        if key not in self.marginal_errors:
+            self.marginal_errors[key] = select_marginal_errors(
+                self.inputs.eta_error_samples, eta=eta,
+                horizon_edges_seconds=self.policy.marginal_probability.horizon_edges_seconds)
+        return self.marginal_errors[key]
 
 
 def evaluate_candidates(
@@ -323,15 +343,18 @@ def _evaluate_journey(
     reasons = list(journey.reason_codes)
 
     transfer_probabilities: list[float | None] = []
+    probability_details: list[TransferProbability] = []
     sample_counts: list[int] = []
     sample_rejections: list[dict[str, int]] = []
     for index in range(1, journey.candidate.transfer_count + 1):
-        probability, count, rejected = _transfer_probability(journey, index, shared)
-        transfer_probabilities.append(probability)
+        detail, count, rejected = _transfer_probability(journey, index, shared)
+        transfer_probabilities.append(detail.probability)
+        probability_details.append(detail)
         sample_counts.append(count)
         sample_rejections.append(rejected)
     if any(value is None for value in transfer_probabilities):
         reasons.append("transfer_probability_unavailable")
+    reasons.extend(reason for detail in probability_details for reason in detail.reason_codes)
 
     journey_probability = first_boarding_probability = expected_total_seconds = None
     comparison_key = None
@@ -410,6 +433,7 @@ def _evaluate_journey(
             joint_scene_rejections=scene_rejections,
             expected_scenario_count=len(scene_ids) if expected_total_seconds is not None else None,
         ),
+        transfer_probability_details=tuple(probability_details),
     )
 
 
@@ -417,25 +441,49 @@ def _transfer_probability(
     journey: PlannedJourney,
     transfer_index: int,
     shared: _SharedData,
-) -> tuple[float | None, int, dict[str, int]]:
-    """환승 순번의 개별 확률. 기준 여유와 두 차량의 ETA가 확인되지 않으면 None이다."""
+) -> tuple[TransferProbability, int, dict[str, int]]:
+    """환승 순번의 개별 확률과 근거, 짝 표본 수, 짝 표본 제외 이유. 기준 여유와 두 차량의 ETA가 확인되지 않으면 확률이 없다.
+
+    ① 짝지은 두 차량의 상대 오차 표본(기존 계산·선정 그대로) → ② 단일 차량 오차 결합(정책이 켜져 있을 때만) → ③ 없음.
+    ②는 두 예측이 모두 표본을 쌓는 생성 방식이고, 각각 같은 조건의 표본이 최소 수 이상일 때만 낸다.
+    """
     if len(journey.connections) <= transfer_index or len(journey.legs) <= transfer_index:
-        return None, 0, {}
+        return TransferProbability(), 0, {}
     connection = journey.connections[transfer_index]
     front_eta = journey.legs[transfer_index - 1].alight_eta
+    next_eta = journey.legs[transfer_index].board_eta
     if connection.slack_seconds is None or front_eta is None:
-        return None, 0, {}
+        return TransferProbability(), 0, {}
     pairs, rejected = select_error_pairs(
         shared.inputs.transfer_error_samples,
         front_eta=front_eta,
-        next_eta=journey.legs[transfer_index].board_eta,
+        next_eta=next_eta,
         condition_key=shared.inputs.sample_condition_key,
         policy=shared.policy,
     )
     probability = estimate_transfer_probability(
         connection.slack_seconds, pairs, shared.policy.min_probability_samples
     )
-    return probability, len(pairs), rejected
+    counts = {"paired": len(pairs)}
+    if probability is not None:
+        detail = TransferProbability(probability=probability, source=PAIRED_ECDF,
+                                     probability_range=(probability, probability), sample_counts=counts)
+        return detail, len(pairs), rejected
+    marginal = shared.policy.marginal_probability
+    if marginal is None:
+        return TransferProbability(sample_counts=counts), len(pairs), rejected
+    if front_eta.eta_source not in MARGINAL_ERROR_SOURCES or next_eta.eta_source not in MARGINAL_ERROR_SOURCES:
+        detail = TransferProbability(sample_counts=counts, reason_codes=(MARGINAL_ERROR_SOURCE_UNSUPPORTED,))
+        return detail, len(pairs), rejected
+    front_errors, next_errors = shared.marginal_errors_for(front_eta), shared.marginal_errors_for(next_eta)
+    counts.update(front=len(front_errors), next=len(next_errors))
+    if min(len(front_errors), len(next_errors)) < marginal.min_samples:
+        detail = TransferProbability(sample_counts=counts, reason_codes=(MARGINAL_ERROR_SAMPLES_INSUFFICIENT,))
+        return detail, len(pairs), rejected
+    lower, upper = marginal_transfer_probability_bounds(connection.slack_seconds, front_errors, next_errors)
+    detail = TransferProbability(probability=lower, source=MARGINAL_ECDF, probability_range=(lower, upper),
+                                 sample_counts=counts, reason_codes=(TRANSFER_PROBABILITY_BY_MARGINAL_ERRORS,))
+    return detail, len(pairs), rejected
 
 
 def _overall_connection_status(statuses: set[str], journey: PlannedJourney, infeasible_egress: bool) -> str:

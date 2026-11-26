@@ -43,6 +43,7 @@ from app.integrations.daejeon_bus_api import DaejeonBusClient
 from app.integrations.walking_api import PROVIDER as WALK_PROVIDER, TmapWalkingClient, WalkQuery, WalkResponse
 from app.modules.congestion import levels as congestion_levels
 from app.modules.congestion import service as congestion_service
+from app.modules.evaluation import eta_errors
 from app.modules.evaluation import repository as evaluation_repository
 from app.modules.evaluation import samples as sample_rules
 from app.modules.evaluation.eta import (
@@ -52,15 +53,18 @@ from app.modules.evaluation.eta import (
     index_etas,
     index_segment_durations,
 )
+from app.modules.evaluation.probability import MARGINAL_ERROR_SOURCES
 from app.modules.evaluation.schemas import (
     DESTINATION_REF,
     ORIGIN_REF,
+    EtaErrorSample,
     EtaReport,
     EvaluatedCandidate,
     EvaluationInputs,
     EvaluationPolicy,
     EvaluationResult,
     GapAnchor,
+    MarginalProbabilityPolicy,
     ObservedEvent,
     RouteHeadway,
     SegmentObservation,
@@ -144,7 +148,13 @@ _REQUIRED = {
     "sample_label_deadline_seconds": "BACKEND_SAMPLE_LABEL_DEADLINE_SECONDS",
 }
 # 평가 정책의 선택 기능 설정. 켰을 때만 적용 설정(params)에 남겨, 꺼져 있으면 기존 설정 버전이 그대로다.
-_OPTIONAL_EVALUATION_SETTINGS = ("slack_grade_thresholds_seconds",)
+_OPTIONAL_EVALUATION_SETTINGS = ("slack_grade_thresholds_seconds", "marginal_probability")
+# 단일 차량 오차 결합(BACKEND_EVAL_MARGINAL_PROBABILITY_ENABLED)을 켰을 때 필요한 설정.
+_MARGINAL_REQUIRED = {
+    "eval_marginal_window_days": "BACKEND_EVAL_MARGINAL_WINDOW_DAYS",
+    "eval_min_marginal_samples": "BACKEND_EVAL_MIN_MARGINAL_SAMPLES",
+    "eta_error_horizon_edges_seconds": "BACKEND_ETA_ERROR_HORIZON_EDGES_SECONDS",
+}
 
 
 @dataclass(frozen=True)
@@ -173,6 +183,9 @@ class SearchConfig:
 def load_search_config(settings: Settings) -> SearchConfig:
     """검색 설정을 읽는다. 하나라도 비어 있으면 누락된 키 이름을 모두 알려준다(근거 없는 기본값을 쓰지 않는다)."""
     missing = [env for name, env in _REQUIRED.items() if getattr(settings, name) is None]
+    if settings.eval_marginal_probability_enabled:
+        # 켰는데 필수 값이 빠지면 조용히 끄지 않고 설정 오류로 알린다.
+        missing += [env for name, env in _MARGINAL_REQUIRED.items() if getattr(settings, name) in (None, ())]
     if missing:
         raise SearchConfigError("검색 설정이 없습니다(.env.api): " + ", ".join(missing))
     s = settings
@@ -198,6 +211,10 @@ def load_search_config(settings: Settings) -> SearchConfig:
             recovery_policy_version=s.eval_recovery_policy_version,
             segment_model_version=s.eval_segment_model_version,
             slack_grade_thresholds_seconds=s.eval_slack_grade_thresholds_seconds or None,
+            marginal_probability=MarginalProbabilityPolicy(
+                min_samples=s.eval_min_marginal_samples, window_days=s.eval_marginal_window_days,
+                horizon_edges_seconds=s.eta_error_horizon_edges_seconds,
+            ) if s.eval_marginal_probability_enabled else None,
         )
     except ValidationError as exc:
         fields = sorted({".".join(str(p) for p in error["loc"]) for error in exc.errors()})
@@ -999,6 +1016,8 @@ def transfer_summary(evaluated: EvaluatedCandidate, transfer_index: int,
     front_eta = evaluated.legs[t - 1].alight_eta if t - 1 < len(evaluated.legs) else None
     next_eta = evaluated.legs[t].board_eta if t < len(evaluated.legs) else None
     slack = connection.slack_seconds if connection else None
+    detail = (evaluated.transfer_probability_details[t - 1]
+              if t - 1 < len(evaluated.transfer_probability_details) else None)
     return {
         "slack_seconds": slack,
         "slack_grade": slack_grade(slack, policy.slack_grade_thresholds_seconds if policy else None),
@@ -1006,7 +1025,33 @@ def transfer_summary(evaluated: EvaluatedCandidate, transfer_index: int,
         "status": connection.status if connection else None,
         "probability": evaluated.transfer_probabilities[t - 1] if t - 1 < len(evaluated.transfer_probabilities)
         else None,
+        # 확률의 근거(paired_ecdf / marginal_ecdf / None), 범위 [하한, 상한], 선정한 표본 수. marginal_ecdf면 probability는 하한이다.
+        "probability_source": detail.source if detail else None,
+        "probability_range": list(detail.probability_range) if detail and detail.probability_range else None,
+        "probability_sample_counts": dict(detail.sample_counts) if detail else {},
     }
+
+
+def transfer_reason_codes(evaluated: EvaluatedCandidate, transfer_index: int) -> list[str]:
+    """환승 순번 하나의 사유: 연결 판정 사유에 확률 단계의 사유(단일 차량 오차 결합 사용·표본 부족·방식 미지원)를 더한다."""
+    t = transfer_index
+    connection = evaluated.connections[t] if t < len(evaluated.connections) else None
+    detail = (evaluated.transfer_probability_details[t - 1]
+              if t - 1 < len(evaluated.transfer_probability_details) else None)
+    return [*(connection.reason_codes if connection else ()), *(detail.reason_codes if detail else ())]
+
+
+def marginal_error_samples(conn, policy: EvaluationPolicy, before: datetime) -> list[EtaErrorSample]:
+    """단일 차량 오차 결합에 쓸 표본. 정책이 꺼져 있거나 테이블이 아직 없으면 읽지 않는다(그 단계는 표본 부족이 된다).
+
+    최근 window_days일 안에 도착했고 평가 기준시각 이전에 만들어진 표본만 읽는다.
+    """
+    marginal = policy.marginal_probability
+    if marginal is None or not evaluation_repository.eta_error_samples_ready(conn):
+        return []
+    return eta_errors.error_samples(evaluation_repository.eta_error_samples(
+        conn, eta_sources=sorted(MARGINAL_ERROR_SOURCES), since=before - timedelta(days=marginal.window_days),
+        before=before))
 
 
 def candidate_row(candidate: StaticCandidate, evaluated: EvaluatedCandidate, recommendation: RecommendationResult,
@@ -1025,7 +1070,7 @@ def candidate_row(candidate: StaticCandidate, evaluated: EvaluatedCandidate, rec
             **transfer_summary(evaluated, t, policy),
             "sample_id": sample_ids.get((evaluated.timed_candidate_id, t)),
             "sample_reason": sample_skips.get((evaluated.timed_candidate_id, t)),
-            "reason": None if connection is None else (list(connection.reason_codes) or None),
+            "reason": None if connection is None else (transfer_reason_codes(evaluated, t) or None),
         })
     evaluation = {
         "timed_candidate_id": evaluated.timed_candidate_id,
@@ -1399,6 +1444,7 @@ class SearchWorkflow:
                 guided_at=now, exclude_search_id=search_id)
             error_samples = sample_rules.transfer_error_samples(
                 evaluation_repository.labeled_samples(conn, cohort, before=context.evaluated_at))
+            marginal_samples = marginal_error_samples(conn, policy, context.evaluated_at)
             scenes = sample_rules.joint_scenes(
                 evaluation_repository.complete_scenes(conn, cohort, before=context.evaluated_at))
         rear_vehicles: set[tuple[str, str]] = set()
@@ -1412,6 +1458,8 @@ class SearchWorkflow:
                                           "anchor_stops": sorted({a.anchor_stop_id for a in anchors})}
         summary["history_inputs"] = {"segment_observations": len(segments), "transfer_error_samples":
                                      len(error_samples), "joint_scenes": len(scenes), "cohort_key": cohort}
+        if policy.marginal_probability is not None:
+            summary["history_inputs"]["eta_error_samples"] = len(marginal_samples)
         data_snapshot_id = hashlib.sha256(json.dumps([str(network.data_version), sorted(realtime.batch_refs, key=str)],
                                                      default=str).encode()).hexdigest()[:32]
         summary["data_snapshot_id"] = data_snapshot_id
@@ -1421,6 +1469,7 @@ class SearchWorkflow:
             walks=tuple(w for w in (lookup.as_walk_result() for lookup in walks.values()) if w is not None),
             eta_reports=tuple(realtime.eta_reports), queried_stop_ids=realtime.queried_stop_ids,
             segment_observations=tuple(segments), transfer_error_samples=tuple(error_samples),
+            eta_error_samples=tuple(marginal_samples),
             joint_scenes=tuple(scenes), gap_anchors=tuple(anchors), route_headways=headways,
             rear_vehicles=frozenset(rear_vehicles),
         )

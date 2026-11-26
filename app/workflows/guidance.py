@@ -595,6 +595,7 @@ def compute_guidance(
             if (seconds := search_flow.applicable_headway_seconds(info, now)) is not None}
         error_samples = sample_rules.transfer_error_samples(
             evaluation_repository.labeled_samples(conn, cohort, before=now))
+        marginal_samples = search_flow.marginal_error_samples(conn, policy, now)
         scenes = sample_rules.joint_scenes(evaluation_repository.complete_scenes(conn, cohort, before=now))
         if movement != journey_state.ONBOARD:
             route_ids = sorted({str(leg["route_id"]) for leg in rides if leg.get("route_id") is not None}
@@ -660,6 +661,7 @@ def compute_guidance(
             data_snapshot_id=data_snapshot_id, sample_condition_key=cohort, walks=tuple(walks),
             eta_reports=eta_reports, queried_stop_ids=realtime.queried_stop_ids,
             segment_observations=tuple(segments), transfer_error_samples=tuple(error_samples),
+            eta_error_samples=tuple(marginal_samples),
             joint_scenes=tuple(scenes), route_headways=headways, extra_legs=tuple(extra_legs))
         result = evaluate_candidates(_search_result(candidate, static_version), context, inputs, policy)
         return [*result.candidates, *result.limited]
@@ -886,7 +888,8 @@ def compute_guidance(
                                                 "front_leg_index": merged_bus_indices[completed_count + transfer_index - 1],
                                                 "next_leg_index": merged_bus_indices[completed_count + transfer_index],
                                                 **search_flow.transfer_summary(chosen_eval, transfer_index, policy),
-                                                "reason": list(connection.reason_codes) if connection else [],
+                                                "reason": search_flow.transfer_reason_codes(chosen_eval,
+                                                                                            transfer_index),
                                                 "sample_id": None, "sample_reason": "reevaluated_during_journey",
                                                 "front_alight_eta": search_flow._jsonable(front.alight_eta)
                                                 if front.alight_eta else None,
@@ -980,6 +983,10 @@ def evaluation_snapshots(journey_id: UUID, candidate: dict[str, Any], *, selecti
             "static_route_key": candidate["static_route_key"], "option_key": candidate["option_key"],
             "sample_id": transfer.get("sample_id"), "sample_reason": transfer.get("sample_reason"),
             "predicted_probability": transfer.get("probability"), "slack_seconds": transfer.get("slack_seconds"),
+            # 확률의 근거(paired_ecdf / marginal_ecdf / None)와 범위. marginal_ecdf면 predicted_probability는 하한이다.
+            "probability_source": transfer.get("probability_source"),
+            "probability_range": transfer.get("probability_range"),
+            "probability_sample_counts": transfer.get("probability_sample_counts") or {},
             "slack_grade": transfer.get("slack_grade"), "slack_estimated": transfer.get("slack_estimated"),
             "connection_status": transfer.get("status"), "reason_codes": transfer.get("reason") or [],
             "front_leg_index": transfer.get("front_leg_index"), "next_leg_index": transfer.get("next_leg_index"),
