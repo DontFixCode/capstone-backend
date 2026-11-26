@@ -1167,7 +1167,8 @@ class RealtimeCollector:
     def collect(self, target: RealtimeTarget, *, force: bool = False, store_body: bool = True) -> CollectOutcome:
         """store_body가 False면 대전시 정상·빈 응답의 원본 본문을 남기지 않는다(오류 응답은 남긴다).
 
-        짧은 주기로 도는 ETA 오차 표본 수집 대상에만 쓴다. 항목 원값은 관측 행의 details.source에 남는다.
+        짧은 주기로 도는 ETA 오차 표본 수집 대상에만 쓴다. 도착정보 항목의 원값은 관측 행의 details.source에 남고, 노선 위치는
+        정류소가 바뀐 항목만 관측 행으로 남는다(바뀌지 않은 항목은 남기지 않는다).
         """
         key = realtime_target_key(target, self.city_code)
         uses_daejeon = target.kind in DAEJEON_KINDS

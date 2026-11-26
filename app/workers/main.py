@@ -10,13 +10,17 @@
 BACKEND_ODSAY_DAILY_CALL_LIMIT이 있을 때만, 남은 한도만큼. app/workflows/route_shapes.py). 연결된 노선의 형상은 한 요청으로
 모두 다시 받으므로 하루 1회 전체 갱신에 보통 1건이 든다.
 
-상시 실행은 두 흐름을 같은 프로세스에서 돌린다: ① 공유 수집 루프(정적 갱신 → 실시간 → 표본 판정),
+상시 실행은 두 흐름을 같은 프로세스에서 돌린다: ① 공유 수집 루프(정적 갱신 → 실시간 → 표본 판정 → ETA 오차 표본 생성),
 ② 앱 작업 스레드(접수된 검색 실행 → 활성 이동 안내 재계산, BACKEND_JOB_POLL_SECONDS 간격 → 탈퇴 계정의 Auth 신규 로그인
 차단 재시도, BACKEND_AUTH_BLOCK_RETRY_INTERVAL_SECONDS 간격). 두 흐름은 대상별 DB 잠금을
 기다리지 않는 방식(try-lock)으로 같은 수집기를 써서 서로의 완료를 기다리며 막히지 않는다.
 
 실시간 대상은 .env.api의 BACKEND_REALTIME_POSITION_ROUTE_IDS·BACKEND_REALTIME_ARRIVAL_STOP_IDS(쉼표 구분)이며,
 매 회 설정을 다시 읽으므로 목록을 고치면 다음 회부터 등록·해제가 반영된다. 실제 외부 호출은 이 워커만 수행한다.
+
+ETA 오차 표본 수집(BACKEND_ETA_ERROR_SAMPLING_ENABLED, 기본 꺼짐)을 켜면 설정한 정류소의 도착정보와 노선의 대전시 위치를
+수집 시간대(KST) 동안 짧은 주기로 받는다. 이 대상만 그 주기로 돌고 나머지는 공통 간격 그대로이며, 수집한 위치 기록에서 도착
+이벤트와 오차 표본을 만든다(app/workflows/eta_error_sampling.py). 설정이 빠졌으면 표본 수집만 건너뛰고 나머지는 계속한다.
 """
 
 from __future__ import annotations
