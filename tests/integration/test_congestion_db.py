@@ -22,7 +22,7 @@ from test_congestion import export_html  # noqa: E402
 
 from app import main  # noqa: E402
 from app.core.config import Settings  # noqa: E402
-from app.modules.congestion import service  # noqa: E402
+from app.modules.congestion import equilibrium, levels, service  # noqa: E402
 from app.workers.collection import collection_targets  # noqa: E402
 
 UTC = timezone.utc
@@ -187,6 +187,55 @@ class CongestionFlowTest(base.Phase4TestCase):
                              "FROM app.route_searches WHERE id = %s", (weighted_id,))[0]
         self.assertEqual((summary[0]["applied"], summary[0]["candidates_with_bias"] > 0, summary[1]),
                          (True, True, "congestion_ride_time_weight"))
+
+        # ---- 균형 시뮬레이션 입력: 저장된 검색의 순위 후보를 정적 경로마다 하나씩 읽는다(DB에 쓰지 않는다).
+        policy = levels.policy_from_settings(self.settings)
+        with self.db.transaction() as conn:
+            options = service.equilibrium_options(conn, weighted_id, policy)
+        static_keys = {r[0] for r in self.query("SELECT static_route_key FROM app.route_candidates "
+                                                "WHERE search_id = %s AND rank_no IS NOT NULL", (weighted_id,))}
+        self.assertEqual(len(options), len(static_keys))
+        rides = [ride for option in options for ride in option.rides]
+        known = [ride for ride in rides if not ride.assumed]
+        self.assertTrue(known and all(link.trips_per_hour == 6.0 for ride in known for link in ride.links))
+        self.assertEqual({link.base_load for ride in known for link in ride.links} - {25.0, 40.0, 0.0}, set())
+        self.assertTrue(all(ride.assumed == ("base_load_unknown", "trips_from_timetable")
+                            for ride in rides if ride.assumed), "집계가 없는 노선은 배차간격으로 채우고 가정을 남긴다")
+        simulated = equilibrium.simulate(options, policy, demand_per_hour=300, theta=0.01, max_iterations=500,
+                                         tolerance=0.001)
+        self.assertEqual(len(simulated.options), len(options))
+        self.assertAlmostEqual(sum(o.share_at_equilibrium for o in simulated.options), 1.0)
+        self.assertLessEqual(simulated.max_share("share_at_equilibrium"), simulated.max_share("share_all_to_best"))
+
+        # ---- 안내 인원: 다른 사용자가 같은 차량으로 안내받고 있으면 그 구간의 1대당 재차에 1명씩 더한다.
+        def route_10_leg(candidate):
+            return next((leg for leg in candidate["legs"] if leg["kind"] == "bus"
+                         and leg["route"]["externalId"] == ROUTE_10 and leg["vehicle"]
+                         and leg["vehicle"]["vehicleId"]), None)
+
+        self.assertEqual({leg["congestion"]["guidedRiders"] for c in ranked for leg in c["legs"]
+                          if leg["kind"] == "bus" and leg["congestion"]["status"] == "available"}, {0.0})
+        chosen = next(c for c in ranked if route_10_leg(c))
+        ridden = route_10_leg(chosen)
+        started = self.client.post("/api/v1/journeys", headers=self.auth(self.user_c),
+                                   json={"searchId": weighted_id, "candidateId": chosen["candidateId"]})
+        self.assertEqual(started.status_code, 201, started.text)
+        _, body = self.ready_search(self.user_a)
+        same = [leg for c in body["candidates"] for leg in c["legs"]
+                if leg["kind"] == "bus" and leg["route"]["externalId"] == ROUTE_10 and leg["vehicle"]
+                and leg["vehicle"]["vehicleId"] == ridden["vehicle"]["vehicleId"]
+                and (leg["board"]["seq"], leg["alight"]["seq"]) == (ridden["board"]["seq"], ridden["alight"]["seq"])]
+        self.assertTrue(same, "같은 차량·같은 구간을 타는 후보가 다른 사용자 검색에도 있다")
+        for leg in same:
+            self.assertEqual((leg["congestion"]["guidedRiders"], leg["congestion"]["loadPerVehicle"]),
+                             (1.0, ridden["congestion"]["loadPerVehicle"] + 1.0), leg["congestion"])
+        guided_summary = self.query("SELECT summary -> 'congestion_bias' ->> 'guided_rides' FROM app.route_searches "
+                                    "WHERE user_id = %s ORDER BY created_at DESC LIMIT 1", (self.user_a,))[0][0]
+        self.assertEqual(guided_summary, "1")
+        # 안내받는 사용자 자신의 검색에는 자기 탑승을 더하지 않는다.
+        _, own = self.ready_search(self.user_c)
+        self.assertEqual({leg["congestion"]["guidedRiders"] for c in own["candidates"] for leg in c["legs"]
+                          if leg["kind"] == "bus" and leg["congestion"]["status"] == "available"}, {0.0})
 
         # ---- 단계 설정(좌석 수·정원)이 없으면 단계를 만들지 않고 사유를 준다.
         self.use_settings()

@@ -265,6 +265,34 @@ class SchedulerTest(unittest.TestCase):
         self.assertGreaterEqual(other.at - (attempt + timedelta(seconds=30)), timedelta(seconds=600),
                                 "다른 프로세스가 그 뒤에 조회했으면 간격을 다시 지킴")
 
+    def test_returning_target_is_fetched_once_not_once_per_missed_slot(self):
+        """12시간 쉬었다가 다시 대상이 된 노선: 밀린 슬롯 72개를 연달아 조회하지 않고 한 번만 조회한다."""
+        last = datetime(2026, 11, 26, 4, 27, 16, tzinfo=UTC)
+        now = datetime(2026, 11, 26, 16, 44, 34, tzinfo=UTC)
+        ran_slots, clock, calls = {}, now, 0
+        for _ in range(100):
+            due = scheduler.next_due(self.KEY, 600, last, last, clock, ran_slot=ran_slots.get(self.KEY))
+            if due.at > clock:
+                break
+            self.assertGreaterEqual(due.at - last, timedelta(seconds=600) if calls == 0 else timedelta(0))
+            calls += 1
+            last = clock + timedelta(seconds=0.1)                   # 조회 시작(DB의 마지막 시도)
+            finished = clock + timedelta(seconds=0.3)
+            if due.on_slot:
+                ran_slots[self.KEY] = (due.at, finished)
+            clock = finished
+        self.assertEqual(calls, 1)
+        self.assertLessEqual(due.at - clock, timedelta(seconds=600), "다음 조회는 한 간격 안의 다음 슬롯")
+        self.assertAlmostEqual(((due.at - scheduler._EPOCH).total_seconds() - scheduler.phase_offset(self.KEY, 600))
+                               % 600, 0, places=3)
+        # 워커가 오래 멈췄다 돌아온 경우(프로세스 메모리의 슬롯이 오래됨)도 같은 규칙이다.
+        slot = scheduler.first_slot_at_or_after(self.KEY, 600, datetime(2026, 11, 7, tzinfo=UTC))
+        attempt = slot + timedelta(seconds=0.5)
+        late = slot + timedelta(hours=3)
+        resumed = scheduler.next_due(self.KEY, 600, attempt, attempt, late, ran_slot=(slot, attempt + timedelta(seconds=1)))
+        self.assertLessEqual(resumed.at, late)
+        self.assertLess(late - resumed.at, timedelta(seconds=600), "지금 시각 직전의 슬롯")
+
     def test_phases_spread_targets_within_cycle(self):
         phases = {scheduler.phase_offset(f"tago:x?routeId=R{i}", 600) for i in range(50)}
         self.assertGreater(len({int(p // 60) for p in phases}), 5, "50개 대상이 한 구간에 몰리지 않음")

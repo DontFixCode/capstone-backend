@@ -966,7 +966,8 @@ def build_legs(candidate: StaticCandidate, evaluated: EvaluatedCandidate, walks:
             "congestion": None if network_info.get("congestion") is None else network_info["congestion"].describe(
                 route.route_id if route else None, ride.pattern_id,
                 at=timed.board_eta.predicted_arrival_at if timed else network_info.get("start_at"),
-                from_seq=ride.board_position, to_seq=ride.alight_position),
+                from_seq=ride.board_position, to_seq=ride.alight_position,
+                vehicle_id=timed.vehicle_id if timed else None),
             # 승하차 구간 형상: 검증된 제공처의 패턴 형상(routes.shape_info)이 있을 때만 잘라 붙이고, 없으면 미확보와 사유.
             **route_shapes.segment_geometry(
                 route_shapes.pattern_entry(network_info.get("shapes", {}).get(ride.route_id), ride.pattern_id),
@@ -1057,7 +1058,7 @@ def congestion_biases(items: Iterable[EvaluatedCandidate], lookup: congestion_se
         for leg in item.legs:
             described = lookup.describe(internal_ids.get(leg.route_id), leg.pattern_id,
                                         at=leg.board_eta.predicted_arrival_at, from_seq=leg.board_position,
-                                        to_seq=leg.alight_position)
+                                        to_seq=leg.alight_position, vehicle_id=leg.vehicle_id)
             value = congestion_levels.ride_bias_seconds(described, leg.ride_seconds, policy)
             if value is None:
                 unknown.add(item.timed_candidate_id)
@@ -1363,9 +1364,11 @@ class SearchWorkflow:
             shapes = transit_repository.route_shape_infos(
                 conn, {r.route_id for c in result.candidates for r in c.rides})
             internal_ids = {r.external_id: r.route_id for r in network.routes}
+            # 앱이 지금 안내 중인 다른 사용자의 탑승을 예상 재차에 더한다(이 검색을 요청한 사용자의 이동은 뺀다).
             congestion = congestion_service.Lookup.load(
                 conn, config.congestion_policy,
-                {(internal_ids.get(r.route_id), r.pattern_id) for c in result.candidates for r in c.rides})
+                {(internal_ids.get(r.route_id), r.pattern_id) for c in result.candidates for r in c.rides},
+                guided_at=now, exclude_search_id=search_id)
             error_samples = sample_rules.transfer_error_samples(
                 evaluation_repository.labeled_samples(conn, cohort, before=context.evaluated_at))
             scenes = sample_rules.joint_scenes(
@@ -1402,7 +1405,8 @@ class SearchWorkflow:
         summary["congestion_bias"] = {
             "applied": bool(config.congestion_policy and config.congestion_policy.cost_weights),
             "candidates_with_bias": sum(1 for value in congestion_bias.values() if value > 0),
-            "candidates_with_unknown_leg": len(bias_unknown)}
+            "candidates_with_unknown_leg": len(bias_unknown),
+            "guided_rides": sum(len(rides) for rides in congestion.guided.values())}
         status, status_reason = search_status(result, recommendation)
         timed = [*evaluation.candidates, *evaluation.limited]
         statics = {c.static_candidate_id: c for c in result.candidates}

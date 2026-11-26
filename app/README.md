@@ -520,7 +520,8 @@ Phase 5(이동 중 재평가·대안 추천) 없이 동작하는 범위만 구�
 승객 흐름을 집계하고, 경로 후보의 버스 구간(`legs[].congestion`)과 정류소 도착 목록(`items[].congestion`)에 5단계 예상 혼잡을
 내보낸다. 값은 "평소 이 시간대 예상"이며 실시간이 아니다. 좌석 수·정원·집계 창은 `.env.api`의 `BACKEND_CONGESTION_*`로 정하고
 (기본값 없음), `BACKEND_CONGESTION_COST_WEIGHTS`가 있으면 버스 탑승시간 × (단계 가중치 − 1)을 추천 비용의 내시균형 bias로 더해
-순위에 반영한다(`candidates[].cost`). 균형 시뮬레이션은 없다. 내려받는 절차, 계산식, 응답 형식, 설계 초안과 다른 점은
+순위에 반영한다(`candidates[].cost`). 앱이 안내 중인 다른 사용자의 탑승도 1대당 재차에 더한다(`guidedRiders`). 균형
+시뮬레이션은 오프라인 스크립트로 실행한다. 내려받는 절차, 계산식, 응답 형식, 설계 초안과 다른 점은
 [docs/phase8-congestion.md](../docs/phase8-congestion.md)에 있다.
 
 | 위치 | 책임 |
@@ -529,4 +530,6 @@ Phase 5(이동 중 재평가·대안 추천) 없이 동작하는 범위만 구�
 | `app/modules/congestion/aggregation.py` | 하차 보정·경유 순서 누적·요일유형별 평균과 p80·위치 관측 기반 통과 횟수(모자라면 배차간격) |
 | `app/modules/congestion/levels.py` | 조회 시점의 1대당 재차·5단계·대체 시간대·미확인 사유 |
 | `app/modules/congestion/service.py`, `repository.py` | 입력(중복 건너뜀)·노선별 집계 교체·검색과 도착 목록용 조회 |
+| `app/modules/congestion/equilibrium.py` | 균형 시뮬레이션 계산(로짓 선택·연속평균법, DB·HTTP 없음) |
 | `scripts/import_ridership.py` | 입력·집계·현황 CLI(기본은 미리 보기, `--execute`로 저장) |
+| `scripts/simulate_equilibrium.py` | 저장된 검색의 순위 후보로 균형 분포를 계산해 지금 분포와 비교(읽기 전용) |

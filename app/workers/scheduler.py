@@ -51,14 +51,28 @@ def next_due(key: str, interval_seconds: float, last_attempt_at: datetime | None
     """ran_slot은 이 워커가 마지막으로 조회한 (슬롯 시각, 조회 종료 시각)이다(프로세스 메모리).
 
     DB의 마지막 시도가 그 조회 구간 안에 있을 때만 다음 슬롯을 쓰고, 그 뒤에 다른 시도가 있었으면 간격 규칙을 다시 적용한다.
+
+    계산한 슬롯이 이미 지났으면(한동안 대상이 아니었거나 워커가 멈춰 있었던 경우) 지금 시각 직전의 슬롯으로 당긴다. 밀린
+    슬롯을 하나씩 따라가며 쉰 시간만큼 연달아 호출하지 않고 한 번만 조회한다.
     """
     known = [t for t in (last_attempt_at, last_collected_at) if t is not None]
     if not known:
         return Due(now, False, "initial")
     interval = timedelta(seconds=interval_seconds)
     if ran_slot is not None and last_attempt_at is not None and ran_slot[0] <= last_attempt_at <= ran_slot[1]:
-        return Due(ran_slot[0] + interval, True, "next_slot")
-    return Due(first_slot_at_or_after(key, interval_seconds, max(known) + interval), True, "aligned_after_interval")
+        return Due(_skip_missed_slots(key, interval_seconds, ran_slot[0] + interval, now), True, "next_slot")
+    slot = first_slot_at_or_after(key, interval_seconds, max(known) + interval)
+    return Due(_skip_missed_slots(key, interval_seconds, slot, now), True, "aligned_after_interval")
+
+
+def _skip_missed_slots(key: str, interval_seconds: float, slot: datetime, now: datetime) -> datetime:
+    """지난 슬롯이면 지금 시각 이전의 가장 최근 슬롯(그보다 앞이 아닐 때), 아니면 그대로."""
+    if slot >= now:
+        return slot
+    latest = first_slot_at_or_after(key, interval_seconds, now)
+    if latest > now:
+        latest -= timedelta(seconds=interval_seconds)
+    return max(slot, latest)
 
 
 @dataclass(frozen=True)

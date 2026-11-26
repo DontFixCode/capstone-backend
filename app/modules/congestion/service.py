@@ -27,7 +27,7 @@ import psycopg
 
 from app.core.config import Settings
 from app.db.session import Database
-from app.modules.congestion import levels, repository
+from app.modules.congestion import equilibrium, levels, repository
 from app.modules.congestion.aggregation import (
     KST,
     AggregateResult,
@@ -36,7 +36,9 @@ from app.modules.congestion.aggregation import (
     VehiclePoint,
     align_stops,
     build_profiles,
+    day_type,
     observed_trips,
+    timetable_trips_per_hour,
     window_start,
 )
 from app.modules.congestion.source import ParsedFile, SourceFileError, SourceRow, parse_export, route_parts
@@ -310,28 +312,100 @@ def preview(db: Database, settings: Settings, parsed: ParsedFile, *, now: dateti
     return out
 
 
+# ---------------------------------------------------------------- 균형 시뮬레이션 입력
+
+def equilibrium_options(conn: psycopg.Connection, search_id: UUID, policy: levels.LevelPolicy, *,
+                        assume_trips_per_hour: float | None = None) -> list[equilibrium.Option]:
+    """저장된 검색의 순위 후보를 균형 시뮬레이션 입력으로 바꾼다(읽기만 한다).
+
+    같은 정적 경로를 차량만 바꿔 타는 조합은 순위가 가장 높은 하나만 쓴다(시간당 선택 인원을 그 경로의 차량들에 나눠
+    싣기 때문). 버스 구간의 기준 재차와 통과 횟수는 승차 예상 시각의 집계 값이다. 집계가 없는 노선은 기준 재차를 0으로 두고
+    통과 횟수를 assume_trips_per_hour(없으면 노선 배차간격)로 채우며, 그 사실을 assumed에 남긴다. 통과 횟수도 구하지 못하면
+    그 구간은 혼잡 비용 없이 둔다.
+    """
+    rows, seen = [], set()
+    for row in repository.ranked_candidates(conn, search_id):
+        if row["static_route_key"] not in seen and row["time_seconds"] is not None:
+            seen.add(row["static_route_key"])
+            rows.append(row)
+    bus_legs = [leg for row in rows for leg in row["legs"] if leg.get("kind") == "bus"]
+    keys = {(leg.get("route_internal_id"), leg.get("pattern_key")) for leg in bus_legs}
+    keys = {key for key in keys if key[0] is not None and key[1]}
+    profiles = repository.profiles_for(conn, keys) if keys and repository.tables_ready(conn) else {}
+    routes = {route_id: repository.route_by_id(conn, route_id) for route_id, _ in keys}
+
+    def ride(leg: dict[str, Any]) -> equilibrium.Ride:
+        key = (leg.get("route_internal_id"), leg.get("pattern_key"))
+        seconds = float(leg.get("ride_seconds") or 0.0)
+        at = repository.moment((leg.get("board_eta") or {}).get("predicted_arrival_at"))
+        first, last = (leg.get("board") or {}).get("seq"), (leg.get("alight") or {}).get("seq")
+        if at is None or first is None or last is None:
+            return equilibrium.Ride(key, seconds, (), ("no_congestion_estimate",))
+        seqs = range(int(first), max(int(first) + 1, int(last)))
+        if profiles.get(key):
+            links = []
+            for seq in seqs:
+                found = levels.describe(profiles[key], policy, at=at, from_seq=seq)
+                if found["status"] == "available":
+                    links.append(equilibrium.Link(seq, found["load_per_vehicle"], found["trips_per_hour"]))
+            notes = () if len(links) == len(seqs) else ("some_links_without_estimate",)
+            return equilibrium.Ride(key, seconds, tuple(links), notes if links else ("no_congestion_estimate",))
+        trips, note = assume_trips_per_hour, "trips_assumed"
+        if trips is None:
+            kind = day_type(at.astimezone(KST).date(), policy.holidays)
+            service_info = (routes.get(key[0]) or {}).get("service_info")
+            trips, note = timetable_trips_per_hour(service_info, kind), "trips_from_timetable"
+        if not trips:
+            return equilibrium.Ride(key, seconds, (), ("no_congestion_estimate",))
+        return equilibrium.Ride(key, seconds, tuple(equilibrium.Link(seq, 0.0, trips) for seq in seqs),
+                                ("base_load_unknown", note))
+
+    options = []
+    for row in rows:
+        buses = [leg for leg in row["legs"] if leg.get("kind") == "bus"]
+        options.append(equilibrium.Option(
+            option_id=str(row["id"]), time_seconds=row["time_seconds"], rides=tuple(ride(leg) for leg in buses),
+            label=" → ".join(str(leg.get("route_no") or leg.get("route_id")) for leg in buses) or None))
+    return options
+
+
 # ---------------------------------------------------------------- 조회
 
 class Lookup:
     """검색·도착 목록이 한 번 읽어 여러 구간에 쓰는 집계 묶음."""
 
     def __init__(self, policy: levels.LevelPolicy | None,
-                 profiles: dict[tuple[int, str], dict[tuple[str, int, int], dict[str, Any]]] | None = None) -> None:
+                 profiles: dict[tuple[int, str], dict[tuple[str, int, int], dict[str, Any]]] | None = None,
+                 guided: dict[tuple[int, str], list[levels.GuidedRide]] | None = None) -> None:
         self.policy = policy
         self.profiles = profiles or {}
+        # (노선 내부 ID, 패턴) → 앱이 안내 중인 탑승. 검색에서만 읽는다(정류소 도착 목록에는 더하지 않는다).
+        self.guided = guided or {}
 
     @classmethod
     def load(cls, conn: psycopg.Connection, policy: levels.LevelPolicy | None,
-             targets: Iterable[tuple[int | None, str | None]]) -> Lookup:
-        """(노선 내부 ID, 패턴) 대상의 집계를 읽는다. 단계 정책이나 테이블이 없으면 읽지 않고 미확인으로 답한다."""
+             targets: Iterable[tuple[int | None, str | None]], *, guided_at: datetime | None = None,
+             exclude_search_id: UUID | None = None) -> Lookup:
+        """(노선 내부 ID, 패턴) 대상의 집계를 읽는다. 단계 정책이나 테이블이 없으면 읽지 않고 미확인으로 답한다.
+
+        guided_at을 주면 그 시각에 아직 끝나지 않은 안내 중 탑승도 읽어 1대당 재차에 더한다. exclude_search_id는 그
+        검색을 요청한 사용자 자신의 이동을 빼는 데 쓴다.
+        """
         wanted = [(route_id, key) for route_id, key in targets if route_id is not None and key]
         if policy is None or not wanted or not repository.tables_ready(conn):
             return cls(policy)
-        return cls(policy, repository.profiles_for(conn, wanted))
+        profiles = repository.profiles_for(conn, wanted)
+        guided: dict[tuple[int, str], list[levels.GuidedRide]] = {}
+        if guided_at is not None and profiles:
+            guided = {key: [levels.GuidedRide(**ride) for ride in rides]
+                      for key, rides in repository.guided_rides(conn, list(profiles), now=guided_at,
+                                                                exclude_search_id=exclude_search_id).items()}
+        return cls(policy, profiles, guided)
 
     def describe(self, route_id: int | None, pattern_key: str | None, *, at: datetime | None, from_seq: int | None,
-                 to_seq: int | None = None) -> dict[str, Any]:
+                 to_seq: int | None = None, vehicle_id: str | None = None) -> dict[str, Any]:
         if route_id is None or not pattern_key or from_seq is None:
             return levels.unavailable(levels.PROFILE_MISSING, self.policy)
         return levels.describe(self.profiles.get((route_id, pattern_key)), self.policy, at=at, from_seq=from_seq,
-                               to_seq=to_seq)
+                               to_seq=to_seq, guided=self.guided.get((route_id, pattern_key), ()),
+                               vehicle_id=vehicle_id)

@@ -18,13 +18,16 @@
 - 혼잡 비용: 버스 구간 비용 = 탑승시간 × m(단계). 탑승시간을 넘는 부분 탑승시간 × (m − 1)을 추천 비용의 내시균형 bias로
   더한다(ride_bias_seconds). 단계별 가중치 m은 배포 설정이며 없으면 0이다. 혼잡 정보가 없는 구간은 더하지 않는다
   (붐비지 않는 것으로 본 것과 같으므로, 집계가 없는 노선이 유리해진다는 점을 추천 이유로 남긴다).
+- 안내 인원: 앱이 지금 안내 중인 탑승(활성 이동의 선택 경로에서 아직 끝나지 않은 버스 구간)을 1대당 재차에 더한다
+  (guided_load). 같은 차량으로 안내한 탑승은 1명씩, 차량을 모르는 탑승은 같은 날짜·시간대일 때 1 ÷ 시간당 통과 횟수씩
+  더한다(그 시간대 차량에 고르게 탄다고 본다). 차량이 다르면 더하지 않는다. 더한 값은 guided_riders에 남긴다.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -32,7 +35,7 @@ from typing import Any
 from app.modules.congestion.aggregation import KST, day_type
 
 LEVELS = ("empty", "relaxed", "normal", "crowded", "very_crowded")
-RULE_VERSION = "seat-capacity-5/1"
+RULE_VERSION = "seat-capacity-5/2"   # /2: 안내 인원을 1대당 재차에 더한다
 EMPTY_SEAT_SHARE = 0.2
 
 NOT_CONFIGURED = "congestion_not_configured"
@@ -43,6 +46,32 @@ TIME_UNKNOWN = "congestion_time_unknown"
 
 # (요일유형, 시간대, 경유 순번) → 집계 행(dict: flow_mean, flow_p80, trips_per_hour, trips_source, sample_days, source_period)
 Profiles = Mapping[tuple[str, int, int], Mapping[str, Any]]
+
+
+@dataclass(frozen=True)
+class GuidedRide:
+    """앱이 안내 중인 탑승 한 건. 경유 순번 from_seq(포함)부터 to_seq(제외)까지 탄다."""
+
+    from_seq: int
+    to_seq: int
+    vehicle_id: str | None
+    board_at: datetime | None
+
+
+def guided_load(rides: Iterable[GuidedRide], *, seq: int, at: datetime, vehicle_id: str | None,
+                trips_per_hour: float | None) -> float:
+    """경유 순번 seq 구간에서, at 시각에 vehicle_id 차량을 타는 사람에게 더해지는 안내 인원(1대당)."""
+    total = 0.0
+    hour = at.astimezone(KST).replace(minute=0, second=0, microsecond=0)
+    for ride in rides:
+        if not ride.from_seq <= seq < ride.to_seq:
+            continue
+        if vehicle_id and ride.vehicle_id:
+            total += 1.0 if ride.vehicle_id == vehicle_id else 0.0
+        elif trips_per_hour and ride.board_at is not None and ride.board_at.tzinfo is not None and (
+                ride.board_at.astimezone(KST).replace(minute=0, second=0, microsecond=0) == hour):
+            total += 1.0 / trips_per_hour
+    return total
 
 
 @dataclass(frozen=True)
@@ -109,10 +138,12 @@ def _load(row: Mapping[str, Any]) -> tuple[float, str] | None:
 
 
 def describe(profiles: Profiles | None, policy: LevelPolicy | None, *, at: datetime | None, from_seq: int,
-             to_seq: int | None = None) -> dict[str, Any]:
+             to_seq: int | None = None, guided: Sequence[GuidedRide] = (),
+             vehicle_id: str | None = None) -> dict[str, Any]:
     """경유 순번 from_seq(포함)부터 to_seq(제외)까지 타는 구간의 예상 혼잡. to_seq가 없으면 from_seq 한 구간이다.
 
-    at은 그 구간을 타는 시각(시간대가 있는 값)이며 한국 시각의 요일유형·시간대로 행을 고른다.
+    at은 그 구간을 타는 시각(시간대가 있는 값)이며 한국 시각의 요일유형·시간대로 행을 고른다. guided는 같은 노선·패턴으로
+    안내 중인 탑승이고 vehicle_id는 타려는 차량이다(모르면 None).
     """
     if policy is None:
         return unavailable(NOT_CONFIGURED)
@@ -154,10 +185,15 @@ def describe(profiles: Profiles | None, policy: LevelPolicy | None, *, at: datet
         return unavailable(TIME_MISSING, policy)
     if not candidates:
         return unavailable(TRIPS_UNKNOWN, policy)
-    load, basis, seq, row = max(candidates, key=lambda item: (item[0], -item[2]))
+    scored = [(load + extra, basis, seq, row, extra)
+              for load, basis, seq, row in candidates
+              for extra in (guided_load(guided, seq=seq, at=at, vehicle_id=vehicle_id,
+                                        trips_per_hour=row["trips_per_hour"]) if guided else 0.0,)]
+    load, basis, seq, row, extra = max(scored, key=lambda item: (item[0], -item[2]))
     index = level_of(load, policy)
     return {
         "status": "available", "level": LEVELS[index - 1], "level_index": index, "load_per_vehicle": round(load, 1),
+        "guided_riders": round(extra, 2),
         "basis": basis, "stop_seq": seq, "day_type": kind, "hour": hour, "sample_days": row["sample_days"],
         "source_period": row["source_period"], "trips_per_hour": row["trips_per_hour"],
         "trips_source": row["trips_source"],

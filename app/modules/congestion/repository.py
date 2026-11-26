@@ -176,6 +176,60 @@ def profiles_for(conn: psycopg.Connection, targets: Iterable[tuple[int, str]]
     return result
 
 
+def guided_rides(conn: psycopg.Connection, targets: Iterable[tuple[int, str]], *, now: datetime,
+                 exclude_search_id: UUID | None = None) -> dict[tuple[int, str], list[dict[str, Any]]]:
+    """(노선 내부 ID, 패턴) → 앱이 안내 중인 탑승. 활성 이동의 선택 경로에서 아직 끝나지 않은 버스 구간이다.
+
+    계획한 하차 시각(없으면 승차 시각)이 now보다 앞이면 이미 끝난 탑승으로 보고 뺀다(종료하지 않고 방치된 이동 포함).
+    exclude_search_id를 주면 그 검색을 요청한 사용자의 이동은 세지 않는다(자기 자신의 탑승을 혼잡으로 더하지 않는다).
+    """
+    wanted = set(targets)
+    result: dict[tuple[int, str], list[dict[str, Any]]] = {}
+    if not wanted:
+        return result
+    rows = conn.execute(
+        """
+        SELECT leg, j.current_progress -> 'completed_bus_legs'
+          FROM app.journeys j, jsonb_array_elements(j.selected_snapshot -> 'legs') AS leg
+         WHERE j.lifecycle_status = 'active' AND leg ->> 'kind' = 'bus'
+           AND (%(search)s::uuid IS NULL OR j.user_id IS DISTINCT FROM
+                (SELECT s.user_id FROM app.route_searches s WHERE s.id = %(search)s::uuid))
+        """, {"search": exclude_search_id})
+    for leg, completed in rows:
+        key = (leg.get("route_internal_id"), leg.get("pattern_key"))
+        board_seq, alight_seq = (leg.get("board") or {}).get("seq"), (leg.get("alight") or {}).get("seq")
+        if key not in wanted or board_seq is None or alight_seq is None or leg.get("leg_index") in (completed or []):
+            continue
+        board_at = moment((leg.get("board_eta") or {}).get("predicted_arrival_at"))
+        ends_at = moment((leg.get("alight_eta") or {}).get("predicted_arrival_at")) or board_at
+        if ends_at is None or ends_at < now:
+            continue
+        result.setdefault(key, []).append({
+            "from_seq": int(board_seq), "to_seq": int(alight_seq), "board_at": board_at,
+            "vehicle_id": (leg.get("vehicle") or {}).get("vehicle_id")})
+    return result
+
+
+def ranked_candidates(conn: psycopg.Connection, search_id: UUID) -> list[dict[str, Any]]:
+    """검색의 순위 후보(순위 순): 정적 경로 키, 순위, 구간, 순위 계산에 쓴 시간(초)."""
+    rows = conn.execute(
+        "SELECT id, static_route_key, rank_no, legs, evaluation -> 'ranking' ->> 'time_seconds' "
+        "FROM app.route_candidates WHERE search_id = %s AND rank_no IS NOT NULL ORDER BY rank_no", (search_id,))
+    return [{"id": row[0], "static_route_key": row[1], "rank_no": row[2], "legs": row[3] or [],
+             "time_seconds": None if row[4] is None else float(row[4])} for row in rows]
+
+
+def moment(value: Any) -> datetime | None:
+    """ISO 8601 글자를 시간대가 있는 시각으로. 읽지 못하거나 시간대가 없으면 None."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
+
+
 def status(conn: psycopg.Connection) -> list[dict[str, Any]]:
     """노선별 원본 입력 현황과 집계 현황."""
     rows = conn.execute(

@@ -7,7 +7,7 @@ import unittest
 from datetime import date, datetime, timedelta, timezone
 
 from app.core.config import Settings
-from app.modules.congestion import aggregation, levels, service, source
+from app.modules.congestion import aggregation, equilibrium, levels, service, source
 from app.modules.congestion.aggregation import CountRow
 
 UTC = timezone.utc
@@ -309,6 +309,35 @@ class LevelTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Settings(_env_file=None, congestion_holidays="10월 9일")
 
+    def test_riders_the_app_is_guiding_are_added_to_the_load(self):
+        profiles = {("weekday", 9, seq): self.row(120) for seq in (3, 4, 5)}             # 구간마다 1대당 20명
+        plain = levels.describe(profiles, self.POLICY, at=self.THURSDAY_9, from_seq=3, to_seq=6)
+        self.assertEqual((plain["load_per_vehicle"], plain["level"], plain["guided_riders"]), (20.0, "relaxed", 0.0))
+        same_hour, next_hour = self.THURSDAY_9 + timedelta(minutes=10), self.THURSDAY_9 + timedelta(minutes=40)
+        rides = [levels.GuidedRide(1, 5, "대전75자1001", same_hour),      # 같은 차량: 구간 3·4를 함께 탄다
+                 levels.GuidedRide(4, 9, "대전75자1001", same_hour),      # 같은 차량: 구간 4·5
+                 levels.GuidedRide(3, 6, "대전75자2002", same_hour),      # 다른 차량: 더하지 않는다
+                 levels.GuidedRide(4, 5, None, same_hour),                # 차량 미확인·같은 시간대: 1 ÷ 시간당 6대
+                 levels.GuidedRide(4, 5, None, next_hour),                # 차량 미확인·다른 시간대(10시): 더하지 않는다
+                 levels.GuidedRide(6, 9, "대전75자1001", same_hour)]      # 하차한 뒤 구간: 겹치지 않는다
+        mine = levels.describe(profiles, self.POLICY, at=self.THURSDAY_9, from_seq=3, to_seq=6, guided=rides,
+                               vehicle_id="대전75자1001")
+        self.assertEqual((mine["stop_seq"], mine["guided_riders"], mine["load_per_vehicle"]), (4, 2.17, 22.2),
+                         "안내 인원이 가장 많이 겹치는 구간 4가 가장 붐빈다")
+        unknown = levels.describe(profiles, self.POLICY, at=self.THURSDAY_9, from_seq=3, to_seq=6, guided=rides)
+        self.assertEqual((unknown["stop_seq"], unknown["guided_riders"]), (4, 0.67),
+                         "타려는 차량을 모르면 같은 시간대 안내 인원 4명을 시간당 6대에 나눈다")
+        # 좌석 수 25명 경계에 걸친 구간은 안내 인원으로 단계가 올라간다.
+        edge = {("weekday", 9, 1): self.row(150)}
+        crowd = [levels.GuidedRide(1, 2, "v", same_hour)]
+        self.assertEqual(levels.describe(edge, self.POLICY, at=self.THURSDAY_9, from_seq=1)["level"], "relaxed")
+        bumped = levels.describe(edge, self.POLICY, at=self.THURSDAY_9, from_seq=1, guided=crowd, vehicle_id="v")
+        self.assertEqual((bumped["load_per_vehicle"], bumped["level"], levels.view(bumped)["guidedRiders"]),
+                         (26.0, "normal", 1.0))
+        lookup = service.Lookup(self.POLICY, {(7, "p"): edge}, {(7, "p"): crowd})
+        self.assertEqual(lookup.describe(7, "p", at=self.THURSDAY_9, from_seq=1, vehicle_id="v")["guided_riders"], 1.0)
+        self.assertEqual(lookup.describe(7, "p", at=self.THURSDAY_9, from_seq=1, vehicle_id="w")["guided_riders"], 0.0)
+
     def test_ride_bias_is_ride_time_times_level_weight_minus_one(self):
         settings = Settings(_env_file=None, congestion_seats=25, congestion_capacity=50,
                             congestion_cost_weights="1.0, 1.0,1.2,1.5,2.0")
@@ -329,6 +358,78 @@ class LevelTest(unittest.TestCase):
             with self.subTest(weights=wrong), self.assertRaises(ValueError):
                 Settings(_env_file=None, congestion_cost_weights=wrong)
         self.assertEqual(Settings(_env_file=None, congestion_cost_weights="").congestion_cost_weights, ())
+
+
+class EquilibriumTest(unittest.TestCase):
+    """균형 시뮬레이션: 후보를 고른 사람이 그 후보의 버스 구간 재차에 더해진다(로짓 선택, 연속평균법)."""
+
+    POLICY = levels.LevelPolicy(seats=25, capacity=50, min_sample_days=None, holidays=frozenset(),
+                                cost_weights=(1.0, 1.0, 1.2, 1.5, 2.0))
+
+    @staticmethod
+    def ride(route, *, seqs=(1, 2, 3), load=20.0, trips=6.0, seconds=900.0):
+        return equilibrium.Ride((route, "p"), seconds, tuple(equilibrium.Link(seq, load, trips) for seq in seqs))
+
+    def run_for(self, options, demand):
+        return equilibrium.simulate(options, self.POLICY, demand_per_hour=demand, theta=0.01, max_iterations=2000,
+                                    tolerance=0.001)
+
+    def test_small_demand_changes_nothing_and_large_demand_spreads_the_choice(self):
+        # A는 2분 빠르다. 두 노선 모두 1대당 20명(여유), 시간당 6대, 버스 탑승 15분.
+        options = [equilibrium.Option("A", 1200.0, (self.ride(1),)), equilibrium.Option("B", 1320.0, (self.ride(2),))]
+        few = self.run_for(options, 12)                       # 12명이 모두 타도 1대당 2명 → 단계가 바뀌지 않는다
+        a, b = few.options
+        self.assertEqual((few.converged, few.iterations, a.levels_at_equilibrium), (True, 1, ("relaxed",)))
+        self.assertEqual((a.share_all_to_best, b.share_all_to_best), (1.0, 0.0))
+        self.assertAlmostEqual(a.share_before, 0.7685, places=4)          # 1 ÷ (1 + e^(−0.01 × 120))
+        self.assertAlmostEqual(a.share_at_equilibrium, a.share_before)
+        self.assertEqual((a.cost_before, a.cost_at_equilibrium, b.cost_before), (1200.0, 1200.0, 1320.0))
+
+        many = self.run_for(options, 240)                     # 240명이 모두 A를 타면 1대당 60명(매우 혼잡)
+        a, b = many.options
+        self.assertLess(many.max_share("share_at_equilibrium"), many.max_share("share_before"))
+        self.assertLess(many.max_share("share_before"), many.max_share("share_all_to_best"))
+        self.assertAlmostEqual(a.share_at_equilibrium + b.share_at_equilibrium, 1.0)
+        self.assertAlmostEqual(a.share_at_equilibrium, 0.5625, delta=0.01,
+                               msg="B가 혼잡 단계로 넘어가는 경계(B 105명, A 135명)에 머문다")
+        self.assertGreater(a.cost_at_equilibrium, a.cost_before, "A를 고른 사람이 늘어 A의 비용이 오른다")
+        self.assertEqual(a.levels_before, ("relaxed",))
+        self.assertFalse(many.converged, "가중치가 계단 함수라 경계에서는 정확히 같아지지 않는다(gap으로 알린다)")
+        self.assertGreater(many.gap, 0.001)
+
+    def test_options_sharing_a_link_load_each_other(self):
+        shared = [equilibrium.Option("A", 1200.0, (self.ride(1),)),
+                  equilibrium.Option("C", 1260.0, (self.ride(1, seqs=(2, 3, 4)),)),
+                  equilibrium.Option("B", 1500.0, (self.ride(2),))]
+        flows = equilibrium.link_flows(shared, [100.0, 50.0, 90.0])
+        self.assertEqual((flows[(1, "p", 1)], flows[(1, "p", 2)], flows[(1, "p", 4)], flows[(2, "p", 1)]),
+                         (100.0, 150.0, 50.0, 90.0), "구간 2·3은 A와 C가 함께 지난다")
+        costs, names = equilibrium.option_costs(shared, [100.0, 50.0, 90.0], self.POLICY)
+        # 노선 1의 구간 2·3: 20 + 150 ÷ 6 = 45명(혼잡, ×1.5). 노선 2: 20 + 90 ÷ 6 = 35명(보통, ×1.2).
+        self.assertEqual((costs, names), ([1650.0, 1710.0, 1680.0], [("crowded",), ("crowded",), ("normal",)]))
+        result = self.run_for(shared, 240)
+        self.assertTrue(result.converged)
+        before = {o.option_id: o.share_before for o in result.options}
+        after = {o.option_id: o.share_at_equilibrium for o in result.options}
+        self.assertGreater(after["B"], before["B"] * 5, "겹치는 노선 1이 붐벼 느린 B로 옮겨 간다")
+        self.assertAlmostEqual(sum(after.values()), 1.0)
+
+    def test_unknown_legs_cost_nothing_and_inputs_are_checked(self):
+        unknown = equilibrium.Ride((9, "p"), 600.0, (), ("no_congestion_estimate",))
+        options = [equilibrium.Option("A", 1000.0, (unknown,)), equilibrium.Option("B", 1000.0, (self.ride(2),))]
+        result = self.run_for(options, 600)
+        a, b = result.options
+        self.assertEqual((a.levels_at_equilibrium, a.cost_at_equilibrium, a.assumed),
+                         ((None,), 1000.0, ("no_congestion_estimate",)))
+        self.assertGreater(a.share_at_equilibrium, b.share_at_equilibrium, "혼잡을 모르는 후보로 쏠린다")
+        self.assertEqual(equilibrium.logit_shares([100.0, 100.0], 0.01), [0.5, 0.5])
+        self.assertEqual(self.run_for([], 10).options, ())
+        with self.assertRaises(ValueError):
+            equilibrium.simulate(options, LevelTest.POLICY, demand_per_hour=10, theta=0.01, max_iterations=10,
+                                 tolerance=0.01)                       # 가중치 설정이 없는 정책
+        with self.assertRaises(ValueError):
+            equilibrium.simulate(options, self.POLICY, demand_per_hour=0, theta=0.01, max_iterations=10,
+                                 tolerance=0.01)
 
 
 class StopMappingTest(unittest.TestCase):
