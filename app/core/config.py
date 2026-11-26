@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     # TAGO_SERVICE_KEY를 쓴다(해당 API 활용신청이 승인돼 있어야 한다). 현재는 devtools 확인 URL에서만 쓴다.
     daejeon_bus_service_key: SecretStr | None = Field(default=None, validation_alias="DAEJEON_BUS_SERVICE_KEY")
     daejeon_bus_timeout_seconds: float = Field(default=10.0, gt=0)
+    # 대전시 노선 위치(getBusPosByRtid) ARR_TIME의 뜻. 도착 시각인지 출발 시각인지 확인하지 못했으므로 기본은 unverified다.
+    # unverified면 그 정류소의 ARR_TIME을 도착 시각으로 쓰지 않고 앞뒤 정류소 기록 사이의 범위로만 도착을 남긴다.
+    # arrival은 점 시각으로, departure는 [직전 정류소 ARR_TIME, 그 정류소 ARR_TIME] 범위로 쓴다(app.modules.transit.arrival_events).
+    daejeon_position_arr_time_meaning: Literal["unverified", "arrival", "departure"] = "unverified"
 
     # 서비스별 승인 호출 한도. 계정에서 확인한 값이 없으므로 기본값을 두지 않으며 None은 '미확인'이다.
     # 공개 포털의 개발 트래픽 표기를 이 계정의 승인값으로 사용하지 않는다.

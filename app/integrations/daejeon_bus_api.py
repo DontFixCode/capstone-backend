@@ -1,11 +1,18 @@
-"""대전광역시 버스 도착정보 API(공공데이터포털 apis.data.go.kr/6300000/arrive) 클라이언트.
+"""대전광역시 버스 API(공공데이터포털 apis.data.go.kr/6300000) 클라이언트: 도착정보(arrive)와 노선 위치(busposinfo).
 
-실시간 도착정보의 수집 원천이다(2026-11-09 사용자 결정으로 TAGO 도착정보를 대체, 위치·정적 정보는 TAGO 유지).
+도착정보는 실시간 도착정보의 수집 원천이다(2026-11-09 사용자 결정으로 TAGO 도착정보를 대체, 위치·정적 정보는 TAGO 유지).
 - arrivals_by_stop: 응답 원본 그대로(devtools 확인 URL용, 키만 가림).
 - fetch_arrivals: 수집용 해석. 확인된 응답 형식(ServiceResult > msgHeader·msgBody > itemList, 2026-11-09 실응답)을 읽는다.
   headerCd "0"만 정상으로 보고, 그 밖의 headerCd·공공데이터포털 게이트웨이 오류(returnReasonCode)·HTTP 오류는 실패다.
   운행 없음일 때의 결과 코드는 아직 확인하지 못했다(Notion Backend > 검증 대기 항목). itemPageCnt가 currentPage보다 크면
   전체 페이지를 받지 못한 것이므로 partial이다.
+
+노선 위치(getBusPosByRtid, 조회 조건 busRouteId = 대전시 ROUTE_CD)는 ETA 오차 표본 수집에만 쓴다(워커, 설정으로 켬).
+노선당 요청 1회에 운행 중인 차량이 모두 온다.
+- positions_by_route: 응답 원본 그대로(키만 가림).
+- fetch_route_positions: 수집용 해석. 인증키·오류 처리는 도착정보와 같다. 운행 중인 차량이 없으면 headerCd "4"
+  ('결과가 없습니다.', itemCnt 0)가 오므로(2026-11-27 05:32 KST 실조회) 이 조회에서는 오류가 아닌 빈 결과로 본다.
+  잘못된 노선 ID와는 응답으로 구분되지 않는다.
 
 인증키는 요청 직전에만 쓰고, 응답 본문·오류 메시지에 키가 되돌아오면 그 부분만 가린다. httpx 요청 로그에는 키가 담긴
 URL이 남으므로 경고 이상만 출력한다.
@@ -28,6 +35,10 @@ if TYPE_CHECKING:
 
 BASE_URL = "https://apis.data.go.kr/6300000/arrive"
 ARRIVALS_BY_STOP = "getArrInfoByStopID"
+POSITIONS_BASE_URL = "https://apis.data.go.kr/6300000/busposinfo"
+POSITIONS_BY_ROUTE = "getBusPosByRtid"
+# 노선 위치 조회에서 '결과 없음'을 뜻하는 headerCd. 항목이 없을 때만 빈 결과로 본다.
+POSITIONS_EMPTY_HEADER_CODES = ("4",)
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -43,7 +54,10 @@ class DaejeonBusConfigError(RuntimeError):
 
 @dataclass
 class ArrivalsPage:
-    """수집용 해석 결과 1건(요청 1회). status: success / empty / partial / error / timeout."""
+    """수집용 해석 결과 1건(요청 1회). status: success / empty / partial / error / timeout.
+
+    도착정보와 노선 위치 조회가 같은 응답 틀(ServiceResult > msgHeader·msgBody > itemList)이라 같은 형식을 쓴다.
+    """
 
     params: dict[str, str]
     requested_at: str
@@ -122,10 +136,20 @@ class DaejeonBusClient:
         params = {"BusStopID": bus_stop_id}
         return parse_arrivals(self._get(ARRIVALS_BY_STOP, params), params)
 
-    def _get(self, operation: str, params: dict[str, str]) -> RawResponse:
+    def positions_by_route(self, bus_route_id: str) -> RawResponse:
+        """노선별 버스 위치(getBusPosByRtid) 원본. 요청 1회, 재시도 없음."""
+        return self._get(POSITIONS_BY_ROUTE, {"busRouteId": bus_route_id}, base_url=POSITIONS_BASE_URL)
+
+    def fetch_route_positions(self, bus_route_id: str) -> ArrivalsPage:
+        """노선별 버스 위치를 수집용으로 해석한다. 요청 1회, 재시도 없음(다음 수집 주기에 다시 조회)."""
+        return parse_positions(self.positions_by_route(bus_route_id), {"busRouteId": bus_route_id})
+
+    def _get(self, operation: str, params: dict[str, str], *, base_url: str | None = None) -> RawResponse:
+        """base_url을 주면 그 서비스의 상세기능을 부른다(없으면 도착정보). 인증키·오류 처리는 같다."""
         result = RawResponse(requested_at=_utc_now())
+        url = f"/{operation}" if base_url is None else f"{base_url}/{operation}"
         try:
-            response = self._http.get(f"/{operation}", params={"serviceKey": self._service_key, **params})
+            response = self._http.get(url, params={"serviceKey": self._service_key, **params})
         except httpx.TimeoutException as exc:
             result.error = {"category": "timeout", "message": f"응답 제한시간 초과 ({type(exc).__name__})"}
             return result
@@ -148,6 +172,15 @@ _HEADER_TAGS = ("headerCd", "headerMsg", "itemCnt", "currentPage", "itemPageCnt"
 
 
 def parse_arrivals(raw: RawResponse, params: dict[str, str]) -> ArrivalsPage:
+    return _parse_items(raw, params)
+
+
+def parse_positions(raw: RawResponse, params: dict[str, str]) -> ArrivalsPage:
+    """노선 위치 응답. 항목 없이 온 headerCd "4"(결과 없음)는 운행 차량이 없는 빈 결과로 본다."""
+    return _parse_items(raw, params, empty_header_codes=POSITIONS_EMPTY_HEADER_CODES)
+
+
+def _parse_items(raw: RawResponse, params: dict[str, str], *, empty_header_codes: tuple[str, ...] = ()) -> ArrivalsPage:
     page = ArrivalsPage(params=dict(params), requested_at=raw.requested_at, received_at=raw.received_at,
                         http_status=raw.http_status, status="error")
     if raw.error is not None:
@@ -178,11 +211,15 @@ def parse_arrivals(raw: RawResponse, params: dict[str, str]) -> ArrivalsPage:
         page.error = page.error or "parse: XML 응답이 아님"
         return page
     page.provider_code = page.header.get("headerCd")
+    items = [{_local(child.tag): (child.text or "").strip() for child in element}
+             for element in root.iter() if _local(element.tag) == "itemList" and len(element) > 0]
+    if page.provider_code in empty_header_codes and not items and not page.item_count:
+        page.status = "empty"
+        return page
     if page.provider_code != "0":
         page.error = f"provider: headerCd={page.provider_code} {page.header.get('headerMsg') or ''}".strip()
         return page
-    page.items = [{_local(child.tag): (child.text or "").strip() for child in element}
-                  for element in root.iter() if _local(element.tag) == "itemList" and len(element) > 0]
+    page.items = items
     current, total_pages = page.header.get("currentPage"), page.header.get("itemPageCnt")
     if current and total_pages and current.isdigit() and total_pages.isdigit() and int(total_pages) > int(current):
         page.status = "partial"
