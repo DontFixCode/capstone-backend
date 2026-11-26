@@ -43,6 +43,7 @@ from app.integrations import route_shapes_api
 from app.integrations.daejeon_bus_api import DaejeonBusClient, DaejeonBusConfigError
 from app.integrations.odsay_api import OdsayClient, OdsayConfigError
 from app.integrations.supabase_auth import SupabaseAuthAdmin, load_auth_admin
+from app.modules.congestion import service as congestion_service
 from app.modules.transit import repository as transit_repository
 from app.modules.users import service as user_service
 from app.modules.transit.service import RealtimeCollector, StaticImportService, latest_snapshot, utc_now
@@ -62,6 +63,7 @@ class PassResult:
     outcomes: list[dict[str, Any]] = field(default_factory=list)
     static: dict[str, Any] | None = None
     shapes: dict[str, Any] | None = None
+    congestion: list[dict[str, Any]] | None = None
     labels: dict[str, int] | None = None
     next_wake_at: datetime | None = None
 
@@ -164,6 +166,7 @@ class Worker:
                                  "problems": [asdict(p) for p in report.problems]}
                 logger.info("정적 갱신: %s", report.status)
                 result.shapes = self.collect_route_shapes(settings, db)
+                result.congestion = self.refresh_congestion(settings, db)
                 with db.transaction() as conn:
                     _, due_at = scheduler.static_due(conn, settings.static_refresh_interval_seconds, self.clock())
             wake_candidates.append(due_at)
@@ -222,6 +225,24 @@ class Worker:
         poll_limit = self.clock() + timedelta(seconds=settings.worker_poll_seconds)
         result.next_wake_at = min([poll_limit, *wake_candidates])
         return result
+
+    def refresh_congestion(self, settings: Settings, db: Database) -> list[dict[str, Any]] | None:
+        """승하차 원본이 있는 노선의 혼잡 집계를 다시 만든다(하루 1회, 정적 갱신 직후, 외부 호출 없음).
+
+        집계는 패턴(정류소 순서)별로 저장하므로 정적 갱신으로 순서가 바뀐 노선은 다시 집계해야 조회된다. 집계 창의 이동도
+        함께 반영된다. 집계 창 설정이 없거나 테이블이 없으면 아무것도 하지 않고, 실패해도 수집 루프는 계속한다.
+        """
+        if settings.congestion_window_months is None:
+            return None
+        try:
+            reports = congestion_service.aggregate_all(db, settings, now=self.clock())
+        except Exception:
+            logger.exception("혼잡 집계 중 오류. 다음 정적 갱신 때 다시 시도합니다.")
+            return None
+        for report in reports:
+            logger.info("혼잡 집계 노선 %s: %s (행 %s, 사유 %s)", report.get("route_no"), report.get("status"),
+                        report.get("saved"), report.get("reason"))
+        return reports
 
     def collect_route_shapes(self, settings: Settings, db: Database) -> dict[str, Any] | None:
         """버스 노선 형상 수집(하루 1회, 정적 갱신 직후). 실패해도 수집 루프는 계속한다. 제공처 미설정이면 None.

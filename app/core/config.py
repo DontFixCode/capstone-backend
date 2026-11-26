@@ -4,6 +4,7 @@
 DB 이름·비밀번호는 app/db/session.py가 루트 .env에서 직접 읽고, 접속 위치·계정은 여기(BACKEND_DB_*)서 읽는다.
 """
 
+from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -181,6 +182,54 @@ class Settings(BaseSettings):
     # 워커가 차단 대기 계정(deleted_at 있음·auth_blocked_at 없음)을 다시 시도하는 간격과 한 번에 처리할 최대 계정 수.
     auth_block_retry_interval_seconds: float = Field(default=300.0, gt=0)
     auth_block_retry_batch_size: int = Field(default=20, ge=1, le=500)
+
+    # ---- 예상 혼잡도 (Phase 8) ----
+    # 근거 없는 기본값을 두지 않는다. 비어 있으면 그 값이 필요한 기능이 사유와 함께 멈춘다(.env.api.example의 가정값 참고).
+    # 집계 창: 집계 시점 기준 직전 n개월의 승하차 원본만 쓴다. 비우면 집계를 실행하지 않는다.
+    congestion_window_months: int | None = Field(default=None, gt=0, le=36)
+    # 표본 일수가 이 값보다 적으면 상위 80퍼센타일을 만들지 않고 응답에 신뢰도 낮음(lowConfidence)을 표시한다.
+    congestion_min_sample_days: int | None = Field(default=None, gt=0)
+    # 1대당 좌석 수·정원(단계 문턱값의 경계). 둘 다 있어야 혼잡 단계를 만든다. 실제 차량 제원으로 교체한다.
+    congestion_seats: int | None = Field(default=None, gt=0)
+    congestion_capacity: int | None = Field(default=None, gt=0)
+    # 공휴일(YYYY-MM-DD, 쉼표 구분). 일요일과 함께 holiday 요일유형으로 집계·조회한다.
+    congestion_holidays: Annotated[tuple[date, ...], NoDecode] = ()
+    # 혼잡 단계별 탑승시간 가중치 5개(버스 전세, 여유, 보통, 혼잡, 매우 혼잡 순, 쉼표 구분, 각 1 이상).
+    # 추천 비용의 내시균형 bias = Σ 버스 탑승시간 × (가중치 − 1). 비우면 혼잡을 순위에 반영하지 않는다(bias 0).
+    congestion_cost_weights: Annotated[tuple[float, ...], NoDecode] = ()
+
+    @field_validator("congestion_cost_weights", mode="before")
+    @classmethod
+    def split_cost_weights(cls, value: object) -> object:
+        if value is None:
+            return ()
+        parts = value.split(",") if isinstance(value, str) else list(value)
+        weights = tuple(float(str(part).strip()) for part in parts if str(part).strip())
+        if weights and (len(weights) != 5 or any(not 1.0 <= weight < float("inf") for weight in weights)
+                        or list(weights) != sorted(weights)):
+            raise ValueError("혼잡 단계별 가중치는 1 이상이고 단계가 높을수록 크거나 같은 값 5개여야 합니다.")
+        return weights
+
+    @field_validator("congestion_holidays", mode="before")
+    @classmethod
+    def split_holidays(cls, value: object) -> object:
+        """쉼표 구분 날짜 문자열을 중복 없는 날짜 목록으로 바꾼다. 형식이 틀리면 설정 오류로 알린다."""
+        if value is None:
+            return ()
+        parts = value.split(",") if isinstance(value, str) else list(value)
+        days = {date.fromisoformat(str(part).strip()) if not isinstance(part, date) else part
+                for part in parts if str(part).strip()}
+        return tuple(sorted(days))
+
+    @field_validator(
+        "congestion_window_months", "congestion_min_sample_days", "congestion_seats", "congestion_capacity",
+        mode="before",
+    )
+    @classmethod
+    def blank_congestion_setting_is_missing(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
 
     @field_validator(
         "search_max_boardings", "search_access_radius_meters", "search_transfer_radius_meters",

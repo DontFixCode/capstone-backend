@@ -9,6 +9,8 @@
   (기본 30분, 재조회 시 연장). 만료되면 집계에서 빠지고 다른 수요가 있으면 그 수요로 수집이 이어진다.
 - 활성 이동: 재평가가 예약된 active journeys의 선택 경로 중 남은 버스 구간 승하차 정류소·노선. 백그라운드·연결 단절에도
   유지하고, 사용자가 완료·취소하면(예약 해제) 빠진다.
+- 혼잡도: 승하차 원본이 입력된 노선의 위치. 시간대별 실제 통과 횟수를 세려면 운행 시간 내내 쌓여야 하므로 상시 수집한다
+  (노선 하나에 수집 간격마다 TAGO 위치 조회 1건).
 같은 조회 조건은 출처가 여러 개여도 한 번만 수집한다.
 """
 
@@ -19,6 +21,7 @@ from datetime import datetime
 import psycopg
 
 from app.core.config import Settings
+from app.modules.congestion import service as congestion_service
 from app.modules.journeys import repository as journey_repository
 from app.modules.routing import repository as search_repository
 from app.modules.transit import repository as transit_repository
@@ -86,4 +89,5 @@ def collection_targets(settings: Settings, conn: psycopg.Connection | None = Non
         groups.append(search_targets(conn, now))
         groups.append(journey_targets(conn))
         groups.append(view_targets(conn, now))
+        groups.append(congestion_service.position_targets(conn))
     return merge_targets(groups)

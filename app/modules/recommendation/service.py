@@ -1,13 +1,17 @@
 """추천 모드 선택·비용 계산·정렬·추천 이유 생성을 담당한다. 추천 유지·변경 판단은 이동 관리 구현 때 추가한다.
 
-초기 모드는 nominal이고 사용자 맞춤형·내시균형 bias는 0이다. 비교 대상 전체를 같은 조건으로 평가할 수 있을 때만
+초기 모드는 nominal이고 사용자 맞춤형 bias는 0이다. 비교 대상 전체를 같은 조건으로 평가할 수 있을 때만
 expected를 적용하며, 한 순위에서 두 모드의 시간을 섞지 않는다. 비용에 확률을 넣지 않으므로 성공 확률과 추천 점수는
 별개의 값이다.
+
+내시균형 bias는 호출자가 후보별로 준 혼잡 비용(초)이다(2026-11-27 사용자 결정: 버스 탑승시간 × (혼잡 단계 가중치 − 1),
+congestion.levels.ride_bias_seconds). 순위 모드를 따로 두지 않고 선택한 모드의 시간에 더해 비용으로 정렬한다. 값을 주지
+않은 후보는 0이다. 붐비는 경로의 비용을 올려 한 경로로 쏠리지 않게 하는 추천 방식이며, 균형 배분을 계산한 결과는 아니다.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from app.modules.evaluation.schemas import EvaluatedCandidate, EvaluationResult
 from app.modules.recommendation.schemas import (
@@ -49,8 +53,11 @@ def select_ranking_mode(
     return "expected", ("expected_time_available_for_group",)
 
 
-def recommend_candidates(evaluation: EvaluationResult) -> RecommendationResult:
+def recommend_candidates(evaluation: EvaluationResult,
+                         equilibrium_bias: Mapping[str, float] | None = None) -> RecommendationResult:
     """평가 결과를 한 모드로 정렬해 추천 묶음을 만든다.
+
+    equilibrium_bias는 후보(timed_candidate_id)별 내시균형 bias(초, 혼잡 비용)이며 비용에 더한다. 없는 후보는 0이다.
 
     nominal·expected 모두 비용 → 환승 횟수 → 도보시간 → 안정적인 후보 ID 순이다. 순위에 들지 못한 후보는 숫자를
     채우지 않고 이유와 함께 제외 목록으로 반환한다.
@@ -74,9 +81,10 @@ def recommend_candidates(evaluation: EvaluationResult) -> RecommendationResult:
         else:
             excluded.append(_excluded(item, mode, later_estimate=item.timed_candidate_id in later_estimates))
 
-    ordered = sorted(rankable, key=lambda item: _sort_key(item, mode))
+    bias = equilibrium_bias or {}
+    ordered = sorted(rankable, key=lambda item: _sort_key(item, mode, bias.get(item.timed_candidate_id, 0.0)))
     ranked = tuple(
-        _ranked(item, rank, mode, ordered[rank] if rank < len(ordered) else None)
+        _ranked(item, rank, mode, ordered[rank] if rank < len(ordered) else None, bias)
         for rank, item in enumerate(ordered, start=1)
     )
 
@@ -149,8 +157,8 @@ def _time_for_mode(item: EvaluatedCandidate, mode: RankingMode) -> float | None:
     return None
 
 
-def _sort_key(item: EvaluatedCandidate, mode: RankingMode) -> tuple:
-    cost = recommendation_cost(_time_for_mode(item, mode))
+def _sort_key(item: EvaluatedCandidate, mode: RankingMode, equilibrium_bias_seconds: float = 0.0) -> tuple:
+    cost = recommendation_cost(_time_for_mode(item, mode), equilibrium_bias_seconds=equilibrium_bias_seconds)
     # 배차간격 예상은 실제 출발과 수 분 차이 날 수 있어, 실시간 예측만으로 계산된 후보를 먼저 둔다.
     return uses_headway_estimate(item), cost, item.transfer_count, item.walk_seconds, item.timed_candidate_id
 
@@ -160,13 +168,18 @@ def _ranked(
     rank: int,
     mode: RankingMode,
     following: EvaluatedCandidate | None,
+    bias: Mapping[str, float] | None = None,
 ) -> RankedCandidate:
     time_seconds = _time_for_mode(item, mode)
+    bias = bias or {}
+    equilibrium = bias.get(item.timed_candidate_id, 0.0)
     reasons = [f"ranked_by_{mode}_cost"]
+    if equilibrium > 0:
+        reasons.append("congestion_bias_applied")
     if rank == 1:
         reasons.append("recommended_lowest_cost")
         if following is not None:
-            reasons.extend(_tie_break_reasons(item, following, mode))
+            reasons.extend(_tie_break_reasons(item, following, mode, bias))
     if item.connection_status == "negative_slack":
         reasons.append("nominal_connection_negative_slack")
     if uses_headway_estimate(item):
@@ -182,8 +195,8 @@ def _ranked(
         ranking_mode=mode,
         time_seconds=time_seconds,
         user_bias_seconds=0.0,
-        equilibrium_bias_seconds=0.0,
-        cost_seconds=recommendation_cost(time_seconds),
+        equilibrium_bias_seconds=equilibrium,
+        cost_seconds=recommendation_cost(time_seconds, equilibrium_bias_seconds=equilibrium),
         transfer_count=item.transfer_count,
         walk_seconds=item.walk_seconds,
         first_boarding_probability=item.first_boarding_probability,
@@ -193,9 +206,16 @@ def _ranked(
     )
 
 
-def _tie_break_reasons(item: EvaluatedCandidate, following: EvaluatedCandidate, mode: RankingMode) -> list[str]:
+def _tie_break_reasons(item: EvaluatedCandidate, following: EvaluatedCandidate, mode: RankingMode,
+                       bias: Mapping[str, float] | None = None) -> list[str]:
     """1위와 2위의 비용이 같을 때 어떤 기준으로 갈렸는지 반환한다."""
-    if _time_for_mode(item, mode) != _time_for_mode(following, mode):
+    bias = bias or {}
+
+    def cost(candidate: EvaluatedCandidate) -> float:
+        return recommendation_cost(_time_for_mode(candidate, mode),
+                                   equilibrium_bias_seconds=bias.get(candidate.timed_candidate_id, 0.0))
+
+    if cost(item) != cost(following):
         return []
     if item.transfer_count != following.transfer_count:
         return ["tie_broken_by_transfer_count"]

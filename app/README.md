@@ -512,3 +512,21 @@ Phase 5(이동 중 재평가·대안 추천) 없이 동작하는 범위만 구�
 ## 자동 탑승 추정 (Phase 7)
 
 `migrations/12_journey_presence.sql`은 추정에 필요한 짧은 GPS 표본을 저장한다. 표본은 이동 종료 시 지우고, 계속 이동하는 동안 새 위치를 받을 때 5분보다 오래된 표본을 정리한다. 탑승 후보는 `guidance.boardingEstimate`에 반환하며 자동으로 탑승 확정 상태를 바꾸지 않는다. 상세 계약과 프론트엔드가 결정할 하차·환승 알림 항목은 [docs/phase7-auto-boarding-contract.md](../docs/phase7-auto-boarding-contract.md)에 있다.
+
+## 예상 혼잡도 (Phase 8, 측정 부분)
+
+`migrations/13_congestion.sql`은 승하차 원본 누적 테이블 `ridership_counts`와 조회용 집계 테이블 `congestion_profiles`를 만든다.
+관리자가 대전교통빅데이터플랫폼에서 받은 원본 파일(HTML 표 형식 `.xls`)을 `python -m scripts.import_ridership`로 입력하면 구간별
+승객 흐름을 집계하고, 경로 후보의 버스 구간(`legs[].congestion`)과 정류소 도착 목록(`items[].congestion`)에 5단계 예상 혼잡을
+내보낸다. 값은 "평소 이 시간대 예상"이며 실시간이 아니다. 좌석 수·정원·집계 창은 `.env.api`의 `BACKEND_CONGESTION_*`로 정하고
+(기본값 없음), `BACKEND_CONGESTION_COST_WEIGHTS`가 있으면 버스 탑승시간 × (단계 가중치 − 1)을 추천 비용의 내시균형 bias로 더해
+순위에 반영한다(`candidates[].cost`). 균형 시뮬레이션은 없다. 내려받는 절차, 계산식, 응답 형식, 설계 초안과 다른 점은
+[docs/phase8-congestion.md](../docs/phase8-congestion.md)에 있다.
+
+| 위치 | 책임 |
+| --- | --- |
+| `app/modules/congestion/source.py` | 플랫폼 원본 파일 해석·검증(글자만 읽고 합계 행으로 검산) |
+| `app/modules/congestion/aggregation.py` | 하차 보정·경유 순서 누적·요일유형별 평균과 p80·위치 관측 기반 통과 횟수(모자라면 배차간격) |
+| `app/modules/congestion/levels.py` | 조회 시점의 1대당 재차·5단계·대체 시간대·미확인 사유 |
+| `app/modules/congestion/service.py`, `repository.py` | 입력(중복 건너뜀)·노선별 집계 교체·검색과 도착 목록용 조회 |
+| `scripts/import_ridership.py` | 입력·집계·현황 CLI(기본은 미리 보기, `--execute`로 저장) |
