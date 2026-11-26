@@ -15,6 +15,14 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 IdList = Annotated[tuple[str, ...], NoDecode]
 
 
+def _split_numbers(value: object) -> tuple[float, ...]:
+    """쉼표 구분 숫자 문자열을 순서를 지킨 실수 목록으로 바꾼다. 비어 있으면 빈 목록(미설정)이다."""
+    if value is None:
+        return ()
+    parts = value.split(",") if isinstance(value, str) else list(value)
+    return tuple(float(str(part).strip()) for part in parts if str(part).strip())
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=Path(__file__).resolve().parents[2] / ".env.api",
@@ -105,6 +113,9 @@ class Settings(BaseSettings):
     eval_sample_policy_version: str | None = None
     eval_recovery_policy_version: str | None = None
     eval_segment_model_version: str | None = None
+    # 환승 여유시간 등급의 경계(초, "하한,상한"). 여유 m이 0 미만이면 missed, 0 이상 하한 미만 tight, 하한 이상 상한 미만
+    # moderate, 상한 이상 comfortable이다. 근거 있는 공통 수치가 없어 기본값을 두지 않으며, 비우면 등급을 만들지 않는다(null).
+    eval_slack_grade_thresholds_seconds: Annotated[tuple[float, ...], NoDecode] = ()
     # 최초 검색 결과·필요 실시간 대상의 유효기간(초). 이 동안 워커가 대상을 공유 수집한다.
     search_expires_seconds: float | None = None
     # TMAP 보행자 경로 searchOption(0 추천, 4 추천+대로우선, 10 최단, 30 최단+계단제외)과 검색당 최대 조회 수.
@@ -197,6 +208,14 @@ class Settings(BaseSettings):
     # 혼잡 단계별 탑승시간 가중치 5개(버스 전세, 여유, 보통, 혼잡, 매우 혼잡 순, 쉼표 구분, 각 1 이상).
     # 추천 비용의 내시균형 bias = Σ 버스 탑승시간 × (가중치 − 1). 비우면 혼잡을 순위에 반영하지 않는다(bias 0).
     congestion_cost_weights: Annotated[tuple[float, ...], NoDecode] = ()
+
+    @field_validator("eval_slack_grade_thresholds_seconds", mode="before")
+    @classmethod
+    def split_slack_grade_thresholds(cls, value: object) -> object:
+        numbers = _split_numbers(value)
+        if numbers and (len(numbers) != 2 or not 0 < numbers[0] < numbers[1] < float("inf")):
+            raise ValueError("환승 여유시간 등급 경계는 0 < 하한 < 상한인 초 값 2개여야 합니다.")
+        return numbers
 
     @field_validator("congestion_cost_weights", mode="before")
     @classmethod

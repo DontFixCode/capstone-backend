@@ -116,6 +116,9 @@ def evaluation_view(row: dict[str, Any]) -> dict[str, Any]:
         "transfers": [{
             "transferIndex": t.get("transfer_index"), "frontLegIndex": t.get("front_leg_index"),
             "nextLegIndex": t.get("next_leg_index"), "slackSeconds": t.get("slack_seconds"),
+            # 여유시간 등급(missed/tight/moderate/comfortable, 경계 설정이 없거나 시각 미확인이면 null)과, 여유에 제공처
+            # 예측이 아닌 ETA가 들어갔는지. 확률이 없어도 시간이 계산된 환승마다 준다.
+            "slackGrade": t.get("slack_grade"), "slackEstimated": t.get("slack_estimated"),
             "status": t.get("status"), "probability": t.get("probability"),
             "reasonCodes": t.get("reason") or [],
         } for t in ev.get("transfers") or []],

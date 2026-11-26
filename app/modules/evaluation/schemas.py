@@ -39,7 +39,10 @@ Probability = Annotated[float, Field(ge=0, le=1)]
 
 
 class EvaluationPolicy(SearchPolicy):
-    """평가 설정. 자료에 근거한 값이 정해지지 않았으므로 기본값을 두지 않으며 누락은 검증 오류다."""
+    """평가 설정. 자료에 근거한 값이 정해지지 않았으므로 기본값을 두지 않으며 누락은 검증 오류다.
+
+    끝의 선택 기능 설정만 None(끔)을 기본으로 둔다. 켰을 때 쓰는 수치는 모두 설정에서 받는다.
+    """
 
     search_horizon_seconds: PositiveFloat
     evaluation_budget_ms: PositiveInt
@@ -60,6 +63,8 @@ class EvaluationPolicy(SearchPolicy):
     sample_policy_version: Version
     recovery_policy_version: Version
     segment_model_version: Version
+    # 환승 여유시간 등급의 경계(하한, 상한 초). None이면 등급을 만들지 않는다(app.modules.evaluation.transfer.slack_grade).
+    slack_grade_thresholds_seconds: tuple[PositiveFloat, PositiveFloat] | None = None
 
 
 class WalkResult(FrozenSchema):

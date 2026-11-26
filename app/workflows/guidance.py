@@ -885,10 +885,7 @@ def compute_guidance(
                         fresh_transfers.append({"transfer_index": transfer_index,
                                                 "front_leg_index": merged_bus_indices[completed_count + transfer_index - 1],
                                                 "next_leg_index": merged_bus_indices[completed_count + transfer_index],
-                                                "slack_seconds": connection.slack_seconds if connection else None,
-                                                "status": connection.status if connection else None,
-                                                "probability": chosen_eval.transfer_probabilities[transfer_index - 1]
-                                                if transfer_index - 1 < len(chosen_eval.transfer_probabilities) else None,
+                                                **search_flow.transfer_summary(chosen_eval, transfer_index, policy),
                                                 "reason": list(connection.reason_codes) if connection else [],
                                                 "sample_id": None, "sample_reason": "reevaluated_during_journey",
                                                 "front_alight_eta": search_flow._jsonable(front.alight_eta)
@@ -983,6 +980,7 @@ def evaluation_snapshots(journey_id: UUID, candidate: dict[str, Any], *, selecti
             "static_route_key": candidate["static_route_key"], "option_key": candidate["option_key"],
             "sample_id": transfer.get("sample_id"), "sample_reason": transfer.get("sample_reason"),
             "predicted_probability": transfer.get("probability"), "slack_seconds": transfer.get("slack_seconds"),
+            "slack_grade": transfer.get("slack_grade"), "slack_estimated": transfer.get("slack_estimated"),
             "connection_status": transfer.get("status"), "reason_codes": transfer.get("reason") or [],
             "front_leg_index": transfer.get("front_leg_index"), "next_leg_index": transfer.get("next_leg_index"),
             "front_alight_eta": front.get("alight_eta"), "next_board_eta": nxt.get("board_eta"),

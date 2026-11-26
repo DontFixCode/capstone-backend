@@ -68,6 +68,7 @@ from app.modules.evaluation.schemas import (
     WalkResult,
 )
 from app.modules.evaluation.service import evaluate_candidates
+from app.modules.evaluation.transfer import slack_estimated, slack_grade
 from app.modules.recommendation.schemas import RecommendationResult
 from app.modules.recommendation.service import recommend_candidates, uses_headway_estimate
 from app.modules.routing import repository as search_repository
@@ -142,6 +143,8 @@ _REQUIRED = {
     "tmap_max_lookups_per_search": "BACKEND_TMAP_MAX_LOOKUPS_PER_SEARCH",
     "sample_label_deadline_seconds": "BACKEND_SAMPLE_LABEL_DEADLINE_SECONDS",
 }
+# 평가 정책의 선택 기능 설정. 켰을 때만 적용 설정(params)에 남겨, 꺼져 있으면 기존 설정 버전이 그대로다.
+_OPTIONAL_EVALUATION_SETTINGS = ("slack_grade_thresholds_seconds",)
 
 
 @dataclass(frozen=True)
@@ -194,6 +197,7 @@ def load_search_config(settings: Settings) -> SearchConfig:
             timing_policy_version=s.eval_timing_policy_version, sample_policy_version=s.eval_sample_policy_version,
             recovery_policy_version=s.eval_recovery_policy_version,
             segment_model_version=s.eval_segment_model_version,
+            slack_grade_thresholds_seconds=s.eval_slack_grade_thresholds_seconds or None,
         )
     except ValidationError as exc:
         fields = sorted({".".join(str(p) for p in error["loc"]) for error in exc.errors()})
@@ -201,9 +205,13 @@ def load_search_config(settings: Settings) -> SearchConfig:
     for name in ("search_expires_seconds", "sample_label_deadline_seconds", "tmap_max_lookups_per_search"):
         if getattr(s, name) <= 0:
             raise SearchConfigError(f"{_REQUIRED[name]}은 0보다 커야 합니다.")
+    evaluation_params = policy.model_dump()
+    for name in _OPTIONAL_EVALUATION_SETTINGS:
+        if evaluation_params[name] is None:
+            del evaluation_params[name]
     params = {
         "search_policy": search_policy.model_dump(),
-        "evaluation_policy": policy.model_dump(),
+        "evaluation_policy": evaluation_params,
         "search_expires_seconds": s.search_expires_seconds,
         "tmap": {"provider": WALK_PROVIDER, "searchOption": s.tmap_search_option,
                  "max_lookups_per_search": s.tmap_max_lookups_per_search},
@@ -979,9 +987,32 @@ def build_legs(candidate: StaticCandidate, evaluated: EvaluatedCandidate, walks:
     return legs, bus_indices
 
 
+def transfer_summary(evaluated: EvaluatedCandidate, transfer_index: int,
+                     policy: EvaluationPolicy | None) -> dict[str, Any]:
+    """환승 순번(1부터) 하나의 여유·판정·확률 저장 값. 최초 검색 후보와 이동 중 재평가 제안이 같은 값을 쓴다.
+
+    여유시간 등급은 확률이 없어도 시간이 계산된 환승마다 준다(경계 설정이 없으면 None). slack_estimated는 앞 차량 하차
+    ETA·다음 차량 승차 ETA 중 하나라도 제공처 예측이 아니면 True다.
+    """
+    t = transfer_index
+    connection = evaluated.connections[t] if t < len(evaluated.connections) else None
+    front_eta = evaluated.legs[t - 1].alight_eta if t - 1 < len(evaluated.legs) else None
+    next_eta = evaluated.legs[t].board_eta if t < len(evaluated.legs) else None
+    slack = connection.slack_seconds if connection else None
+    return {
+        "slack_seconds": slack,
+        "slack_grade": slack_grade(slack, policy.slack_grade_thresholds_seconds if policy else None),
+        "slack_estimated": slack_estimated(slack, front_eta, next_eta),
+        "status": connection.status if connection else None,
+        "probability": evaluated.transfer_probabilities[t - 1] if t - 1 < len(evaluated.transfer_probabilities)
+        else None,
+    }
+
+
 def candidate_row(candidate: StaticCandidate, evaluated: EvaluatedCandidate, recommendation: RecommendationResult,
                   walks, points, network_info, sample_ids: dict[tuple[str, int], str],
-                  sample_skips: dict[tuple[str, int], str], scene_id: str | None) -> dict[str, Any]:
+                  sample_skips: dict[tuple[str, int], str], scene_id: str | None,
+                  policy: EvaluationPolicy | None = None) -> dict[str, Any]:
     legs, bus_indices = build_legs(candidate, evaluated, walks, points, network_info)
     ranked = {item.timed_candidate_id: item for item in recommendation.ranked}
     excluded = {item.timed_candidate_id: item for item in recommendation.excluded}
@@ -991,10 +1022,7 @@ def candidate_row(candidate: StaticCandidate, evaluated: EvaluatedCandidate, rec
         connection = evaluated.connections[t] if t < len(evaluated.connections) else None
         transfers.append({
             "transfer_index": t, "front_leg_index": bus_indices[t - 1], "next_leg_index": bus_indices[t],
-            "slack_seconds": connection.slack_seconds if connection else None,
-            "status": connection.status if connection else None,
-            "probability": evaluated.transfer_probabilities[t - 1] if t - 1 < len(evaluated.transfer_probabilities)
-            else None,
+            **transfer_summary(evaluated, t, policy),
             "sample_id": sample_ids.get((evaluated.timed_candidate_id, t)),
             "sample_reason": sample_skips.get((evaluated.timed_candidate_id, t)),
             "reason": None if connection is None else (list(connection.reason_codes) or None),
@@ -1444,7 +1472,7 @@ class SearchWorkflow:
                 candidate_row(statics[item.static_candidate_id], item, recommendation, walks, points, network_info,
                               sample_ids, sample_skips,
                               str(scene_ids[scene_records[item.static_candidate_id].scene_key])
-                              if item.static_candidate_id in scene_records else None)
+                              if item.static_candidate_id in scene_records else None, policy=policy)
                 for item in timed
             ]
             summary.update({
