@@ -16,6 +16,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
@@ -512,6 +513,93 @@ class JourneyApiTest(Phase4TestCase):
         self.assertEqual(detail["guidanceStatus"], "current")
         self.assertNotIn(missed_vehicle,
                          [vehicle["vehicleId"] for vehicle in detail["guidance"]["nextBoarding"]["upcoming"]])
+
+    # ---- 다음 승차 안내: 도보 반영, 지나간 차량 제외, 놓친 뒤 다음 차량 (2026-11-26 프론트엔드 제보 재현)
+
+    def recalc(self, provider):
+        """모든 활성 이동을 지금 다시 계산한다. 배차간격은 요일·운행시간과 무관하게 10분으로 고정한다."""
+        self.query("UPDATE app.journeys SET next_recalc_at = now() WHERE lifecycle_status = 'active' RETURNING 1")
+        with mock.patch.object(flow, "applicable_headway_seconds", return_value=600.0):
+            self.worker(provider).run_jobs_pass()
+
+    def set_access_walk(self, jid, seconds, started_ago=0):
+        """출발 도보 시간을 바꾸고, 이동을 started_ago초 전에 시작한 것으로 둔다."""
+        started = datetime.now(UTC) - timedelta(seconds=started_ago)
+        self.query("UPDATE app.journeys SET selected_snapshot = jsonb_set(jsonb_set(selected_snapshot, "
+                   "'{legs,0,duration_seconds}', to_jsonb(%s::float8)), '{selected_at}', to_jsonb(%s::text)), "
+                   "started_at = %s WHERE id = %s RETURNING 1",
+                   (seconds, started.isoformat(), started, UUID(jid)))
+
+    def test_bus_leaving_before_the_walk_ends_is_not_guided(self):
+        journey, _, _ = self.start()
+        jid = journey["journeyId"]
+        one_bus = synthetic_provider(vehicles=1)   # 대전시 도착정보처럼 정류소·노선마다 다음 차량 한 대만
+        self.set_access_walk(jid, 600)             # 첫 정류소까지 도보 10분, 방금 출발
+        self.recalc(one_bus)
+        g = self.detail(jid)["guidance"]
+        nb = g["nextBoarding"]
+        ready, predicted = datetime.fromisoformat(nb["readyAt"]), datetime.fromisoformat(nb["predictedArrivalAt"])
+        self.assertGreater(ready, datetime.now(UTC) + timedelta(seconds=600), "도착 가능 시각에 도보 10분을 반영")
+        self.assertGreaterEqual(predicted, ready, "걸어가는 동안 떠나는 차량을 다음 차량으로 안내하지 않는다")
+        self.assertEqual((nb["vehicle"]["vehicleId"], nb["etaSource"], nb["estimated"]),
+                         (None, "headway_estimate", True), "응답에 없는 뒤 차량은 배차간격 예상으로 표시")
+        self.assertEqual([u["catchable"] for u in nb["upcoming"]], [False])
+        self.assertIn("access_walk_progress_assumed_from_elapsed_time", g["reasonCodes"])
+
+        self.set_access_walk(jid, 600, started_ago=700)   # 11분 넘게 지나 정류소에 닿은 뒤
+        self.recalc(one_bus)
+        g = self.detail(jid)["guidance"]
+        nb = g["nextBoarding"]
+        self.assertIsNotNone(nb["vehicle"]["vehicleId"], "도보 10분을 지금부터 다시 더하지 않고 곧 오는 차량을 안내")
+        self.assertEqual((nb["etaSource"], nb["estimated"], nb["connectionStatus"]), ("provider", False, "feasible"))
+        self.assertEqual([u["catchable"] for u in nb["upcoming"]], [True])
+        self.assertIsNotNone(g["arrival"]["plannedArrivalAt"])
+
+    def test_bus_that_already_passed_is_not_guided_as_next(self):
+        journey, _, _ = self.start()
+        jid = journey["journeyId"]
+
+        def stale(conn, targets, network, now):
+            """수집 간격 동안 재사용된 응답: 13분 전 기준이라 모든 예상 도착이 이미 지났다."""
+            rows = w.synthetic_eta_rows(network.patterns, basis_at=now - timedelta(seconds=800), vehicles=1)
+            return flow.RealtimeInputs([EtaReport(**row) for row in rows], frozenset(w.STOPS), {},
+                                       [("synthetic", "stale")], {})
+
+        self.recalc(stale)
+        nb = self.detail(jid)["guidance"]["nextBoarding"]
+        self.assertEqual(nb["upcoming"], [])
+        self.assertGreater(datetime.fromisoformat(nb["predictedArrivalAt"]), datetime.now(UTC),
+                           "이미 지난 시각을 다음 차량 도착으로 안내하지 않는다")
+        self.assertEqual((nb["vehicle"]["vehicleId"], nb["estimated"]), (None, True))
+
+    def test_missed_bus_without_vehicle_id_gets_the_next_bus(self):
+        journey, _, _ = self.start()
+        jid = journey["journeyId"]
+        one_bus = synthetic_provider(vehicles=1)
+        self.recalc(one_bus)
+        shown = self.detail(jid)["guidance"]["nextBoarding"]
+        self.assertIsNotNone(shown["vehicle"]["vehicleId"])
+        # 앱이 차량번호 없이 보내도 화면에 안내하던 차량을 놓친 것으로 기록한다.
+        self.assertEqual(self.event(jid, "missed_bus", 1, {"legIndex": shown["legIndex"]}).status_code, 200)
+        entry = self.query("SELECT current_progress FROM app.journeys WHERE id = %s",
+                           (UUID(jid),))[0][0]["missed_vehicles"][-1]
+        self.assertEqual((entry["vehicle_id"], entry["vehicle_basis"], entry["board_eta_at"]),
+                         (shown["vehicle"]["vehicleId"], "guidance", shown["predictedArrivalAt"]))
+        self.recalc(one_bus)
+        detail = self.detail(jid)
+        after = detail["guidance"]["nextBoarding"]
+        self.assertEqual(detail["guidanceStatus"], "current")
+        self.assertIsNotNone(after["predictedArrivalAt"], "놓친 뒤 다음 차량 안내가 비어 있지 않다")
+        self.assertEqual((after["vehicle"]["vehicleId"], after["estimated"]), (None, True))
+        first = datetime.fromisoformat(shown["predictedArrivalAt"])
+        second = datetime.fromisoformat(after["predictedArrivalAt"])
+        self.assertTrue(timedelta(seconds=595) <= second - first <= timedelta(seconds=660), second - first)
+        self.assertNotIn(shown["vehicle"]["vehicleId"], [u["vehicleId"] for u in after["upcoming"]])
+        # 예상 차량까지 놓쳤다고 하면 그 다음 차량으로 넘어간다.
+        self.assertEqual(self.event(jid, "missed_bus", 2, {"legIndex": after["legIndex"]}).status_code, 200)
+        self.recalc(one_bus)
+        third = datetime.fromisoformat(self.detail(jid)["guidance"]["nextBoarding"]["predictedArrivalAt"])
+        self.assertTrue(timedelta(seconds=595) <= third - second <= timedelta(seconds=605), third - second)
 
     def test_destination_change_queues_fresh_search_from_current_location(self):
         journey, _, _ = self.start()

@@ -405,6 +405,20 @@ uv run python -m app.workers.main                                    # 워커: �
   최소 개선량을 넘을 때만 `proposedRoute`를 만든다. `destination_changed`는 최신 위치로 일반 앱 경로 검색을 접수하고,
   워커 결과가 준비되면 현재 남은 버스 구간과 일치하는 경로를 기준으로 다시 비교한다. 위치가 오래됐거나 현재 경로와 비교할 수 없으면
   `guidanceStatus=current`, `guidance.status=data_limited`와 제한 사유를 반환한다. 탑승 중 목적지를 바꾸면 확인된 현재 탑승을 유지하고 하차 후 검색한다.
+- 다음 승차 안내(`guidance.nextBoarding`, 2026-11-26 수정):
+  - 정류소에 닿는 시각(`readyAt`)은 걷기 시작한 시각(이동 시작 또는 직전 하차) + 도보 + 준비시간이고, 그 시각이 지났거나 버스를
+    놓친 뒤(`waiting`)면 지금이다. 그 시각 이후에 탈 수 있는 차량만 `vehicle`·`predictedArrivalAt`에 넣는다. `upcoming`은 정류소
+    응답 그대로이며 항목마다 `catchable`로 탈 수 있는지 구분한다.
+  - 예상 도착이 이미 지난 응답과 놓쳤다고 알린 차량은 뺀다. `missed_bus`에 `vehicleId`가 없으면 그때 안내하던 차량(없으면 선택 경로의
+    계획 차량)을 놓친 것으로 기록한다.
+  - 정류소 응답에 탈 수 있는 차량이 없으면(대전시 도착정보는 정류소·노선마다 다음 한 대만 준다) 선택 당시 계획 차량의 시각, 또는
+    마지막으로 지나간 차량 시각 + 노선 배차간격으로 채운다. 이때 `estimated: true`이고 `etaSource`(`headway_estimate` 등)·
+    `etaReasonCodes`로 근거를 구분한다(검증 전 예상, 화면에 "예상" 표시). 그래도 없으면 `predictedArrivalAt: null`과
+    `next_boarding_no_catchable_vehicle`이다.
+  - 워커는 재계산 직전에 다음 승차 정류소(탑승 중이면 하차 정류소) 도착정보를 새로 받는다
+    (`BACKEND_JOURNEY_REALTIME_REFRESH_SECONDS`, 기본 60초 이내 값은 재사용, 상태 변경 직후는 항상 새로). 공유 수집 600초만 쓰면
+    이미 지나간 차량이 안내에 남는다. 활성 이동 1건·재계산 1회에 대전시 도착정보 호출이 최대 1건 늘어난다. 사용자 입력·위치·
+    스트림 연결이 `BACKEND_JOURNEY_REALTIME_REFRESH_IDLE_SECONDS`(기본 1800초) 넘게 없는 이동은 이 주기 갱신을 멈춘다.
 
 ### 장소 검색 (카카오 로컬 API)
 

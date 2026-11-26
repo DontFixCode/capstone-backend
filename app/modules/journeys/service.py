@@ -259,6 +259,10 @@ def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key:
                     any(k in payload for k in RESULT_CORRECTION_FIELDS):
                 raise JourneyError(422, "INVALID_CORRECTION", "result·actualConnection은 환승 결과 수정에만 쓸 수 있습니다.")
         resolved = _resolve_references(conn, journey_id, body.eventType, payload)
+        if body.eventType == "missed_bus":
+            guided = _guided_boarding(journey, payload.get("legIndex"))
+            if guided is not None:
+                resolved["guided"] = guided
         legs = (journey["selected_snapshot"] or {}).get("legs") or []
         proposed_snapshot = journey.get("proposed_snapshot") or {}
         if body.eventType in ("route_accepted", "route_rejected"):
@@ -368,6 +372,21 @@ def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key:
                                         received_at=now, state_version_after=version,
                                         payload=snapshot_payload, skip_existing=True)
         return {"event_id": event_id, "state_version_after": version, "replayed": False}
+
+
+def _guided_boarding(journey: dict[str, Any], leg_index: Any) -> dict[str, Any] | None:
+    """현재 상태 버전의 안내가 그 버스 구간에서 타라고 알려주던 차량과 승차 예상 시각. 그런 안내가 없으면 None.
+
+    앱이 차량번호 없이 '버스를 놓쳤어요'를 보내도 사용자가 화면에서 본 차량을 놓친 차량으로 기록하는 데 쓴다.
+    """
+    guidance = journey.get("guidance") or {}
+    boarding = guidance.get("next_boarding") or {}
+    if guidance.get("base_state_version") != journey["state_version"] or boarding.get("leg_index") != leg_index:
+        return None
+    if boarding.get("predicted_arrival_at") is None:
+        return None
+    return {"vehicle_id": (boarding.get("vehicle") or {}).get("vehicle_id"),
+            "predicted_arrival_at": boarding["predicted_arrival_at"]}
 
 
 def _resolve_references(conn, journey_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:

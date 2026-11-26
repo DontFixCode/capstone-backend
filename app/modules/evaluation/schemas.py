@@ -254,6 +254,9 @@ class EvaluationInputs(FrozenSchema):
     # (pattern_id, vehicle_id): 노선 위치상 뒤에 운행 중인 차량이 없는 맨 뒤 차량. 기점 정류소의 '다음 차량 출발 전' 응답은
     # 직전 차량번호를 주지 않으므로, 이 확인이 있을 때만 그 응답을 맨 뒤 차량 뒤가 출발 전이라는 근거로 쓴다.
     rear_vehicles: frozenset[tuple[str, str]] = frozenset()
+    # 호출자가 준비한 추가 차량 옵션. 같은 (패턴, 승차 위치, 하차 위치)의 탑승 구간 옵션 뒤에 붙인다. 이동 안내가 실시간
+    # 응답으로 탈 수 있는 차량을 찾지 못했을 때 선택 당시 계획 차량·배차간격 예상을 넣는 데만 쓴다(workflows.guidance).
+    extra_legs: tuple[TimedLeg, ...] = ()
 
 
 class TimedLeg(FrozenSchema):
@@ -405,3 +408,7 @@ class EvaluationResult(FrozenSchema):
     limited: tuple[EvaluatedCandidate, ...]
     search_coverage: SearchCoverage
     coverage: EvaluationCoverage
+
+
+# EvaluationInputs.extra_legs가 뒤에 정의된 TimedLeg를 참조하므로 모든 형식이 정의된 뒤에 확정한다.
+EvaluationInputs.model_rebuild()

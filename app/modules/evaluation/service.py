@@ -146,7 +146,7 @@ def evaluate_candidates(
 def _ride_legs(ride: StaticRide, shared: _SharedData) -> RideLegs:
     key = (ride.pattern_id, ride.board_position, ride.alight_position)
     if key not in shared.ride_legs:
-        shared.ride_legs[key] = build_ride_legs(
+        built = build_ride_legs(
             ride,
             shared.etas,
             shared.durations,
@@ -159,6 +159,15 @@ def _ride_legs(ride: StaticRide, shared: _SharedData) -> RideLegs:
             rear_vehicle_ids=frozenset(
                 vehicle for pattern_id, vehicle in shared.inputs.rear_vehicles if pattern_id == ride.pattern_id),
         )
+        extra = [leg for leg in shared.inputs.extra_legs
+                 if (leg.pattern_id, leg.board_position, leg.alight_position) == key]
+        if extra:
+            # 호출자가 준비한 옵션은 응답으로 만든 옵션 뒤에 순번을 이어 붙인다.
+            built = RideLegs(
+                legs=(*built.legs, *(leg.model_copy(update={"vehicle_rank": len(built.legs) + offset})
+                                     for offset, leg in enumerate(extra))),
+                reason_codes=built.reason_codes, horizon_excluded_count=built.horizon_excluded_count)
+        shared.ride_legs[key] = built
     return shared.ride_legs[key]
 
 

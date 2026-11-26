@@ -156,6 +156,11 @@ class Settings(BaseSettings):
     # 활성 이동 재평가 간격(Development Phase·Phase 3 Algorithms: 1분, 공유 수집 600초와 별개)과 계산 임대 시간.
     journey_recalc_interval_seconds: float = Field(default=60.0, gt=0)
     journey_recalc_lease_seconds: float = Field(default=120.0, gt=0)
+    # 이동 안내에 바로 쓰이는 도착정보(다음 승차 정류소, 탑승 중이면 하차 정류소)를 재계산 직전에 새로 받는 기준(초).
+    # 이 시간 안에 받은 값은 다시 받지 않는다. 공유 수집 600초만 쓰면 이미 지나간 차량이 안내에 남는다.
+    journey_realtime_refresh_seconds: float = Field(default=60.0, gt=0)
+    # 사용자 입력·위치·스트림 연결이 이 시간(초) 넘게 없는 이동은 위 주기 갱신을 멈춘다(상태가 바뀌면 다시 받는다).
+    journey_realtime_refresh_idle_seconds: float = Field(default=1800.0, gt=0)
     # 위치 최신성 기준(초). 비우면 평가 자료 최신성 기준 BACKEND_EVAL_MAX_DATA_AGE_SECONDS를 쓴다.
     journey_location_max_age_seconds: float | None = Field(default=None, gt=0)
     # 기기 시계 오차로 허용하는 미래 관측 시각(초). 이보다 미래인 위치는 422로 거부한다.

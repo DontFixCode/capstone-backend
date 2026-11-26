@@ -111,7 +111,8 @@ class Worker:
             walking_client_factory=self.walking_client_factory, realtime_provider=self.realtime_provider,
             daejeon_client_factory=self.daejeon_client_factory)
         journeys = recalculation.process_due_journeys(db, settings, clock=self.clock, network_cache=self.network_cache,
-                                                      realtime_provider=self.realtime_provider)
+                                                      realtime_provider=self.realtime_provider,
+                                                      daejeon_client_factory=self.daejeon_client_factory)
         return {"searches": searches, "journeys": journeys, "auth_blocks": self.retry_auth_blocks(settings, db)}
 
     def retry_auth_blocks(self, settings: Settings, db: Database, *, force: bool = False) -> list[dict[str, Any]]:
