@@ -231,9 +231,17 @@ class Worker:
         """
         if route_shapes_api.configured_provider(settings.route_shape_provider) is None:
             return None
+        # 정적 갱신으로 정류소 순서가 바뀐 노선은 저장해 둔 선에 다시 대응시킨다(외부 호출 없음). 아래 수집이 꺼져 있거나
+        # 실패해도 이미 받은 형상이 지도에서 사라지지 않게 한다.
+        remapped = None
+        try:
+            remap = route_shapes_flow.remap_stored(db, clock=self.clock)
+            remapped = {"remapped": len(remap["remapped"]), "remap_failed": len(remap["failed"])}
+        except Exception:
+            logger.exception("형상 재대응 중 오류. 다음 정적 갱신 때 다시 시도합니다.")
         if settings.odsay_daily_call_limit is None:
             logger.warning("형상 수집 건너뜀: BACKEND_ODSAY_DAILY_CALL_LIMIT이 비어 있습니다.")
-            return {"status": "skipped", "reason": "daily_call_limit_unset"}
+            return {"status": "skipped", "reason": "daily_call_limit_unset", **(remapped or {})}
         try:
             with self.shape_client_factory(settings) as client:
                 report = route_shapes_flow.collect(db, settings, client, refresh_all=True, clock=self.clock)

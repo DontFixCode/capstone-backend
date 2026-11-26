@@ -777,6 +777,12 @@ def pattern_stop_points(conn: psycopg.Connection,
     return result
 
 
+def route_shape_patterns(conn: psycopg.Connection, route_id: int) -> dict[str, Any]:
+    """노선에 저장된 패턴 형상 전체(좌표 포함). 예전 정류소 순서의 패턴 키도 그대로 들어 있다."""
+    row = conn.execute("SELECT shape_info -> 'patterns' FROM app.routes WHERE id = %s", (route_id,)).fetchone()
+    return row[0] if row and isinstance(row[0], dict) else {}
+
+
 def set_shape_provider(conn: psycopg.Connection, route_id: int, provider: dict[str, Any]) -> None:
     """형상 제공처 연결 정보만 바꾼다(저장된 패턴 형상은 그대로)."""
     conn.execute("UPDATE app.routes SET shape_info = shape_info || jsonb_build_object('provider', %s::jsonb) "

@@ -9,6 +9,8 @@
     uv run python -m scripts.import_route_shapes run --execute --max-calls 5
     uv run python -m scripts.import_route_shapes run --execute --refresh-all   # 저장된 형상도 모두 다시 받기
     uv run python -m scripts.import_route_shapes status                   # 확보 현황·최근 24시간 호출 수(외부 호출 없음)
+    uv run python -m scripts.import_route_shapes remap                    # 정류소 순서가 바뀐 노선의 재대응 계획(외부 호출 없음)
+    uv run python -m scripts.import_route_shapes remap --execute          # 저장해 둔 선에 다시 대응시켜 저장
 """
 
 from __future__ import annotations
@@ -59,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--refresh-all", action="store_true",
                      help="갱신 간격과 무관하게 연결된 노선의 형상을 모두 다시 받습니다(한 요청에 최대한 넣음).")
     sub.add_parser("status", help="형상 확보 현황과 최근 24시간 호출 수")
+    remap = sub.add_parser("remap", help="정류소 순서가 바뀌어 형상을 잃은 노선을 저장된 선에 다시 대응(외부 호출 없음)")
+    remap.add_argument("--execute", action="store_true", help="결과를 DB에 저장합니다(생략하면 계획만 출력).")
     return parser
 
 
@@ -90,6 +94,9 @@ def main(argv: list[str] | None = None) -> int:
         db = Database.from_settings(settings)
         if command == "status":
             _print(status(db, settings))
+            return 0
+        if command == "remap":
+            _print(route_shapes.remap_stored(db, dry_run=not args.execute))
             return 0
         with OdsayClient.from_settings(settings) as client:
             report = route_shapes.collect(db, settings, client, max_calls=args.max_calls,
