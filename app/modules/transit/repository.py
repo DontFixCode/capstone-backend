@@ -634,6 +634,24 @@ def arrival_predictions(conn: psycopg.Connection, *, route_id: int, stop_id: int
     return [dict(zip(keys, row)) for row in rows]
 
 
+def eta_error_collection_status(conn: psycopg.Connection, since: datetime | None = None) -> dict[str, Any]:
+    """ETA 오차 표본 수집 현황(읽기 전용): 대전시 위치 기록과 도출한 도착 이벤트의 수·최근 수집 시각."""
+    positions = conn.execute(
+        f"SELECT count(*), count(DISTINCT o.details ->> 'run_group'), max(o.collected_at) "
+        f"FROM app.transit_observations o WHERE {DAEJEON_POSITION_FILTER} "
+        "AND (%s::timestamptz IS NULL OR o.collected_at >= %s::timestamptz)", (since, since)).fetchone()
+    events = conn.execute(
+        "SELECT quality, count(*), max(collected_at) FROM app.transit_observations "
+        "WHERE kind = 'event' AND event_type = 'arrival' AND event_key LIKE 'daejeon-position-arrival:%%' "
+        "AND (%s::timestamptz IS NULL OR collected_at >= %s::timestamptz) GROUP BY quality ORDER BY quality",
+        (since, since)).fetchall()
+    return {
+        "position_records": {"count": positions[0], "runs": positions[1], "latest_collected_at": positions[2]},
+        "arrival_events": {"by_quality": {quality: count for quality, count, _ in events},
+                           "latest_collected_at": max((latest for _, _, latest in events), default=None)},
+    }
+
+
 def observations_for_fetches(conn: psycopg.Connection, fetch_ids: Sequence[int]) -> list[dict[str, Any]]:
     if not fetch_ids:
         return []

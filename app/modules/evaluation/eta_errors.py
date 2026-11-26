@@ -110,6 +110,64 @@ def build_error_samples(arrival: ObservedArrival, predictions: Iterable[ArrivalP
     return records
 
 
+QUANTILES = (0.1, 0.25, 0.5, 0.75, 0.9)
+
+
+def quantile(sorted_values: Sequence[float], q: float) -> float | None:
+    """정렬된 값의 분위수(선형 보간). 값이 없으면 None이다."""
+    if not sorted_values:
+        return None
+    position = (len(sorted_values) - 1) * q
+    below = int(position)
+    above = min(below + 1, len(sorted_values) - 1)
+    return sorted_values[below] + (sorted_values[above] - sorted_values[below]) * (position - below)
+
+
+def _distribution(values: Iterable[float]) -> dict[str, float] | None:
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    return {("median" if q == 0.5 else f"p{round(q * 100)}"): round(quantile(ordered, q), 1) for q in QUANTILES}
+
+
+def summarize_samples(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """표본 현황: 생성 방식·모델 버전·기준 시각 출처·잔여시간 구간별 표본 수(독립 운행 기준)와 오차 분포.
+
+    점 시각 표본의 오차 분포(exact)와, 전체 표본의 오차 하한 분포(lower)·상한 분포(upper)를 따로 낸다. 범위 표본을 중간값
+    같은 대표값으로 바꿔 한 분포로 합치지 않는다.
+    """
+    groups: dict[tuple, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        key = (row["eta_source"], row["model_version"], row["basis_source"], row["horizon_bucket"])
+        groups.setdefault(key, []).append(row)
+
+    def bucket_order(name: str) -> float:
+        try:
+            return float(name.rstrip("+").split("-")[0])
+        except ValueError:
+            return float("inf")
+
+    summary = []
+    for key in sorted(groups, key=lambda k: (k[0], k[1] or "", k[2] or "", bucket_order(k[3]), k[3])):
+        items = groups[key]
+        exact = [row for row in items if row["quality"] == "exact"]
+        summary.append({
+            "eta_source": key[0], "model_version": key[1], "basis_source": key[2], "horizon_bucket": key[3],
+            "samples": len(items), "independent_runs": len({row["run_group"] for row in items}),
+            "by_quality": {"exact": len(exact), "bounded": len(items) - len(exact)},
+            "error_seconds": {
+                "exact": _distribution(row["error_lower_seconds"] for row in exact),
+                "lower": _distribution(row["error_lower_seconds"] for row in items),
+                "upper": _distribution(row["error_upper_seconds"] for row in items),
+            },
+            "bounded_width_seconds": _distribution(row["error_upper_seconds"] - row["error_lower_seconds"]
+                                                   for row in items if row["quality"] != "exact"),
+            "latest_arrival_at": max(row["arrival_upper_at"] for row in items),
+            "latest_created_at": max(row["created_at"] for row in items),
+        })
+    return summary
+
+
 def error_samples(rows: Iterable[Mapping[str, Any]]) -> list[EtaErrorSample]:
     """DB 행을 평가 입력으로 바꾼다."""
     return [EtaErrorSample(

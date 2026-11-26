@@ -165,6 +165,20 @@ def eta_error_samples(conn: psycopg.Connection, *, eta_sources: Sequence[str], s
     return [dict(zip(_ETA_ERROR_COLUMNS, row)) for row in rows]
 
 
+_ETA_ERROR_STATUS_COLUMNS = ("run_group", "eta_source", "model_version", "basis_source", "horizon_bucket", "quality",
+                             "error_lower_seconds", "error_upper_seconds", "arrival_upper_at", "created_at")
+
+
+def eta_error_sample_status_rows(conn: psycopg.Connection, since: datetime | None = None) -> list[dict[str, Any]]:
+    """표본 현황 집계용 행(읽기 전용). since를 주면 그 뒤에 도착한 표본만 읽는다."""
+    rows = conn.execute(
+        f"SELECT {', '.join(_ETA_ERROR_STATUS_COLUMNS)} FROM app.eta_error_samples "
+        "WHERE %s::timestamptz IS NULL OR arrival_upper_at >= %s::timestamptz ORDER BY id",
+        (since, since),
+    ).fetchall()
+    return [dict(zip(_ETA_ERROR_STATUS_COLUMNS, row)) for row in rows]
+
+
 def apply_scene_label(conn: psycopg.Connection, scene_id: UUID, status: str, observations: list[dict[str, Any]],
                       quality: dict[str, Any], now: datetime) -> None:
     conn.execute(
