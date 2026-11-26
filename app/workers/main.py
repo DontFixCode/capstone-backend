@@ -49,6 +49,7 @@ from app.modules.users import service as user_service
 from app.modules.transit.service import RealtimeCollector, StaticImportService, latest_snapshot, utc_now
 from app.workers import recalculation, scheduler, search_jobs
 from app.workers.collection import collection_targets
+from app.workflows import eta_error_sampling as eta_error_flow
 from app.workflows import guidance as guidance_flow
 from app.workflows import route_shapes as route_shapes_flow
 from app.workflows.labeling import label_due
@@ -65,6 +66,8 @@ class PassResult:
     shapes: dict[str, Any] | None = None
     congestion: list[dict[str, Any]] | None = None
     labels: dict[str, int] | None = None
+    # ETA 오차 표본 수집(설정으로 켰을 때만): 이번 회차의 수집 상태와 도착 이벤트·표본 생성 결과.
+    eta_errors: dict[str, Any] | None = None
     next_wake_at: datetime | None = None
 
 
@@ -103,6 +106,22 @@ class Worker:
         self.last_auth_block_pass: datetime | None = None
         # 이 프로세스가 대상별로 마지막에 조회한 (위상 슬롯, 조회 종료 시각). 재시작하면 비며 그때는 간격 이상을 지킨다.
         self.ran_slots: dict[str, tuple[datetime, datetime]] = {}
+        # 그 슬롯을 정한 수집 간격. 대상의 간격이 바뀌면(표본 수집 시간대의 시작·끝) 슬롯 기억을 버리고 간격 규칙을 다시 적용한다.
+        self.ran_intervals: dict[str, float] = {}
+        self.sampling_error: str | None = None
+
+    def sampling_config(self, settings: Settings) -> tuple[eta_error_flow.SamplingConfig | None, str | None]:
+        """ETA 오차 표본 수집 설정과 설정 오류 메시지. 꺼져 있으면 (None, None)이고, 오류면 표본 수집만 건너뛴다."""
+        try:
+            config = eta_error_flow.load_config(settings)
+        except eta_error_flow.SamplingConfigError as exc:
+            # 워커는 수십 초마다 설정을 다시 읽으므로 같은 오류는 한 번만 남긴다(회차 결과에는 매번 들어간다).
+            if str(exc) != self.sampling_error:
+                logger.error("ETA 오차 표본 수집을 건너뜀(설정 오류): %s", exc)
+            self.sampling_error = str(exc)
+            return None, str(exc)
+        self.sampling_error = None
+        return config, None
 
     def run_jobs_pass(self) -> dict[str, Any]:
         """앱 작업 대기열 처리: 접수된 검색 실행 → 예약된 활성 이동 안내 재계산. 공유 수집 루프와 별도 스레드에서 돈다."""
@@ -172,18 +191,35 @@ class Worker:
             wake_candidates.append(due_at)
             now = self.clock()
         interval = settings.realtime_interval_seconds
+        sampling, sampling_error = self.sampling_config(settings)
+        if sampling_error is not None:
+            result.eta_errors = {"status": "config_error", "reason": sampling_error}
         with db.transaction() as conn:
+            # ETA 오차 표본 수집 대상(수집 시간대 안, 일일 호출 상한 전)과 그 대상에만 적용할 짧은 주기.
+            sampling_plan = eta_error_flow.collection_plan(conn, sampling, now) if sampling is not None else None
+            intervals = sampling_plan.intervals if sampling_plan is not None else {}
             # 개발 설정 대상 + 유효기간 안의 검색이 등록한 대상(만료되면 자동 해제).
-            targets = collection_targets(settings, conn, now)
+            targets = collection_targets(settings, conn, now,
+                                         extra=sampling_plan.targets if sampling_plan is not None else ())
             # 만료된 화면 조회 수요는 이미 집계에서 빠졌으므로 행만 정리한다(공개본·호출 이력은 그대로).
             transit_repository.delete_expired_view_targets(conn, now)
-            plans = scheduler.plan_realtime(conn, targets, interval, now, self.ran_slots)
+            # 간격이 바뀐 대상은 예전 간격으로 정한 슬롯을 잇지 않는다(마지막 시도에서 새 간격 이상을 지킨다).
+            for key, used in list(self.ran_intervals.items()):
+                if intervals.get(key, interval) != used:
+                    self.ran_slots.pop(key, None)
+                    del self.ran_intervals[key]
+            plans = scheduler.plan_realtime(conn, targets, interval, now, self.ran_slots, intervals)
         result.targets = len(targets)
+        if sampling_plan is not None:
+            result.eta_errors = {"status": sampling_plan.status, "targets": len(sampling_plan.targets),
+                                 "interval_seconds": sampling.interval_seconds,
+                                 "daily_call_limit_reached": sampling_plan.limited}
         # 해제된 대상의 슬롯 기억을 지운다. 다시 등록되면 DB 이력 기준으로 간격을 지킨다.
         active_keys = {p.target_key for p in plans}
         for key in list(self.ran_slots):
             if key not in active_keys:
                 del self.ran_slots[key]
+                self.ran_intervals.pop(key, None)
         due = [p for p in plans if p.due.at <= now]
         realtime_wake = [p.due.at for p in plans if p.due.at > now]
         if due:
@@ -194,20 +230,25 @@ class Worker:
                 logger.warning("대전시 버스 API 미설정(도착정보 수집 안 함): %s", exc)
                 daejeon = None
             collector = RealtimeCollector(db, client, interval_seconds=interval, clock=self.clock,
-                                          daejeon_client=daejeon)
+                                          daejeon_client=daejeon,
+                                          position_run_gap_seconds=sampling.run_gap_seconds if sampling else None)
             try:
                 for plan in due:
                     try:
-                        # 실행 시점은 스케줄러가 간격 규칙으로 정했으므로 재사용 판정 없이 조회한다.
-                        outcome = collector.collect(plan.target, force=True)
+                        # 실행 시점은 스케줄러가 간격 규칙으로 정했으므로 재사용 판정 없이 조회한다. 짧은 주기로 도는
+                        # 표본 수집 대상은 정상 응답의 원본 본문을 남기지 않는다(오류 응답만 남김).
+                        outcome = collector.collect(plan.target, force=True,
+                                                    store_body=plan.target_key not in intervals)
                     except (DbError, OSError) as exc:
                         logger.error("실시간 수집 실패 %s: %s", plan.target_key, exc)
                         result.outcomes.append({"target_key": plan.target_key, "action": "error", "reason": str(exc)})
                         continue
                     if outcome.http_attempts and plan.due.on_slot:
                         self.ran_slots[plan.target_key] = (plan.due.at, self.clock())
+                        self.ran_intervals[plan.target_key] = plan.interval_seconds
                     else:
                         self.ran_slots.pop(plan.target_key, None)
+                        self.ran_intervals.pop(plan.target_key, None)
                     result.outcomes.append({**asdict(outcome), "due_reason": plan.due.reason})
                     logger.info("실시간 %s: %s (HTTP %d회, 관측 %d건)", plan.target_key, outcome.action,
                                 outcome.http_attempts, outcome.observations)
@@ -216,15 +257,35 @@ class Worker:
                 if daejeon is not None:
                     daejeon.close()
             with db.transaction() as conn:
-                replanned = scheduler.plan_realtime(conn, targets, interval, self.clock(), self.ran_slots)
+                replanned = scheduler.plan_realtime(conn, targets, interval, self.clock(), self.ran_slots, intervals)
             realtime_wake = [p.due.at for p in replanned]
         wake_candidates.extend(realtime_wake)
         # 환승 표본·공동 관측 묶음의 사후 판정(예측 값은 바꾸지 않고 관측·판정만 갱신).
         with db.transaction() as conn:
             result.labels = label_due(conn, self.clock())
+        if sampling is not None:
+            result.eta_errors = {**(result.eta_errors or {}), "derived": self.derive_eta_errors(sampling, db)}
         poll_limit = self.clock() + timedelta(seconds=settings.worker_poll_seconds)
         result.next_wake_at = min([poll_limit, *wake_candidates])
         return result
+
+    def derive_eta_errors(self, sampling: eta_error_flow.SamplingConfig, db: Database) -> dict[str, Any]:
+        """수집한 위치 기록에서 도착 이벤트와 ETA 오차 표본을 만든다(외부 호출 없음). 실패해도 수집 루프는 계속한다.
+
+        수집 시간대가 끝난 뒤에도 실행해 마지막 운행의 이벤트를 마저 만든다. 이미 만든 것은 다시 만들지 않는다.
+        """
+        try:
+            with db.transaction() as conn:
+                derived = eta_error_flow.derive_due(conn, sampling, self.clock())
+        except DbError:
+            raise
+        except Exception:
+            logger.exception("ETA 오차 표본 생성 중 오류. 다음 회차에 다시 시도합니다.")
+            return {"status": "error"}
+        if derived.get("events_created") or derived.get("samples_created"):
+            logger.info("ETA 오차 표본: 도착 이벤트 %d건, 표본 %d건", derived["events_created"],
+                        derived["samples_created"])
+        return derived
 
     def refresh_congestion(self, settings: Settings, db: Database) -> list[dict[str, Any]] | None:
         """승하차 원본이 있는 노선의 혼잡 집계를 다시 만든다(하루 1회, 정적 갱신 직후, 외부 호출 없음).
@@ -295,17 +356,29 @@ def describe_targets(settings: Settings, db: Database,
     """외부 호출 없이 설정 대상과 최신 공개값 상태, 다음 예정 시각을 보여준다."""
     now = utc_now()
     interval = settings.realtime_interval_seconds
+    try:
+        sampling, sampling_state = eta_error_flow.load_config(settings), None
+    except eta_error_flow.SamplingConfigError as exc:
+        sampling, sampling_state = None, {"status": "config_error", "reason": str(exc)}
     with db.transaction(isolation="REPEATABLE READ") as conn:
-        targets = collection_targets(settings, conn, now)
-        plans = scheduler.plan_realtime(conn, targets, interval, now, ran_slots)
+        sampling_plan = eta_error_flow.collection_plan(conn, sampling, now) if sampling is not None else None
+        intervals = sampling_plan.intervals if sampling_plan is not None else {}
+        if sampling_plan is not None:
+            sampling_state = {"status": sampling_plan.status, "targets": len(sampling_plan.targets),
+                              "interval_seconds": sampling.interval_seconds,
+                              "daily_call_limit_reached": sampling_plan.limited}
+        targets = collection_targets(settings, conn, now,
+                                     extra=sampling_plan.targets if sampling_plan is not None else ())
+        plans = scheduler.plan_realtime(conn, targets, interval, now, ran_slots, intervals)
         entries = []
         for plan in plans:
-            snapshot = latest_snapshot(conn, plan.target, interval_seconds=interval, now=now)
+            snapshot = latest_snapshot(conn, plan.target, interval_seconds=plan.interval_seconds, now=now)
             entries.append({
                 "kind": plan.target.kind,
                 "external_id": plan.target.external_id,
                 "sources": sorted(plan.target.sources),
                 "target_key": plan.target_key,
+                "interval_seconds": plan.interval_seconds,
                 "state": snapshot.state,
                 "content": snapshot.content,
                 "collected_at": snapshot.collected_at,
@@ -317,7 +390,7 @@ def describe_targets(settings: Settings, db: Database,
                 "next_due_at": plan.due.at,
                 "next_due_reason": plan.due.reason,
             })
-    return {"checked_at": now, "interval_seconds": interval, "targets": entries}
+    return {"checked_at": now, "interval_seconds": interval, "eta_error_sampling": sampling_state, "targets": entries}
 
 
 def to_jsonable(value: Any) -> Any:

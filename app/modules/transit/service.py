@@ -34,7 +34,7 @@ from app.db.session import Database, try_xact_lock
 from app.integrations import bus_api, daejeon_bus_api
 from app.integrations.bus_api import AttemptRecord, Collection, Endpoint, TagoClient, field_state, text_value, to_int
 from app.integrations.daejeon_bus_api import ArrivalsPage, DaejeonBusClient
-from app.modules.transit import repository
+from app.modules.transit import arrival_events, repository
 from app.modules.transit.models import FetchAttemptRow, ObservationRow, RouteRow, RouteStopRow, StopRow
 from app.modules.transit.schemas import (
     AttemptSummary,
@@ -90,11 +90,19 @@ DAEJEON_ARRIVALS_NORMALIZER_VERSION = "daejeon-arrivals/2"
 DAEJEON_MSG_TP_WAITING_DEPARTURE = "07"
 DAEJEON_ID_PREFIX = "DJB"
 DAEJEON_ETA_BASIS_SOURCE = "daejeon_info_offer_tm"
+# 대전시 노선 위치(getBusPosByRtid): 정류소가 바뀐 기록만 저장한다(ETA 오차 표본 수집 전용, 검증 전).
+DAEJEON_POSITIONS_KIND = "daejeon_positions"
+DAEJEON_POSITIONS_NORMALIZER_VERSION = "daejeon-positions/1"
+# 대상 종류 → 호출 기록의 api_kind(DDL CHECK 값). 대전시 노선 위치는 positions로 남기고 제공처(키 접두사)로 구분한다.
+API_KIND = {"positions": "positions", "arrivals": "arrivals", DAEJEON_POSITIONS_KIND: "positions"}
+# 대전시 API로 수집하는 대상 종류.
+DAEJEON_KINDS = frozenset({"arrivals", DAEJEON_POSITIONS_KIND})
 KST = timezone(timedelta(hours=9))
 # 응답 명세·실응답 기준으로 원천이 제공하지 않는 항목. 빈 값·실패와 구분해 표시한다.
 NOT_PROVIDED = {
     "positions": ("source_generated_at", "run_key", "remaining_seconds"),
     "arrivals": ("run_key", "source_generated_at"),
+    DAEJEON_POSITIONS_KIND: ("run_key", "remaining_seconds", "source_generated_at"),
 }
 _SECRET_PARAM_NAMES = frozenset({"servicekey", "appkey"})
 
@@ -130,6 +138,8 @@ def realtime_target_key(target: RealtimeTarget, city_code: str = CITY_CODE) -> s
     """
     if target.kind == "arrivals":
         return f"{DAEJEON_PROVIDER}:{daejeon_bus_api.ARRIVALS_BY_STOP}?nodeId={target.external_id}"
+    if target.kind == DAEJEON_POSITIONS_KIND:
+        return f"{DAEJEON_PROVIDER}:{daejeon_bus_api.POSITIONS_BY_ROUTE}?routeId={target.external_id}"
     return target_key(REALTIME_ENDPOINT["positions"], {"cityCode": city_code, "routeId": target.external_id})
 
 
@@ -138,6 +148,11 @@ def daejeon_bus_stop_id(external_id: str) -> str | None:
     text = (external_id or "").strip()
     digits = text[len(DAEJEON_ID_PREFIX):] if text.startswith(DAEJEON_ID_PREFIX) else ""
     return digits if digits.isdigit() else None
+
+
+def daejeon_bus_route_id(external_id: str) -> str | None:
+    """대전시 busRouteId = TAGO 노선 ID('DJB'+숫자)에서 접두사를 뗀 대전시 노선 ID(ROUTE_CD). 형식이 다르면 None."""
+    return daejeon_bus_stop_id(external_id)
 
 
 def provider_of_key(key: str) -> str:
@@ -977,6 +992,83 @@ def parse_kst(text: str | None) -> datetime | None:
         return None
 
 
+def parse_compact_kst(text: str | None) -> datetime | None:
+    """대전시 노선 위치 ARR_TIME의 'YYYYMMDDHHMMSS'(시간대 없음, KST로 봄)를 UTC로. 형식이 다르면 None."""
+    value = (text or "").strip()
+    if len(value) != 14 or not value.isdigit():
+        return None
+    try:
+        return datetime.strptime(value, "%Y%m%d%H%M%S").replace(tzinfo=KST).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def normalize_daejeon_positions(
+    conn: psycopg.Connection, request_route_id: str, bus_route_id: str, fetch_id: int, items: list[dict[str, str]],
+    collected_at: datetime, static_version: str | None, *, run_gap_seconds: float,
+) -> list[ObservationRow]:
+    """대전시 노선 위치. 차량의 정류소(BUS_NODE_ID)가 직전 저장 기록과 달라진 항목만 행으로 만든다.
+
+    - 저장할 때 운행 키(details.run_group)를 정한다(arrival_events.next_run_group). 회차 키는 원천이 주지 않으므로 run_key
+      컬럼은 비워 둔다(기존 구간 소요시간·사후 판정은 run_key가 있는 이벤트만 읽는다).
+    - ARR_TIME은 원값과 해석한 시각(details.arr_time_at)을 남기되 뜻(도착·출발)은 확인 전이다. 수집 시각과 구분한다.
+    - GPS는 그 시각의 위치인지 조회 시점의 위치인지 확인하지 못해 location에 넣지 않는다(원값은 details.source에 있다).
+      그래서 좌표가 있는 위치 관측만 읽는 탑승 추정에는 이 행이 들어가지 않는다.
+    - 정류소는 BUS_NODE_ID에 'DJB'를 붙여 연결하고, 경유 순번은 그 노선이 정류소를 한 번만 지날 때만 정한다.
+    """
+    route_internal = repository.route_ids(conn, [request_route_id]).get(request_route_id)
+    if route_internal is None:
+        return []
+    visits = repository.route_visits(conn, [route_internal]).get(route_internal, [])
+    plates = sorted({plate for item in items if (plate := (item.get("PLATE_NO") or "").strip())})
+    states = {plate: arrival_events.VehicleState(**row)
+              for plate, row in repository.latest_daejeon_positions(conn, route_internal, plates).items()}
+    stop_map = repository.stop_ids(conn, [f"{DAEJEON_ID_PREFIX}{node}" for item in items
+                                          if (node := (item.get("BUS_NODE_ID") or "").strip())])
+    rows: list[ObservationRow] = []
+    for index, item in enumerate(items):
+        plate = (item.get("PLATE_NO") or "").strip()
+        node = (item.get("BUS_NODE_ID") or "").strip()
+        if not plate or not node:
+            # 차량이나 정류소를 알 수 없는 항목은 운행에 이을 수 없다.
+            continue
+        node_ext = f"{DAEJEON_ID_PREFIX}{node}"
+        pattern, seq, visit = _visit_match(visits, node_ext)
+        state = states.get(plate)
+        run_group, started = arrival_events.next_run_group(
+            state, route_external_id=request_route_id, vehicle_no=plate, node_id=node, stop_seq=seq,
+            collected_at=collected_at, run_gap_seconds=run_gap_seconds)
+        if run_group is None:
+            continue
+        last_seq = seq if seq is not None else (None if started or state is None else state.last_seq)
+        # 같은 응답에 같은 차량이 다시 나와도 방금 만든 기록을 직전 기록으로 본다.
+        states[plate] = arrival_events.VehicleState(run_group, node, last_seq, collected_at)
+        arr_time = parse_compact_kst(item.get("ARR_TIME"))
+        rows.append(ObservationRow(
+            fetch_id=fetch_id, item_index=index, kind="position", collected_at=collected_at,
+            route_id=route_internal, stop_id=stop_map.get(node_ext), pattern_key=pattern, stop_seq=seq,
+            vehicle_no=plate,
+            details={
+                "provider": DAEJEON_PROVIDER,
+                "source": dict(item),
+                "request": {"busRouteId": bus_route_id, "routeId": request_route_id},
+                "run_group": run_group, "run_started": started, "run_last_seq": last_seq,
+                "arr_time_at": arr_time.isoformat() if arr_time else None,
+                "arr_time_meaning": "unverified (도착·출발 미확인, 설정 BACKEND_DAEJEON_POSITION_ARR_TIME_MEANING으로 해석)",
+                "stored_when": "bus_node_id_changed",
+                "route_match": {"status": "matched", "basis": "request_route_id"},
+                "stop_match": {"status": "matched" if node_ext in stop_map else "unmatched",
+                               "basis": "BUS_NODE_ID + DJB prefix"},
+                "visit_match": visit,
+                "location_status": "not_used (GPS 시점 미확인)",
+                "not_provided": list(NOT_PROVIDED[DAEJEON_POSITIONS_KIND]),
+                "collected_at_meaning": "server_received_at (원천 관측 시각 아님)",
+                "static_version": static_version,
+            },
+        ))
+    return rows
+
+
 def normalize_daejeon_arrivals(
     conn: psycopg.Connection, request_stop_id: str, bus_stop_id: str, fetch_id: int, items: list[dict[str, str]],
     collected_at: datetime, static_version: str | None,
@@ -1060,19 +1152,27 @@ class RealtimeCollector:
 
     def __init__(self, db: Database, client: TagoClient | None, *, interval_seconds: float, city_code: str = CITY_CODE,
                  rows: int = PAGE_ROWS, clock: Callable[[], datetime] = utc_now,
-                 daejeon_client: DaejeonBusClient | None = None) -> None:
+                 daejeon_client: DaejeonBusClient | None = None,
+                 position_run_gap_seconds: float | None = None) -> None:
         self.db = db
         self.client = client
         self.daejeon_client = daejeon_client
+        # 대전시 노선 위치 기록을 운행으로 나누는 간격(초). ETA 오차 표본 수집 설정에서 받으며, 없으면 그 대상은 수집하지 않는다.
+        self.position_run_gap_seconds = position_run_gap_seconds
         self.interval = timedelta(seconds=interval_seconds)
         self.city_code = city_code
         self.rows = rows
         self.clock = clock
 
-    def collect(self, target: RealtimeTarget, *, force: bool = False) -> CollectOutcome:
+    def collect(self, target: RealtimeTarget, *, force: bool = False, store_body: bool = True) -> CollectOutcome:
+        """store_body가 False면 대전시 정상·빈 응답의 원본 본문을 남기지 않는다(오류 응답은 남긴다).
+
+        짧은 주기로 도는 ETA 오차 표본 수집 대상에만 쓴다. 항목 원값은 관측 행의 details.source에 남는다.
+        """
         key = realtime_target_key(target, self.city_code)
-        if (self.daejeon_client if target.kind == "arrivals" else self.client) is None:
-            source = "대전시 버스 API" if target.kind == "arrivals" else "TAGO"
+        uses_daejeon = target.kind in DAEJEON_KINDS
+        if (self.daejeon_client if uses_daejeon else self.client) is None:
+            source = "대전시 버스 API" if uses_daejeon else "TAGO"
             return CollectOutcome(key, "failed", reason=f"{source} 클라이언트가 설정되지 않아 조회하지 않음")
         lock_conn = self.db.connect()
         try:
@@ -1080,7 +1180,7 @@ class RealtimeCollector:
                 lock_conn.rollback()
                 return CollectOutcome(key, "in_progress", reason="다른 실행이 같은 대상을 수집 중")
             if not force:
-                pages = repository.latest_published_pages(lock_conn, target.kind, key)
+                pages = repository.latest_published_pages(lock_conn, API_KIND[target.kind], key)
                 if pages:
                     collected = min(p["received_at"] for p in pages)
                     if self.clock() - collected < self.interval:
@@ -1088,7 +1188,9 @@ class RealtimeCollector:
                         return CollectOutcome(key, "reused", batch_key=pages[0]["batch_key"],
                                               reason="수집 간격 이내 공개값 재사용")
             if target.kind == "arrivals":
-                return self._collect_daejeon(target, key, lock_conn)
+                return self._collect_daejeon_arrivals(target, key, lock_conn, store_body)
+            if target.kind == DAEJEON_POSITIONS_KIND:
+                return self._collect_daejeon_positions(target, key, lock_conn, store_body)
             with self.db.connect(autocommit=True) as record_conn:
                 recorder = FetchRecorder(record_conn)
                 previous = self.client.on_attempt
@@ -1136,32 +1238,60 @@ class RealtimeCollector:
         finally:
             lock_conn.close()
 
-    def _collect_daejeon(self, target: RealtimeTarget, key: str, lock_conn: psycopg.Connection) -> CollectOutcome:
+    def _collect_daejeon_arrivals(self, target: RealtimeTarget, key: str, lock_conn: psycopg.Connection,
+                                  store_body: bool) -> CollectOutcome:
         """대전시 도착정보 1회 조회 → api_fetches 기록(즉시 커밋) → 정상·빈 응답이면 관측과 공개를 한 트랜잭션에서 저장."""
         bus_stop_id = daejeon_bus_stop_id(target.external_id)
         if bus_stop_id is None or not repository.is_active_stop(lock_conn, target.external_id):
             lock_conn.rollback()
             return CollectOutcome(key, "failed", reason="활성 정류소가 아니거나 'DJB'+숫자 형식이 아니어서 대전시 BusStopID를 만들 수 없음")
         page = self.daejeon_client.fetch_arrivals(bus_stop_id)
+        return self._publish_daejeon(
+            key, lock_conn, page, "arrivals", DAEJEON_ARRIVALS_NORMALIZER_VERSION, store_body,
+            lambda fetch_id, received_at, version: normalize_daejeon_arrivals(
+                lock_conn, target.external_id, bus_stop_id, fetch_id, page.items, received_at, version))
+
+    def _collect_daejeon_positions(self, target: RealtimeTarget, key: str, lock_conn: psycopg.Connection,
+                                   store_body: bool) -> CollectOutcome:
+        """대전시 노선 위치 1회 조회. 차량의 정류소가 바뀐 기록만 관측으로 남긴다(바뀐 차량이 없으면 빈 공개)."""
+        bus_route_id = daejeon_bus_route_id(target.external_id)
+        run_gap_seconds = self.position_run_gap_seconds
+        if run_gap_seconds is None:
+            lock_conn.rollback()
+            return CollectOutcome(key, "failed", reason="운행 분리 간격 설정이 없어 대전시 노선 위치를 조회하지 않음")
+        if bus_route_id is None or not repository.route_ids(lock_conn, [target.external_id]):
+            lock_conn.rollback()
+            return CollectOutcome(key, "failed", reason="활성 노선이 아니거나 'DJB'+숫자 형식이 아니어서 대전시 busRouteId를 만들 수 없음")
+        page = self.daejeon_client.fetch_route_positions(bus_route_id)
+        return self._publish_daejeon(
+            key, lock_conn, page, "positions", DAEJEON_POSITIONS_NORMALIZER_VERSION, store_body,
+            lambda fetch_id, received_at, version: normalize_daejeon_positions(
+                lock_conn, target.external_id, bus_route_id, fetch_id, page.items, received_at, version,
+                run_gap_seconds=run_gap_seconds))
+
+    def _publish_daejeon(self, key: str, lock_conn: psycopg.Connection, page: ArrivalsPage, api_kind: str,
+                         normalizer_version: str, store_body: bool,
+                         normalize: Callable[[int, datetime, str | None], list[ObservationRow]]) -> CollectOutcome:
+        """대전시 응답 1건을 api_fetches에 기록하고(즉시 커밋), 정상·빈 응답이면 관측과 공개를 한 트랜잭션에서 저장한다."""
+        complete = page.status in ("success", "empty")
         with self.db.connect(autocommit=True) as record_conn:
             row = FetchAttemptRow(
-                batch_key=uuid4(), provider=DAEJEON_PROVIDER, api_kind="arrivals", target_key=key,
+                batch_key=uuid4(), provider=DAEJEON_PROVIDER, api_kind=api_kind, target_key=key,
                 request_params=dict(page.params), page_no=1, attempt_no=1,
                 requested_at=parse_utc(page.requested_at), received_at=parse_utc(page.received_at),
                 http_status=page.http_status, provider_code=page.provider_code, result_status=page.status,
-                total_count=page.item_count, raw_body=page.body, normalizer_version=DAEJEON_ARRIVALS_NORMALIZER_VERSION,
-                error_reason=page.error[:2000] if page.error else None,
+                total_count=page.item_count, raw_body=page.body if store_body or not complete else None,
+                normalizer_version=normalizer_version, error_reason=page.error[:2000] if page.error else None,
             )
             fetch_id = repository.insert_fetch(record_conn, row)
-            if page.status not in ("success", "empty"):
+            if not complete:
                 lock_conn.rollback()
                 action = "partial" if page.status == "partial" else "failed"
                 return CollectOutcome(key, action, row.batch_key, 1, reason=f"realtime_not_published: {page.error}")
             try:
                 versions = repository.current_static_versions(lock_conn)
                 version = str(versions[0]) if len(versions) == 1 else None
-                observations = normalize_daejeon_arrivals(lock_conn, target.external_id, bus_stop_id, fetch_id, page.items,
-                                                          row.received_at, version)
+                observations = normalize(fetch_id, row.received_at, version)
                 inserted = repository.insert_observations(lock_conn, observations)
                 if repository.mark_published(lock_conn, [fetch_id], repository.clock_now(lock_conn)) != 1:
                     raise RuntimeError("공개 표시 행 수가 채택 페이지 수와 다름")
@@ -1185,8 +1315,8 @@ def latest_snapshot(conn: psycopg.Connection, target: RealtimeTarget, *, interva
     """마지막 공개 배치 전체와 최신성, 마지막 시도 상태. 실패·부분 시도는 이전 공개본을 바꾸지 않는다."""
     now = now or utc_now()
     key = realtime_target_key(target, city_code)
-    pages = repository.latest_published_pages(conn, target.kind, key)
-    last = repository.last_attempt(conn, target.kind, key)
+    pages = repository.latest_published_pages(conn, API_KIND[target.kind], key)
+    last = repository.last_attempt(conn, API_KIND[target.kind], key)
     summary = None
     failed = False
     if last is not None:

@@ -11,11 +11,14 @@
   유지하고, 사용자가 완료·취소하면(예약 해제) 빠진다.
 - 혼잡도: 승하차 원본이 입력된 노선의 위치. 시간대별 실제 통과 횟수를 세려면 운행 시간 내내 쌓여야 하므로 상시 수집한다
   (노선 하나에 수집 간격마다 TAGO 위치 조회 1건).
+- ETA 오차 표본 수집: 설정으로 켠 대상 정류소(도착정보)·노선(대전시 위치). 수집 시간대 안에서만 대상이 되고, 이 대상만
+  설정한 짧은 주기로 돈다(app/workflows/eta_error_sampling.py가 대상과 주기를 정해 extra로 넘긴다).
 같은 조회 조건은 출처가 여러 개여도 한 번만 수집한다.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 
 import psycopg
@@ -82,9 +85,12 @@ def view_targets(conn: psycopg.Connection, now: datetime) -> list[RealtimeTarget
 
 
 def collection_targets(settings: Settings, conn: psycopg.Connection | None = None,
-                       now: datetime | None = None) -> list[RealtimeTarget]:
-    """현재 수집해야 할 대상의 합집합. 사용자가 없는 전체 노선·정류소는 넣지 않는다."""
-    groups = [configured_targets(settings)]
+                       now: datetime | None = None, extra: Iterable[RealtimeTarget] = ()) -> list[RealtimeTarget]:
+    """현재 수집해야 할 대상의 합집합. 사용자가 없는 전체 노선·정류소는 넣지 않는다.
+
+    extra는 호출자가 따로 정한 대상(ETA 오차 표본 수집)이다. 같은 정류소가 다른 수요로도 등록돼 있으면 한 대상으로 합친다.
+    """
+    groups = [configured_targets(settings), list(extra)]
     if conn is not None and now is not None:
         groups.append(search_targets(conn, now))
         groups.append(journey_targets(conn))

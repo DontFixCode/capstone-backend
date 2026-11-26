@@ -193,6 +193,28 @@ class TransferErrorSample(FrozenSchema):
     next: PredictionOutcome
 
 
+class EtaErrorSample(FrozenSchema):
+    """차량 한 대의 ETA 오차 표본(실제 도착 − 예측 도착, 초). 도착을 범위로만 알면 하한과 상한이 다르다.
+
+    같은 운행은 생성 방식·모델 버전·잔여시간 구간마다 표본 하나다(app.modules.evaluation.eta_errors).
+    """
+
+    sample_id: str
+    run_group_key: str
+    eta_source: EtaSource
+    model_version: str | None
+    basis_source: str | None
+    horizon_bucket: str
+    error_lower_seconds: float
+    error_upper_seconds: float
+
+    @model_validator(mode="after")
+    def bounds_are_ordered(self) -> EtaErrorSample:
+        if self.error_lower_seconds > self.error_upper_seconds:
+            raise ValueError("오차 하한이 상한보다 클 수 없습니다.")
+        return self
+
+
 class SceneRide(FrozenSchema):
     """과거 관측 묶음의 탑승 구간 하나. vehicle_rank는 그 시점 해당 구간의 도착 예정 순서(0이 가장 빠름)다."""
 

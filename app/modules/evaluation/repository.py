@@ -121,6 +121,50 @@ def apply_sample_label(conn: psycopg.Connection, sample_id: UUID, label: SampleL
     )
 
 
+# ---------------------------------------------------------------- 단일 차량 ETA 오차 표본 (app.eta_error_samples)
+
+def eta_error_samples_ready(conn: psycopg.Connection) -> bool:
+    """마이그레이션 14 적용 여부. 적용 전 DB에서는 표본 수집·오차 결합만 건너뛰고 기존 동작을 계속한다."""
+    return conn.execute("SELECT to_regclass('app.eta_error_samples') IS NOT NULL").fetchone()[0]
+
+
+def insert_eta_error_samples(conn: psycopg.Connection, rows: Sequence[dict[str, Any]]) -> int:
+    """오차 표본을 넣는다. 같은 운행·생성 방식·모델 버전·잔여시간 구간의 표본이 이미 있으면 넣지 않는다. 넣은 수."""
+    created = 0
+    for row in rows:
+        created += conn.execute(
+            """
+            INSERT INTO app.eta_error_samples (run_group, eta_source, model_version, basis_source, horizon_bucket,
+                horizon_seconds, error_lower_seconds, error_upper_seconds, quality, route_id, stop_id, pattern_key,
+                stop_seq, vehicle_no, basis_at, predicted_arrival_at, arrival_lower_at, arrival_upper_at,
+                prediction_observation_id, event_observation_id, details)
+            VALUES (%(run_group)s, %(eta_source)s, %(model_version)s, %(basis_source)s, %(horizon_bucket)s,
+                %(horizon_seconds)s, %(error_lower_seconds)s, %(error_upper_seconds)s, %(quality)s, %(route_id)s,
+                %(stop_id)s, %(pattern_key)s, %(stop_seq)s, %(vehicle_no)s, %(basis_at)s, %(predicted_arrival_at)s,
+                %(arrival_lower_at)s, %(arrival_upper_at)s, %(prediction_observation_id)s,
+                %(event_observation_id)s, %(details)s)
+            ON CONFLICT (run_group, eta_source, (coalesce(model_version, '')), horizon_bucket) DO NOTHING
+            """,
+            {**row, "details": Jsonb(row.get("details") or {})},
+        ).rowcount
+    return created
+
+
+_ETA_ERROR_COLUMNS = ("id", "run_group", "eta_source", "model_version", "basis_source", "horizon_bucket",
+                      "error_lower_seconds", "error_upper_seconds")
+
+
+def eta_error_samples(conn: psycopg.Connection, *, eta_sources: Sequence[str], since: datetime,
+                      before: datetime) -> list[dict[str, Any]]:
+    """확률 계산에 쓸 오차 표본. 도착이 since 이후이고 평가 기준시각 이전에 만들어진 것만 읽는다(사후 정보 누설 방지)."""
+    rows = conn.execute(
+        f"SELECT {', '.join(_ETA_ERROR_COLUMNS)} FROM app.eta_error_samples "
+        "WHERE eta_source = ANY(%s) AND arrival_upper_at >= %s AND created_at <= %s ORDER BY id",
+        (list(eta_sources), since, before),
+    ).fetchall()
+    return [dict(zip(_ETA_ERROR_COLUMNS, row)) for row in rows]
+
+
 def apply_scene_label(conn: psycopg.Connection, scene_id: UUID, status: str, observations: list[dict[str, Any]],
                       quality: dict[str, Any], now: datetime) -> None:
     conn.execute(

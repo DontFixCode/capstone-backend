@@ -6,6 +6,8 @@
 - 워커가 직전 슬롯에 직접 조회했고 그 뒤 다른 시도가 없으면 다음 슬롯(직전 슬롯 + 간격)에 조회한다.
 - 그 밖의 경우(최초 조회 직후·재시작·다른 프로세스의 조회)는 마지막 시도·공개 수집 시각에서 간격 이상 지난 첫 슬롯을
   쓴다. 그래서 간격보다 일찍 다시 조회하지 않으며, 위상에 맞출 때 한 번만 간격이 최대 두 배까지 늘어난다.
+- 간격은 대상마다 다를 수 있다(plan_realtime의 intervals). 지정하지 않은 대상은 공통 간격을 쓰고, 위 규칙은 대상별
+  간격으로 똑같이 적용한다(ETA 오차 표본 수집 대상만 짧은 주기로 돈다).
 정적 정보: 마지막 정적 시도에서 갱신 간격(하루)이 지나면 다시 적재한다.
 """
 
@@ -13,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -20,7 +23,7 @@ import psycopg
 
 from app.modules.transit import repository
 from app.modules.transit.schemas import RealtimeTarget
-from app.modules.transit.service import realtime_target_key
+from app.modules.transit.service import API_KIND, realtime_target_key
 
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -82,23 +85,29 @@ class PlannedTarget:
     due: Due
     last_attempt_at: datetime | None
     last_collected_at: datetime | None
+    # 이 대상에 적용한 수집 간격(초).
+    interval_seconds: float = 0.0
 
 
 def plan_realtime(conn: psycopg.Connection, targets: list[RealtimeTarget], interval_seconds: float, now: datetime,
-                  ran_slots: dict[str, tuple[datetime, datetime]] | None = None) -> list[PlannedTarget]:
+                  ran_slots: dict[str, tuple[datetime, datetime]] | None = None,
+                  intervals: Mapping[str, float] | None = None) -> list[PlannedTarget]:
+    """대상별 다음 조회 시각. intervals(대상 키 → 초)에 있는 대상만 그 간격을 쓰고 나머지는 interval_seconds를 쓴다."""
     ran_slots = ran_slots or {}
+    intervals = intervals or {}
     keyed = [(t, realtime_target_key(t)) for t in targets]
     keys_by_kind: dict[str, list[str]] = {}
     for target, key in keyed:
-        keys_by_kind.setdefault(target.kind, []).append(key)
+        keys_by_kind.setdefault(API_KIND[target.kind], []).append(key)
     timings: dict[str, tuple[datetime | None, datetime | None]] = {}
     for kind, keys in keys_by_kind.items():
         timings.update(repository.target_timings(conn, kind, keys))
     plans = []
     for target, key in keyed:
         last_attempt, last_collected = timings.get(key, (None, None))
-        due = next_due(key, interval_seconds, last_attempt, last_collected, now, ran_slot=ran_slots.get(key))
-        plans.append(PlannedTarget(target, key, due, last_attempt, last_collected))
+        interval = intervals.get(key, interval_seconds)
+        due = next_due(key, interval, last_attempt, last_collected, now, ran_slot=ran_slots.get(key))
+        plans.append(PlannedTarget(target, key, due, last_attempt, last_collected, interval))
     return sorted(plans, key=lambda p: (p.due.at, p.target_key))
 
 

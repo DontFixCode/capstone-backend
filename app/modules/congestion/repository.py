@@ -106,6 +106,7 @@ def position_history(conn: psycopg.Connection, route_id: int, pattern_key: str, 
     """노선 위치의 공개 수집 이력: (수집 시각 목록, [(수집 시각, 차량번호, 경유 순번)]).
 
     수집 시각 목록에는 차량이 한 대도 없던 수집도 들어간다(관측이 덮은 시간을 세는 기준). target_key는 위치 수집 대상 키다.
+    대전시 노선 위치 기록(ETA 오차 표본 수집, 정류소가 바뀔 때만 저장)은 수집 방식이 달라 통과 횟수에 넣지 않는다.
     """
     snapshots = [row[0] for row in conn.execute(
         "SELECT min(received_at) FROM app.api_fetches WHERE api_kind = 'positions' AND target_key = %s "
@@ -114,7 +115,8 @@ def position_history(conn: psycopg.Connection, route_id: int, pattern_key: str, 
     points = conn.execute(
         "SELECT collected_at, vehicle_no, stop_seq FROM app.transit_observations WHERE kind = 'position' "
         "AND route_id = %s AND pattern_key = %s AND vehicle_no IS NOT NULL AND stop_seq IS NOT NULL "
-        "AND collected_at >= %s AND collected_at < %s ORDER BY vehicle_no, collected_at",
+        "AND collected_at >= %s AND collected_at < %s AND details ->> 'provider' IS DISTINCT FROM 'daejeon' "
+        "ORDER BY vehicle_no, collected_at",
         (route_id, pattern_key, first, last)).fetchall()
     return snapshots, points
 

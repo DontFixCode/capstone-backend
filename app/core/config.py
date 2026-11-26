@@ -213,6 +213,75 @@ class Settings(BaseSettings):
     # 추천 비용의 내시균형 bias = Σ 버스 탑승시간 × (가중치 − 1). 비우면 혼잡을 순위에 반영하지 않는다(bias 0).
     congestion_cost_weights: Annotated[tuple[float, ...], NoDecode] = ()
 
+    # ---- ETA 오차 표본 수집 (docs/eta-error-probability.md) ----
+    # 버스 한 대씩의 '실제 도착 − 예측 도착' 오차 표본을 워커가 모은다(app/workflows/eta_error_sampling.py). 기본은 꺼짐이다.
+    # 켜면 대상·주기·시간대·연결 창·잔여시간 구간 경계·운행 분리 간격이 모두 있어야 하고, 하나라도 비면 설정 오류로 표본
+    # 수집만 멈춘다(기존 수집은 계속). 근거 없는 수치를 코드 기본값으로 두지 않는다.
+    eta_error_sampling_enabled: bool = False
+    # 대상 정류소·노선의 원천 ID(쉼표 구분, 'DJB' 접두사 포함). 정류소는 도착정보를, 노선은 대전시 노선 위치를 아래 주기로 받는다.
+    eta_error_sampling_stops: IdList = ()
+    eta_error_sampling_routes: IdList = ()
+    # 표본 수집 대상의 수집 주기(초). 나머지 대상은 BACKEND_REALTIME_INTERVAL_SECONDS를 그대로 쓴다.
+    eta_error_sampling_interval_seconds: float | None = Field(default=None, gt=0)
+    # 수집 시간대(KST 시, "시작-끝"을 쉼표로 구분, 끝 시각 제외. 예: 6-23 또는 7-9,17-20). 시간대 밖에서는 호출하지 않는다.
+    eta_error_sampling_hours: Annotated[tuple[tuple[int, int], ...], NoDecode] = ()
+    # 서비스(도착정보·노선 위치)별로 그날(KST) 대전시 API 호출 수가 이 값에 닿으면 표본 수집 호출을 멈춘다. 검색·안내용
+    # 호출은 계속하므로 계정 한도보다 낮게 잡아 여유를 남긴다. 비우면 제한하지 않는다.
+    eta_error_sampling_daily_call_limit: int | None = Field(default=None, gt=0)
+    # 예측 기준 시각부터 도착까지가 이 시간(초)을 넘으면 예측과 도착을 잇지 않는다(같은 차량의 다른 운행을 잇지 않게 한다).
+    eta_error_match_window_seconds: float | None = Field(default=None, gt=0)
+    # 잔여시간(예측 도착 − 기준 시각) 구간의 경계(초, 오름차순 쉼표 구분. 예: 120,300,600). 표본 생성과 확률 계산이 같은 값을 쓴다.
+    eta_error_horizon_edges_seconds: Annotated[tuple[float, ...], NoDecode] = ()
+    # 같은 차량의 위치 기록 간격이 이 시간(초)을 넘으면 다른 운행으로 나눈다.
+    eta_error_run_gap_seconds: float | None = Field(default=None, gt=0)
+
+    @field_validator("eta_error_sampling_enabled", mode="before")
+    @classmethod
+    def blank_flag_is_off(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return False
+        return value
+
+    @field_validator("eta_error_sampling_interval_seconds", "eta_error_sampling_daily_call_limit",
+                     "eta_error_match_window_seconds", "eta_error_run_gap_seconds", mode="before")
+    @classmethod
+    def blank_eta_error_setting_is_missing(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("eta_error_sampling_hours", mode="before")
+    @classmethod
+    def split_sampling_hours(cls, value: object) -> object:
+        """"6-23" 또는 "7-9,17-20" 같은 KST 시간대 목록. 각 구간은 0 ≤ 시작 < 끝 ≤ 24다."""
+        if value is None:
+            return ()
+        parts = value.split(",") if isinstance(value, str) else list(value)
+        ranges = []
+        for part in parts:
+            if isinstance(part, (tuple, list)):
+                start, end = part
+            elif str(part).strip():
+                start, _, end = str(part).strip().partition("-")
+            else:
+                continue
+            try:
+                start, end = int(str(start).strip()), int(str(end).strip())
+            except ValueError:
+                raise ValueError("수집 시간대는 '시작-끝' 형식의 KST 시(예: 6-23)여야 합니다.") from None
+            if not 0 <= start < end <= 24:
+                raise ValueError("수집 시간대는 0 ≤ 시작 < 끝 ≤ 24여야 합니다.")
+            ranges.append((start, end))
+        return tuple(ranges)
+
+    @field_validator("eta_error_horizon_edges_seconds", mode="before")
+    @classmethod
+    def split_horizon_edges(cls, value: object) -> object:
+        numbers = _split_numbers(value)
+        if any(not 0 < number < float("inf") for number in numbers) or list(numbers) != sorted(set(numbers)):
+            raise ValueError("잔여시간 구간 경계는 0보다 크고 서로 다른 오름차순 초 값이어야 합니다.")
+        return numbers
+
     @field_validator("eval_slack_grade_thresholds_seconds", mode="before")
     @classmethod
     def split_slack_grade_thresholds(cls, value: object) -> object:
@@ -299,7 +368,8 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("realtime_position_route_ids", "realtime_arrival_stop_ids", mode="before")
+    @field_validator("realtime_position_route_ids", "realtime_arrival_stop_ids", "eta_error_sampling_stops",
+                     "eta_error_sampling_routes", mode="before")
     @classmethod
     def split_id_list(cls, value: object) -> object:
         """쉼표 구분 문자열을 순서를 지킨 중복 없는 ID 목록으로 바꾼다. ID는 문자열 그대로 다룬다."""

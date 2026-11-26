@@ -538,6 +538,102 @@ def find_arrival_event(conn: psycopg.Connection, pattern_key: str, stop_seq: int
     return {"id": row[0], "quality": row[1], "event_at": row[2], "details": row[3]}
 
 
+# ---------------------------------------------------------------- 대전시 노선 위치·도출 도착 이벤트 (ETA 오차 표본 수집)
+
+DAEJEON_POSITION_FILTER = "o.kind = 'position' AND o.details ->> 'provider' = 'daejeon'"
+
+
+def latest_daejeon_positions(conn: psycopg.Connection, route_id: int,
+                             vehicle_nos: Sequence[str]) -> dict[str, dict[str, Any]]:
+    """차량별로 그 노선에 마지막으로 저장한 대전시 위치 기록(운행 키·정류소·운행의 마지막 확인 순번·수집 시각)."""
+    if not vehicle_nos:
+        return {}
+    rows = conn.execute(
+        f"""
+        SELECT v.plate, last.details ->> 'run_group', last.details #>> '{{source,BUS_NODE_ID}}',
+               (last.details ->> 'run_last_seq')::int, last.collected_at
+          FROM unnest(%s::text[]) AS v(plate)
+         CROSS JOIN LATERAL (
+               SELECT o.details, o.collected_at FROM app.transit_observations o
+                WHERE o.vehicle_no = v.plate AND o.route_id = %s AND {DAEJEON_POSITION_FILTER}
+                ORDER BY o.collected_at DESC, o.id DESC
+                LIMIT 1) last
+        """,
+        (list(vehicle_nos), route_id),
+    ).fetchall()
+    return {plate: {"run_group": run_group, "node_id": node_id, "last_seq": last_seq, "collected_at": collected_at}
+            for plate, run_group, node_id, last_seq, collected_at in rows if run_group and node_id}
+
+
+def daejeon_positions_since(conn: psycopg.Connection, route_ids: Sequence[int],
+                            since: datetime) -> list[dict[str, Any]]:
+    """노선별 대전시 위치 기록(since 이후 수집분)을 수집 순으로."""
+    if not route_ids:
+        return []
+    rows = conn.execute(
+        f"""
+        SELECT o.id, o.route_id, o.pattern_key, o.stop_seq, o.vehicle_no, o.collected_at,
+               o.details ->> 'run_group', o.details ->> 'arr_time_at'
+          FROM app.transit_observations o
+         WHERE o.route_id = ANY(%s) AND o.collected_at >= %s AND {DAEJEON_POSITION_FILTER}
+         ORDER BY o.route_id, o.collected_at, o.id
+        """,
+        (list(route_ids), since),
+    ).fetchall()
+    keys = ("id", "route_id", "pattern_key", "stop_seq", "vehicle_no", "collected_at", "run_group", "arr_time_at")
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def existing_event_keys(conn: psycopg.Connection, event_keys: Sequence[str]) -> set[str]:
+    if not event_keys:
+        return set()
+    return {row[0] for row in conn.execute(
+        "SELECT event_key FROM app.transit_observations WHERE kind = 'event' AND event_key = ANY(%s)",
+        (list(event_keys),))}
+
+
+def insert_arrival_event(conn: psycopg.Connection, *, event_key: str, quality: str, event_at: datetime | None,
+                         collected_at: datetime, route_id: int | None, stop_id: int | None, pattern_key: str,
+                         stop_seq: int, vehicle_no: str | None, details: dict[str, Any]) -> int | None:
+    """도출한 도착 이벤트 1건을 저장한다. 같은 event_key가 이미 있으면 넣지 않고 None을 돌려준다.
+
+    run_key는 넣지 않는다(원천이 준 회차가 아니며, run_key가 있는 이벤트는 구간 소요시간·사후 판정이 읽는다).
+    """
+    row = conn.execute(
+        """
+        INSERT INTO app.transit_observations (kind, event_type, quality, event_key, event_at, collected_at, route_id,
+            stop_id, pattern_key, stop_seq, vehicle_no, details)
+        VALUES ('event', 'arrival', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (event_key) WHERE kind = 'event' DO NOTHING
+        RETURNING id
+        """,
+        (quality, event_key, event_at, collected_at, route_id, stop_id, pattern_key, stop_seq, vehicle_no,
+         Jsonb(details)),
+    ).fetchone()
+    return None if row is None else row[0]
+
+
+def arrival_predictions(conn: psycopg.Connection, *, route_id: int, stop_id: int, vehicle_no: str,
+                        basis_from: datetime, basis_until: datetime) -> list[dict[str, Any]]:
+    """같은 노선·정류소·차량번호의 저장된 도착 예측 가운데 기준 시각이 [basis_from, basis_until]인 것.
+
+    수집 시각은 기준 시각보다 늦으므로 수집 시각으로 먼저 범위를 줄이되, 제공처 시계 차이를 감안해 창 길이만큼 더 앞에서 읽는다.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, eta_basis_at, predicted_arrival_at, details ->> 'eta_basis_source', details #>> '{source,MSG_TP}'
+          FROM app.transit_observations
+         WHERE kind = 'arrival' AND stop_id = %s AND route_id = %s AND vehicle_no = %s
+           AND predicted_arrival_at IS NOT NULL AND eta_basis_at BETWEEN %s AND %s
+           AND collected_at >= %s
+         ORDER BY eta_basis_at, id
+        """,
+        (stop_id, route_id, vehicle_no, basis_from, basis_until, basis_from - (basis_until - basis_from)),
+    ).fetchall()
+    keys = ("id", "basis_at", "predicted_arrival_at", "basis_source", "msg_tp")
+    return [dict(zip(keys, row)) for row in rows]
+
+
 def observations_for_fetches(conn: psycopg.Connection, fetch_ids: Sequence[int]) -> list[dict[str, Any]]:
     if not fetch_ids:
         return []
@@ -796,10 +892,14 @@ def save_shape_patterns(conn: psycopg.Connection, route_id: int, provider: dict[
                  "'patterns', %s::jsonb) WHERE id = %s", (Jsonb(provider), Jsonb(patterns), route_id))
 
 
-def provider_call_count(conn: psycopg.Connection, provider: str, since: datetime) -> int:
-    """제공처별 실제 HTTP 시도 수(since 이후). 일일 호출 한도 확인에 쓴다."""
-    return conn.execute("SELECT count(*) FROM app.api_fetches WHERE provider = %s AND requested_at >= %s",
-                        (provider, since)).fetchone()[0]
+def provider_call_count(conn: psycopg.Connection, provider: str, since: datetime,
+                        api_kind: str | None = None) -> int:
+    """제공처별 실제 HTTP 시도 수(since 이후). 일일 호출 한도 확인에 쓴다. api_kind를 주면 그 종류만 센다."""
+    if api_kind is None:
+        return conn.execute("SELECT count(*) FROM app.api_fetches WHERE provider = %s AND requested_at >= %s",
+                            (provider, since)).fetchone()[0]
+    return conn.execute("SELECT count(*) FROM app.api_fetches WHERE provider = %s AND api_kind = %s "
+                        "AND requested_at >= %s", (provider, api_kind, since)).fetchone()[0]
 
 
 def shape_summary(conn: psycopg.Connection) -> dict[str, Any]:
