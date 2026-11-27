@@ -5,10 +5,13 @@
 
 - 기본은 꺼짐이다(BACKEND_ETA_ERROR_SAMPLING_ENABLED). 켰는데 필수 설정이 빠지면 SamplingConfigError로 알리고, 워커는
   표본 수집만 건너뛴 채 기존 수집을 계속한다.
-- 대상 정류소의 도착정보(기존 수집 경로)와 대상 노선의 대전시 위치를 설정한 주기·시간대(KST)에 받는다. 이 대상만 짧은
+- 대상 정류소의 도착정보(기존 수집 경로)와 대상 노선의 위치를 설정한 주기·시간대(KST)에 받는다. 이 대상만 짧은
   주기로 돌고 나머지 대상은 기존 주기 그대로다(workers.scheduler의 대상별 간격). 시간대 밖에서는 대상에 넣지 않는다.
-- 서비스(도착정보·노선 위치)별 그날(KST) 대전시 호출 수가 설정한 상한에 닿으면 그 서비스의 표본 수집 대상을 뺀다.
-  검색·이동 안내가 등록한 대상은 그대로 수집한다.
+- 노선 위치의 원천은 설정으로 고른다(BACKEND_ETA_ERROR_POSITION_SOURCE). daejeon은 대전시 노선 위치(getBusPosByRtid),
+  tago는 TAGO 노선 위치(getRouteAcctoBusLcList)다. 대전시 쪽은 이 계정의 일일 한도가 100건으로 확인돼 실사용이 어렵다.
+- 서비스(도착정보·노선 위치)의 그날(KST) 호출 수가 설정한 상한에 닿았거나, 그날 그 서비스가 호출 한도 초과로 거절된 적이
+  있으면 표본 수집 대상을 모두 뺀다(표본은 두 서비스가 다 있어야 만들어지므로 한쪽만 받지 않는다). 검색·이동 안내가
+  등록한 대상은 그대로 수집한다.
 - 도착 이벤트는 transit.arrival_events의 규칙으로, 오차 표본은 evaluation.eta_errors의 규칙으로 만든다. 이벤트는
   event_key로, 표본은 테이블 고유 키로 중복을 막아 다시 실행해도 결과가 같다.
 - 외부 호출은 하지 않는다(수집은 워커의 공유 수집 루프가 한다).
@@ -35,6 +38,7 @@ from app.modules.transit.service import (
     KST,
     realtime_target_key,
 )
+from app.modules.transit.service import PROVIDER as TAGO_PROVIDER
 
 SOURCE = "eta_error_sampling"
 ACTIVE = "active"
@@ -58,10 +62,27 @@ class SamplingConfig:
     run_gap_seconds: float
     arr_time_meaning: str
     daily_call_limit: int | None = None
+    # 노선 위치의 원천(arrival_events.POSITION_SOURCES)과, 그 서비스에만 따로 둔 일일 호출 상한(없으면 공통 상한).
+    position_source: str = arrival_events.SOURCE_DAEJEON
+    position_daily_call_limit: int | None = None
 
     def in_hours(self, now: datetime) -> bool:
         hour = now.astimezone(KST).hour
         return any(start <= hour < end for start, end in self.hours)
+
+    @property
+    def uses_tago_positions(self) -> bool:
+        return self.position_source == arrival_events.SOURCE_TAGO
+
+    @property
+    def services(self) -> dict[str, tuple[str, int | None]]:
+        """표본 수집이 쓰는 서비스(api_kind) → (제공처, 일일 호출 상한)."""
+        position_limit = self.position_daily_call_limit
+        return {
+            "arrivals": (DAEJEON_PROVIDER, self.daily_call_limit),
+            "positions": (TAGO_PROVIDER if self.uses_tago_positions else DAEJEON_PROVIDER,
+                          self.daily_call_limit if position_limit is None else position_limit),
+        }
 
 
 _REQUIRED = {
@@ -93,7 +114,9 @@ def load_config(settings: Settings) -> SamplingConfig | None:
         horizon_edges_seconds=settings.eta_error_horizon_edges_seconds,
         run_gap_seconds=settings.eta_error_run_gap_seconds,
         arr_time_meaning=settings.daejeon_position_arr_time_meaning,
-        daily_call_limit=settings.eta_error_sampling_daily_call_limit)
+        daily_call_limit=settings.eta_error_sampling_daily_call_limit,
+        position_source=settings.eta_error_position_source,
+        position_daily_call_limit=settings.eta_error_sampling_position_daily_call_limit)
 
 
 # ---------------------------------------------------------------- 수집 대상·주기
@@ -106,7 +129,7 @@ class CollectionPlan:
     targets: tuple[RealtimeTarget, ...] = ()
     # 대상 키 → 수집 주기(초). 스케줄러가 이 대상에만 짧은 주기를 적용한다.
     intervals: dict[str, float] = field(default_factory=dict)
-    # 상한에 닿아 뺀 서비스(api_kind)와 그날 호출 수.
+    # 상한에 닿았거나 한도 초과로 거절된 서비스(api_kind)와 그날 호출 수.
     limited: dict[str, int] = field(default_factory=dict)
 
     @property
@@ -121,27 +144,27 @@ def day_start(now: datetime) -> datetime:
 
 
 def collection_plan(conn: psycopg.Connection | None, config: SamplingConfig, now: datetime) -> CollectionPlan:
-    """수집 시간대 안이면 대상 정류소(도착정보)·노선(대전시 위치)을 주기와 함께 돌려준다. 밖이면 대상이 없다."""
+    """수집 시간대 안이면 대상 정류소(도착정보)·노선(위치)을 주기와 함께 돌려준다. 밖이면 대상이 없다.
+
+    어느 한 서비스라도 그날 호출 수가 상한에 닿았거나 한도 초과로 거절됐으면 대상을 모두 뺀다.
+    """
     if not config.in_hours(now):
         return CollectionPlan(OUTSIDE_HOURS)
-    source = frozenset({SOURCE})
-    groups = {
-        "arrivals": [RealtimeTarget("arrivals", stop_id, source) for stop_id in config.stop_ids],
-        "positions": [RealtimeTarget(DAEJEON_POSITIONS_KIND, route_id, source) for route_id in config.route_ids],
-    }
     limited: dict[str, int] = {}
-    if config.daily_call_limit is not None and conn is not None:
+    if conn is not None:
         since = day_start(now)
-        for api_kind in list(groups):
-            calls = transit_repository.provider_call_count(conn, DAEJEON_PROVIDER, since, api_kind)
-            if calls >= config.daily_call_limit:
+        for api_kind, (provider, limit) in config.services.items():
+            calls = transit_repository.provider_call_count(conn, provider, since, api_kind)
+            if ((limit is not None and calls >= limit)
+                    or transit_repository.provider_limit_error_since(conn, provider, api_kind, since)):
                 limited[api_kind] = calls
-                groups[api_kind] = []
-    targets = tuple(target for group in groups.values() for target in group)
-    if not targets:
+    if limited:
         return CollectionPlan(DAILY_CALL_LIMIT_REACHED, limited=limited)
-    return CollectionPlan(ACTIVE, targets, {realtime_target_key(target): config.interval_seconds for target in targets},
-                          limited)
+    source = frozenset({SOURCE})
+    position_kind = "positions" if config.uses_tago_positions else DAEJEON_POSITIONS_KIND
+    targets = (*(RealtimeTarget("arrivals", stop_id, source) for stop_id in config.stop_ids),
+               *(RealtimeTarget(position_kind, route_id, source) for route_id in config.route_ids))
+    return CollectionPlan(ACTIVE, targets, {realtime_target_key(target): config.interval_seconds for target in targets})
 
 
 # ---------------------------------------------------------------- 도착 이벤트·오차 표본
@@ -156,7 +179,7 @@ def _parse_time(text: str | None) -> datetime | None:
 def derive_due(conn: psycopg.Connection, config: SamplingConfig, now: datetime) -> dict[str, Any]:
     """최근 위치 기록에서 대상 정류소의 도착 이벤트를 도출하고 오차 표본을 만든다. 호출자가 트랜잭션을 커밋한다.
 
-    읽는 범위는 지금부터 (연결 창 + 운행 분리 간격 × 2) 이전까지다. 이벤트의 앞뒤 근거는 서로 운행 분리 간격 안에 있으므로
+    위치 기록은 설정한 원천의 것만 읽는다(대전시: 정류소가 바뀐 기록 / TAGO: 운행 키를 남긴 조회별 기록). 읽는 범위는 지금부터 (연결 창 + 운행 분리 간격 × 2) 이전까지다. 이벤트의 앞뒤 근거는 서로 운행 분리 간격 안에 있으므로
     워커가 그보다 오래 멈추지 않는 한 놓치지 않는다. 이미 만든 이벤트·표본은 다시 만들지 않는다.
     """
     result: dict[str, Any] = {"status": "done", "events_created": 0, "samples_created": 0, "excluded_stops": {}}
@@ -165,8 +188,17 @@ def derive_due(conn: psycopg.Connection, config: SamplingConfig, now: datetime) 
     route_map = transit_repository.route_ids(conn, config.route_ids)
     visits = transit_repository.route_visits(conn, route_map.values())
     since = now - timedelta(seconds=config.match_window_seconds + 2 * config.run_gap_seconds)
+    uses_tago = config.uses_tago_positions
+    read_positions = (transit_repository.snapshot_positions_since if uses_tago
+                      else transit_repository.daejeon_positions_since)
+    rule_version = arrival_events.SNAPSHOT_RULE_VERSION if uses_tago else arrival_events.RULE_VERSION
+    # 원천별로 달라지는 근거 설명. TAGO 기록에는 정류소 이벤트 시각이 없어 조회 시각으로 범위를 잡는다.
+    source_details: dict[str, Any] = (
+        {"provider": TAGO_PROVIDER,
+         "bounds_meaning": "(직전 조회를 보낸 시각, 이번 응답을 받은 시각], 원천 반영 지연은 확인 전"}
+        if uses_tago else {"provider": DAEJEON_PROVIDER, "arr_time_meaning": config.arr_time_meaning})
     rows_by_route: dict[int, list[dict[str, Any]]] = {}
-    for row in transit_repository.daejeon_positions_since(conn, sorted(route_map.values()), since):
+    for row in read_positions(conn, sorted(route_map.values()), since):
         rows_by_route.setdefault(row["route_id"], []).append(row)
     window = timedelta(seconds=config.match_window_seconds)
     for route_external_id, route_id in sorted(route_map.items()):
@@ -180,9 +212,15 @@ def derive_due(conn: psycopg.Connection, config: SamplingConfig, now: datetime) 
         if not by_seq or not rows:
             continue
         vehicles = {row["run_group"]: row["vehicle_no"] for row in rows}
-        positions = [arrival_events.RunPosition(row["id"], row["run_group"], row["stop_seq"],
-                                                _parse_time(row["arr_time_at"]), row["collected_at"]) for row in rows]
-        derived = arrival_events.derive_arrivals(positions, by_seq.keys(), config.arr_time_meaning)
+        if uses_tago:
+            derived = arrival_events.derive_snapshot_arrivals(
+                [arrival_events.SnapshotPosition(row["id"], row["run_group"], row["stop_seq"], row["requested_at"],
+                                                 row["collected_at"]) for row in rows], by_seq.keys())
+        else:
+            derived = arrival_events.derive_arrivals(
+                [arrival_events.RunPosition(row["id"], row["run_group"], row["stop_seq"],
+                                            _parse_time(row["arr_time_at"]), row["collected_at"]) for row in rows],
+                by_seq.keys(), config.arr_time_meaning)
         known = transit_repository.existing_event_keys(conn, [arrival.event_key for arrival in derived])
         # 한 운행이 대상 정류소 여러 곳을 지나면 먼저 도착한 정류소의 표본이 그 운행의 구간별 표본이 된다.
         for arrival in sorted(derived, key=lambda item: (item.upper_at, item.event_key)):
@@ -195,8 +233,7 @@ def derive_due(conn: psycopg.Connection, config: SamplingConfig, now: datetime) 
                 collected_at=arrival.collected_at, route_id=route_id, stop_id=visit["stop_id"],
                 pattern_key=visit["pattern_key"], stop_seq=arrival.stop_seq, vehicle_no=vehicle_no,
                 details={
-                    "provider": DAEJEON_PROVIDER, "rule": arrival_events.RULE_VERSION,
-                    "arr_time_meaning": config.arr_time_meaning, "basis": arrival.basis,
+                    **source_details, "rule": rule_version, "basis": arrival.basis,
                     "run_group": arrival.run_group,
                     "bounded_lower_at": arrival.lower_at.isoformat(),
                     "bounded_upper_at": arrival.upper_at.isoformat(),
@@ -224,8 +261,10 @@ def derive_due(conn: psycopg.Connection, config: SamplingConfig, now: datetime) 
             result["samples_created"] += evaluation_repository.insert_eta_error_samples(conn, [{
                 **record.__dict__, "route_id": route_id, "stop_id": visit["stop_id"],
                 "pattern_key": visit["pattern_key"], "stop_seq": arrival.stop_seq, "vehicle_no": vehicle_no,
-                "details": {"rule": eta_errors.RULE_VERSION, "event_rule": arrival_events.RULE_VERSION,
-                            "arr_time_meaning": config.arr_time_meaning, "event_basis": arrival.basis,
+                "details": {"rule": eta_errors.RULE_VERSION, "event_rule": rule_version,
+                            "position_source": config.position_source,
+                            **({} if uses_tago else {"arr_time_meaning": config.arr_time_meaning}),
+                            "event_basis": arrival.basis,
                             "horizon_edges_seconds": list(config.horizon_edges_seconds),
                             "match_window_seconds": config.match_window_seconds},
             } for record in records])

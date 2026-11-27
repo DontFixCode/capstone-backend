@@ -7,7 +7,8 @@
   (exact 점 시각 / bounded 범위), 오차(실제 도착 − 예측 도착, 초)의 중앙값·분위수, 가장 최근 도착·생성 시각.
   점 시각 표본의 오차(exact)와 전체 표본의 오차 하한(lower)·상한(upper) 분포를 따로 보여 준다. 범위 표본을 대표값으로 바꿔
   합치지 않는다. bounded_width_seconds는 범위 표본의 폭(상한 − 하한)으로, 수집 주기가 길수록 커진다.
-- collection: 대전시 노선 위치 기록 수·운행 수·최근 수집 시각과, 도출한 도착 이벤트의 품질별 수.
+- collection: 운행 키를 남긴 노선 위치 기록 수·운행 수·최근 수집 시각과, 도출한 도착 이벤트의 품질별 수. 위치 원천
+  (by_source: daejeon / tago)별 수도 함께 준다.
 - probability: 확률 계산에 쓰는 설정(.env.api)과, 구간별로 최소 표본 수를 채웠는지.
 
 수집은 워커가 한다(BACKEND_ETA_ERROR_SAMPLING_ENABLED, docs/eta-error-probability.md).
@@ -63,6 +64,7 @@ def report(settings: Settings, db: Database, days: float | None) -> dict[str, An
                      "routes": list(settings.eta_error_sampling_routes),
                      "interval_seconds": settings.eta_error_sampling_interval_seconds,
                      "hours_kst": [list(hours) for hours in settings.eta_error_sampling_hours],
+                     "position_source": settings.eta_error_position_source,
                      "arr_time_meaning": settings.daejeon_position_arr_time_meaning},
         "probability": {"enabled": settings.eval_marginal_probability_enabled,
                         "window_days": settings.eval_marginal_window_days, "min_samples": minimum,

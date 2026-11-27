@@ -455,9 +455,9 @@ def route_visits(conn: psycopg.Connection, internal_route_ids: Iterable[int]) ->
     result: dict[int, list[dict[str, Any]]] = {route_id: [] for route_id in ids}
     if not ids:
         return result
-    for route_id, pattern, seq, order, stop_ext, stop_id in conn.execute(
+    for route_id, pattern, seq, order, stop_ext, stop_id, direction in conn.execute(
         """
-        SELECT rs.route_id, rs.pattern_key, rs.seq, rs.source_node_order, st.external_id, st.id
+        SELECT rs.route_id, rs.pattern_key, rs.seq, rs.source_node_order, st.external_id, st.id, rs.direction_code
           FROM app.route_stops rs JOIN app.stops st ON st.id = rs.stop_id
          WHERE rs.route_id = ANY(%s)
          ORDER BY rs.route_id, rs.pattern_key, rs.seq
@@ -465,7 +465,7 @@ def route_visits(conn: psycopg.Connection, internal_route_ids: Iterable[int]) ->
         (ids,),
     ):
         result[route_id].append({"pattern_key": pattern, "seq": seq, "source_node_order": order,
-                                 "stop_external_id": stop_ext, "stop_id": stop_id})
+                                 "stop_external_id": stop_ext, "stop_id": stop_id, "direction_code": direction})
     return result
 
 
@@ -538,20 +538,23 @@ def find_arrival_event(conn: psycopg.Connection, pattern_key: str, stop_seq: int
     return {"id": row[0], "quality": row[1], "event_at": row[2], "details": row[3]}
 
 
-# ---------------------------------------------------------------- 대전시 노선 위치·도출 도착 이벤트 (ETA 오차 표본 수집)
+# ---------------------------------------------------------------- 노선 위치 기록·도출 도착 이벤트 (ETA 오차 표본 수집)
 
 DAEJEON_POSITION_FILTER = "o.kind = 'position' AND o.details ->> 'provider' = 'daejeon'"
+# 운행 키를 남긴 TAGO 노선 위치 기록(표본 수집 대상 노선을 짧은 주기로 받은 것).
+SNAPSHOT_RUN_FILTER = ("o.kind = 'position' AND o.details ->> 'run_group' IS NOT NULL "
+                       "AND o.details ->> 'provider' IS DISTINCT FROM 'daejeon'")
 
 
 def latest_daejeon_positions(conn: psycopg.Connection, route_id: int,
                              vehicle_nos: Sequence[str]) -> dict[str, dict[str, Any]]:
-    """차량별로 그 노선에 마지막으로 저장한 대전시 위치 기록(운행 키·정류소·운행의 마지막 확인 순번·수집 시각)."""
+    """차량별로 그 노선에 마지막으로 저장한 대전시 위치 기록(운행 키·정류소·운행의 마지막 확인 순번·방향·수집 시각)."""
     if not vehicle_nos:
         return {}
     rows = conn.execute(
         f"""
         SELECT v.plate, last.details ->> 'run_group', last.details #>> '{{source,BUS_NODE_ID}}',
-               (last.details ->> 'run_last_seq')::int, last.collected_at
+               (last.details ->> 'run_last_seq')::int, last.collected_at, last.details ->> 'run_direction'
           FROM unnest(%s::text[]) AS v(plate)
          CROSS JOIN LATERAL (
                SELECT o.details, o.collected_at FROM app.transit_observations o
@@ -561,8 +564,54 @@ def latest_daejeon_positions(conn: psycopg.Connection, route_id: int,
         """,
         (list(vehicle_nos), route_id),
     ).fetchall()
-    return {plate: {"run_group": run_group, "node_id": node_id, "last_seq": last_seq, "collected_at": collected_at}
-            for plate, run_group, node_id, last_seq, collected_at in rows if run_group and node_id}
+    return {plate: {"run_group": run_group, "node_id": node_id, "last_seq": last_seq, "collected_at": collected_at,
+                    "direction": direction}
+            for plate, run_group, node_id, last_seq, collected_at, direction in rows if run_group and node_id}
+
+
+def latest_snapshot_runs(conn: psycopg.Connection, route_id: int, vehicle_nos: Sequence[str],
+                         since: datetime) -> dict[str, dict[str, Any]]:
+    """차량별로 그 노선에 마지막으로 저장한, 운행 키가 있는 TAGO 위치 기록(운행 키·마지막 확인 순번·방향·수집 시각).
+
+    since 이전 기록은 어차피 운행 분리 간격을 넘어 새 운행이 되므로 읽지 않는다.
+    """
+    if not vehicle_nos:
+        return {}
+    rows = conn.execute(
+        f"""
+        SELECT v.plate, last.details ->> 'run_group', (last.details ->> 'run_last_seq')::int, last.collected_at,
+               last.details ->> 'run_direction'
+          FROM unnest(%s::text[]) AS v(plate)
+         CROSS JOIN LATERAL (
+               SELECT o.details, o.collected_at FROM app.transit_observations o
+                WHERE o.vehicle_no = v.plate AND o.route_id = %s AND o.collected_at >= %s AND {SNAPSHOT_RUN_FILTER}
+                ORDER BY o.collected_at DESC, o.id DESC
+                LIMIT 1) last
+        """,
+        (list(vehicle_nos), route_id, since),
+    ).fetchall()
+    return {plate: {"run_group": run_group, "node_id": "", "last_seq": last_seq, "collected_at": collected_at,
+                    "direction": direction}
+            for plate, run_group, last_seq, collected_at, direction in rows}
+
+
+def snapshot_positions_since(conn: psycopg.Connection, route_ids: Sequence[int],
+                             since: datetime) -> list[dict[str, Any]]:
+    """노선별 TAGO 위치 기록 가운데 운행 키가 있는 것(since 이후 수집분)을 수집 순으로. 조회를 보낸 시각을 함께 준다."""
+    if not route_ids:
+        return []
+    rows = conn.execute(
+        f"""
+        SELECT o.id, o.route_id, o.pattern_key, o.stop_seq, o.vehicle_no, o.collected_at,
+               o.details ->> 'run_group', f.requested_at
+          FROM app.transit_observations o JOIN app.api_fetches f ON f.id = o.fetch_id
+         WHERE o.route_id = ANY(%s) AND o.collected_at >= %s AND {SNAPSHOT_RUN_FILTER}
+         ORDER BY o.route_id, o.collected_at, o.id
+        """,
+        (list(route_ids), since),
+    ).fetchall()
+    keys = ("id", "route_id", "pattern_key", "stop_seq", "vehicle_no", "collected_at", "run_group", "requested_at")
+    return [dict(zip(keys, row)) for row in rows]
 
 
 def daejeon_positions_since(conn: psycopg.Connection, route_ids: Sequence[int],
@@ -635,20 +684,46 @@ def arrival_predictions(conn: psycopg.Connection, *, route_id: int, stop_id: int
 
 
 def eta_error_collection_status(conn: psycopg.Connection, since: datetime | None = None) -> dict[str, Any]:
-    """ETA 오차 표본 수집 현황(읽기 전용): 대전시 위치 기록과 도출한 도착 이벤트의 수·최근 수집 시각."""
-    positions = conn.execute(
-        f"SELECT count(*), count(DISTINCT o.details ->> 'run_group'), max(o.collected_at) "
-        f"FROM app.transit_observations o WHERE {DAEJEON_POSITION_FILTER} "
-        "AND (%s::timestamptz IS NULL OR o.collected_at >= %s::timestamptz)", (since, since)).fetchone()
-    events = conn.execute(
-        "SELECT quality, count(*), max(collected_at) FROM app.transit_observations "
-        "WHERE kind = 'event' AND event_type = 'arrival' AND event_key LIKE 'daejeon-position-arrival:%%' "
-        "AND (%s::timestamptz IS NULL OR collected_at >= %s::timestamptz) GROUP BY quality ORDER BY quality",
-        (since, since)).fetchall()
+    """ETA 오차 표본 수집 현황(읽기 전용): 운행 키를 남긴 위치 기록과 도출한 도착 이벤트의 수·최근 수집 시각.
+
+    합계와 함께 위치 원천(대전시 / TAGO)별 수를 준다.
+    """
+    def position_counts(condition: str) -> dict[str, Any]:
+        row = conn.execute(
+            f"SELECT count(*), count(DISTINCT o.details ->> 'run_group'), max(o.collected_at) "
+            f"FROM app.transit_observations o WHERE {condition} "
+            "AND (%s::timestamptz IS NULL OR o.collected_at >= %s::timestamptz)", (since, since)).fetchone()
+        return {"count": row[0], "runs": row[1], "latest_collected_at": row[2]}
+
+    def event_counts(prefix: str) -> dict[str, Any]:
+        rows = conn.execute(
+            "SELECT quality, count(*), max(collected_at) FROM app.transit_observations "
+            "WHERE kind = 'event' AND event_type = 'arrival' AND event_key LIKE %s "
+            "AND (%s::timestamptz IS NULL OR collected_at >= %s::timestamptz) GROUP BY quality ORDER BY quality",
+            (prefix + "%", since, since)).fetchall()
+        return {"by_quality": {quality: count for quality, count, _ in rows},
+                "latest_collected_at": max((latest for _, _, latest in rows), default=None)}
+
+    positions = {"daejeon": position_counts(DAEJEON_POSITION_FILTER), "tago": position_counts(SNAPSHOT_RUN_FILTER)}
+    events = {"daejeon": event_counts("daejeon-position-arrival:"), "tago": event_counts("tago-position-arrival:")}
+    qualities: dict[str, int] = {}
+    for source in events.values():
+        for quality, count in source["by_quality"].items():
+            qualities[quality] = qualities.get(quality, 0) + count
     return {
-        "position_records": {"count": positions[0], "runs": positions[1], "latest_collected_at": positions[2]},
-        "arrival_events": {"by_quality": {quality: count for quality, count, _ in events},
-                           "latest_collected_at": max((latest for _, _, latest in events), default=None)},
+        "position_records": {
+            "count": sum(source["count"] for source in positions.values()),
+            "runs": sum(source["runs"] for source in positions.values()),
+            "latest_collected_at": max((source["latest_collected_at"] for source in positions.values()
+                                        if source["latest_collected_at"] is not None), default=None),
+            "by_source": positions,
+        },
+        "arrival_events": {
+            "by_quality": dict(sorted(qualities.items())),
+            "latest_collected_at": max((source["latest_collected_at"] for source in events.values()
+                                        if source["latest_collected_at"] is not None), default=None),
+            "by_source": events,
+        },
     }
 
 
@@ -918,6 +993,17 @@ def provider_call_count(conn: psycopg.Connection, provider: str, since: datetime
                             (provider, since)).fetchone()[0]
     return conn.execute("SELECT count(*) FROM app.api_fetches WHERE provider = %s AND api_kind = %s "
                         "AND requested_at >= %s", (provider, api_kind, since)).fetchone()[0]
+
+
+def provider_limit_error_since(conn: psycopg.Connection, provider: str, api_kind: str, since: datetime) -> bool:
+    """since 이후 그 서비스가 호출 한도 초과로 거절된 적이 있는지(HTTP 429 또는 포털 게이트웨이 코드 22).
+
+    일일 한도를 넘긴 뒤에는 같은 호출이 계속 거절되므로, 표본 수집이 그날 남은 시간에 호출을 멈추는 데 쓴다. TAGO의 동시 세션
+    초과(코드 99)는 일시 오류라 넣지 않는다.
+    """
+    return conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM app.api_fetches WHERE provider = %s AND api_kind = %s AND requested_at >= %s "
+        "AND (http_status = 429 OR provider_code = '22'))", (provider, api_kind, since)).fetchone()[0]
 
 
 def shape_summary(conn: psycopg.Connection) -> dict[str, Any]:

@@ -18,9 +18,10 @@ BACKEND_ODSAY_DAILY_CALL_LIMIT이 있을 때만, 남은 한도만큼. app/workfl
 실시간 대상은 .env.api의 BACKEND_REALTIME_POSITION_ROUTE_IDS·BACKEND_REALTIME_ARRIVAL_STOP_IDS(쉼표 구분)이며,
 매 회 설정을 다시 읽으므로 목록을 고치면 다음 회부터 등록·해제가 반영된다. 실제 외부 호출은 이 워커만 수행한다.
 
-ETA 오차 표본 수집(BACKEND_ETA_ERROR_SAMPLING_ENABLED, 기본 꺼짐)을 켜면 설정한 정류소의 도착정보와 노선의 대전시 위치를
-수집 시간대(KST) 동안 짧은 주기로 받는다. 이 대상만 그 주기로 돌고 나머지는 공통 간격 그대로이며, 수집한 위치 기록에서 도착
-이벤트와 오차 표본을 만든다(app/workflows/eta_error_sampling.py). 설정이 빠졌으면 표본 수집만 건너뛰고 나머지는 계속한다.
+ETA 오차 표본 수집(BACKEND_ETA_ERROR_SAMPLING_ENABLED, 기본 꺼짐)을 켜면 설정한 정류소의 도착정보와 노선의 위치(대전시
+또는 TAGO, BACKEND_ETA_ERROR_POSITION_SOURCE)를 수집 시간대(KST) 동안 짧은 주기로 받는다. 이 대상만 그 주기로 돌고 나머지는
+공통 간격 그대로이며, 수집한 위치 기록에서 도착 이벤트와 오차 표본을 만든다(app/workflows/eta_error_sampling.py). 설정이
+빠졌으면 표본 수집만 건너뛰고 나머지는 계속한다.
 """
 
 from __future__ import annotations
@@ -240,9 +241,11 @@ class Worker:
                 for plan in due:
                     try:
                         # 실행 시점은 스케줄러가 간격 규칙으로 정했으므로 재사용 판정 없이 조회한다. 짧은 주기로 도는
-                        # 표본 수집 대상은 정상 응답의 원본 본문을 남기지 않는다(오류 응답만 남김).
-                        outcome = collector.collect(plan.target, force=True,
-                                                    store_body=plan.target_key not in intervals)
+                        # 표본 수집 대상은 정상 응답의 원본 본문을 남기지 않고(오류 응답만 남김), TAGO 노선 위치에는
+                        # 운행 키를 남긴다.
+                        sampled = plan.target_key in intervals
+                        outcome = collector.collect(plan.target, force=True, store_body=not sampled,
+                                                    track_runs=sampled)
                     except (DbError, OSError) as exc:
                         logger.error("실시간 수집 실패 %s: %s", plan.target_key, exc)
                         result.outcomes.append({"target_key": plan.target_key, "action": "error", "reason": str(exc)})

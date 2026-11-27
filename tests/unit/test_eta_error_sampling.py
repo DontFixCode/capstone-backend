@@ -79,6 +79,36 @@ class RunSplitTest(unittest.TestCase):
         self.assertEqual(next_run_group(state, node_id="8001051", stop_seq=51, collected_at=at(600), **self.COMMON),
                          ("run-1", False), "설정값까지는 같은 운행")
 
+    def test_direction_change_starts_another_run(self):
+        state = VehicleState("run-1", "8001050", 50, at(0), "0")
+        turned, started = next_run_group(state, node_id="8001051", stop_seq=51, collected_at=at(90), direction="1",
+                                         **self.COMMON)
+        self.assertTrue(started, "정류소 방향이 바뀌면 돌아오는 운행이다")
+        self.assertNotEqual(turned, "run-1")
+        for direction in ("0", None):
+            self.assertEqual(next_run_group(state, node_id="8001051", stop_seq=51, collected_at=at(90),
+                                            direction=direction, **self.COMMON), ("run-1", False))
+        unknown = VehicleState("run-1", "8001050", 50, at(0))
+        self.assertEqual(next_run_group(unknown, node_id="8001051", stop_seq=51, collected_at=at(90), direction="1",
+                                        **self.COMMON), ("run-1", False), "직전 방향을 모르면 방향으로 나누지 않는다")
+
+    def test_snapshot_records_keep_the_run_while_the_stop_is_unchanged(self):
+        """조회마다 모두 저장하는 TAGO 기록: 정류소가 그대로여도 같은 운행으로 남고, 나누는 조건은 같다."""
+        common = dict(route_external_id="DJB30300130", vehicle_no="대전75자1234", run_gap_seconds=600)
+        first, started = rules.snapshot_run_group(None, stop_seq=10, direction="0", collected_at=at(0), **common)
+        self.assertEqual((first, started), ("tago:DJB30300130:대전75자1234:20261127T000000Z", True))
+        state = VehicleState(first, "", 10, at(0), "0")
+        self.assertEqual(rules.snapshot_run_group(state, stop_seq=10, direction="0", collected_at=at(90), **common),
+                         (first, False), "정류소가 그대로인 기록도 같은 운행이다")
+        self.assertEqual(rules.snapshot_run_group(state, stop_seq=None, direction=None, collected_at=at(90), **common),
+                         (first, False), "순번을 정하지 못한 기록도 같은 운행에 남긴다")
+        for change in (dict(stop_seq=9, direction="0", collected_at=at(90)),
+                       dict(stop_seq=11, direction="1", collected_at=at(90)),
+                       dict(stop_seq=11, direction="0", collected_at=at(601))):
+            run, started = rules.snapshot_run_group(state, **change, **common)
+            self.assertTrue(started, change)
+            self.assertNotEqual(run, first)
+
 
 class PositionRecordTest(unittest.TestCase):
     """대전시 노선 위치 항목(2026-11-27 실응답 형식)을 정류소가 바뀐 기록만 관측 행으로 만든다."""
@@ -170,6 +200,142 @@ class PositionRecordTest(unittest.TestCase):
         self.assertEqual(service.API_KIND["daejeon_positions"], "positions")
         self.assertTrue(realtime_target_key(RealtimeTarget("positions", "DJB30300130")).startswith("tago:"),
                         "TAGO 노선 위치 대상의 키는 그대로다")
+
+
+class SnapshotRecordTest(unittest.TestCase):
+    """TAGO 노선 위치 항목: 조회마다 모든 차량을 관측 행으로 남기고, 표본 수집 대상이면 운행 키를 함께 남긴다."""
+
+    ROUTE, ROUTE_ID = "DJB30300130", 7
+    NODES = ["8002485", "8002486", "8002487", "8002488", "8001940", "8001941"]
+    DIRECTIONS = ["0", "0", "0", "0", "1", "1"]
+
+    def setUp(self):
+        self.stored: dict[str, dict] = {}   # 차량번호 → 마지막 저장 기록(저장소 대역)
+        self.since: list[datetime] = []
+        visits = [{"pattern_key": "p1:608", "seq": seq, "source_node_order": str(seq),
+                   "stop_external_id": f"DJB{node}", "stop_id": 100 + seq, "direction_code": direction}
+                  for seq, (node, direction) in enumerate(zip(self.NODES, self.DIRECTIONS), start=1)]
+
+        def latest(conn, route_id, plates, since):
+            self.since.append(since)
+            return {p: self.stored[p] for p in plates if p in self.stored and self.stored[p]["collected_at"] >= since}
+
+        repo = service.repository
+        for patch in (
+            mock.patch.object(repo, "route_ids", lambda conn, ids: {self.ROUTE: self.ROUTE_ID}),
+            mock.patch.object(repo, "route_visits", lambda conn, ids: {self.ROUTE_ID: visits}),
+            mock.patch.object(repo, "stop_ids", lambda conn, ids: {v["stop_external_id"]: v["stop_id"]
+                                                                    for v in visits if v["stop_external_id"] in ids}),
+            mock.patch.object(repo, "latest_snapshot_runs", latest),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    @staticmethod
+    def item(plate: str, order: int, node: str | None = None) -> dict:
+        node = node or SnapshotRecordTest.NODES[order - 1]
+        return {"routenm": 608, "routetp": "간선버스", "nodeid": f"DJB{node}", "nodenm": "정류소", "nodeord": order,
+                "vehicleno": plate, "gpslati": 36.335552, "gpslong": 127.449017}
+
+    def poll(self, items, seconds: float, fetch_id: int = 1, run_gap_seconds: float | None = 600):
+        rows = service.normalize_positions(None, self.ROUTE, [(1, fetch_id, items)], {fetch_id: at(seconds)}, "v1",
+                                           run_gap_seconds=run_gap_seconds)
+        for row in rows:
+            if "run_group" in row.details:
+                self.stored[row.vehicle_no] = {
+                    "run_group": row.details["run_group"], "node_id": "", "last_seq": row.details["run_last_seq"],
+                    "collected_at": row.collected_at, "direction": row.details["run_direction"]}
+        return rows
+
+    def test_every_snapshot_is_stored_with_the_same_run_key(self):
+        first = self.poll([self.item("대전75자2719", 2), self.item("대전75자2113", 5)], 0)
+        self.assertEqual([(r.vehicle_no, r.stop_seq, r.details["run_started"], r.details["run_direction"])
+                          for r in first], [("대전75자2719", 2, True, "0"), ("대전75자2113", 5, True, "1")])
+        run = first[0].details["run_group"]
+        self.assertEqual(run, "tago:DJB30300130:대전75자2719:20261127T000000Z")
+        self.assertIsNone(first[0].run_key, "회차 키 컬럼은 비워 둔다")
+        self.assertIsNotNone(first[0].lat, "TAGO 위치 행은 좌표를 그대로 남긴다")
+        same = self.poll([self.item("대전75자2719", 2)], 90, fetch_id=2)
+        self.assertEqual([(r.stop_seq, r.details["run_group"], r.details["run_started"]) for r in same],
+                         [(2, run, False)], "정류소가 그대로여도 행을 남기고 같은 운행이다")
+        moved = self.poll([self.item("대전75자2719", 4)], 180, fetch_id=3)
+        self.assertEqual((moved[0].details["run_group"], moved[0].details["run_last_seq"]), (run, 4))
+        self.assertEqual(self.since[-1], at(180 - 600), "운행 분리 간격보다 오래된 기록은 읽지 않는다")
+
+    def test_direction_change_order_decrease_or_gap_starts_another_run(self):
+        run = self.poll([self.item("대전75자2719", 4)], 0)[0].details["run_group"]
+        turned = self.poll([self.item("대전75자2719", 5)], 90, fetch_id=2)[0]
+        self.assertTrue(turned.details["run_started"], "방향이 바뀌면 돌아오는 운행이다")
+        self.assertNotEqual(turned.details["run_group"], run)
+        back = self.poll([self.item("대전75자2719", 1)], 180, fetch_id=3)[0]
+        self.assertTrue(back.details["run_started"], "경유 순번이 줄면 다음 운행이다")
+        late = self.poll([self.item("대전75자2719", 2)], 180 + 601, fetch_id=4)[0]
+        self.assertTrue(late.details["run_started"], "기록 간격이 설정값을 넘으면 다른 운행이다")
+        self.assertEqual(len({run, turned.details["run_group"], back.details["run_group"],
+                              late.details["run_group"]}), 4)
+
+    def test_unmatched_position_keeps_the_run_and_no_key_without_tracking(self):
+        run = self.poll([self.item("대전75자2719", 2)], 0)[0].details["run_group"]
+        # nodeord 3의 경유 정류소와 응답의 정류소가 달라 경유 위치를 정하지 못한 기록.
+        odd = self.poll([self.item("대전75자2719", 3, node="8001941")], 90, fetch_id=2)[0]
+        self.assertEqual((odd.stop_seq, odd.details["run_group"], odd.details["run_last_seq"],
+                          odd.details["run_direction"]), (None, run, 2, "0"))
+        plain = self.poll([self.item("대전75자2719", 3), {**self.item("", 4), "vehicleno": None}], 180, fetch_id=3,
+                          run_gap_seconds=None)
+        self.assertEqual(len(plain), 2)
+        self.assertTrue(all("run_group" not in row.details for row in plain),
+                        "표본 수집 대상이 아닌 조회에는 운행 키를 남기지 않는다")
+        tracked = self.poll([{**self.item("", 4), "vehicleno": None}], 270, fetch_id=4)
+        self.assertNotIn("run_group", tracked[0].details, "차량번호가 없는 항목은 운행에 잇지 못한다")
+
+
+class SnapshotArrivalTest(unittest.TestCase):
+    """TAGO 위치 기록의 도착 이벤트: 처음으로 대상 순번 이상에서 확인된 조회와 그 직전 조회 사이의 범위다."""
+
+    @staticmethod
+    def snap(obs_id: int, seq: int | None, received: float, run: str = "tago:run-1", requested: float | None = None):
+        """received초에 응답을 받은 조회의 기록. 조회를 보낸 시각은 그 1초 전이다."""
+        return rules.SnapshotPosition(obs_id, run, seq, at(received - 1 if requested is None else requested),
+                                      at(received))
+
+    def test_arrival_is_between_the_two_snapshots(self):
+        items = [self.snap(1, 18, 0), self.snap(2, 19, 90), self.snap(3, 19, 180), self.snap(4, 20, 270),
+                 self.snap(5, 20, 360), self.snap(6, 21, 450)]
+        (event,) = rules.derive_snapshot_arrivals(items, [20])
+        self.assertEqual((event.quality, event.event_at, event.basis), ("bounded", None, rules.BASIS_SNAPSHOT_PAIR))
+        self.assertEqual((event.lower_at, event.upper_at), (at(179), at(270)),
+                         "하한은 직전 조회를 보낸 시각, 상한은 처음 대상 이상으로 확인된 응답을 받은 시각")
+        self.assertEqual((event.lower_stop_seq, event.upper_stop_seq, event.source_observation_ids), (19, 20, (3, 4)))
+        self.assertEqual(event.event_key, "tago-position-arrival:tago:run-1:20")
+        self.assertEqual(event.collected_at, at(270))
+
+    def test_skipped_target_is_still_bounded_by_the_two_snapshots(self):
+        items = [self.snap(1, 19, 0), self.snap(2, 22, 90)]
+        (event,) = rules.derive_snapshot_arrivals(items, [20])
+        self.assertEqual((event.lower_at, event.upper_at, event.upper_stop_seq), (at(-1), at(90), 22))
+        both = rules.derive_snapshot_arrivals(items, [20, 21])
+        self.assertEqual([(e.stop_seq, e.lower_at, e.upper_at) for e in both],
+                         [(20, at(-1), at(90)), (21, at(-1), at(90))])
+
+    def test_no_event_without_a_snapshot_before_the_target(self):
+        self.assertEqual(rules.derive_snapshot_arrivals([self.snap(1, 20, 0), self.snap(2, 21, 90)], [20]), [],
+                         "처음 확인됐을 때 이미 대상 정류소면 하한을 알 수 없다")
+        self.assertEqual(rules.derive_snapshot_arrivals([self.snap(1, 18, 0), self.snap(2, 19, 90)], [20]), [],
+                         "아직 대상에 닿지 않았다")
+        unknown = [self.snap(1, 19, 0), self.snap(2, None, 90), self.snap(3, 20, 180)]
+        (event,) = rules.derive_snapshot_arrivals(unknown, [20])
+        self.assertEqual(event.lower_at, at(-1), "순번을 모르는 기록은 근거로 쓰지 않는다")
+        no_request_time = [rules.SnapshotPosition(1, "tago:run-1", 19, None, at(0)), self.snap(2, 20, 90)]
+        self.assertEqual(rules.derive_snapshot_arrivals(no_request_time, [20]), [])
+
+    def test_runs_are_not_joined_and_keys_are_stable(self):
+        items = [self.snap(1, 19, 0, run="tago:a"), self.snap(2, 20, 90, run="tago:b"),
+                 self.snap(3, 19, 500, run="tago:b"), self.snap(4, 21, 590, run="tago:a")]
+        events = rules.derive_snapshot_arrivals(items, [20])
+        self.assertEqual([(e.run_group, e.lower_at, e.upper_at) for e in events], [("tago:a", at(-1), at(590))],
+                         "다른 운행의 기록으로 범위를 잡지 않는다")
+        again = rules.derive_snapshot_arrivals(list(reversed(items)), [20])
+        self.assertEqual([e.event_key for e in again], [e.event_key for e in events])
 
 
 class ArrivalEventTest(unittest.TestCase):
@@ -308,6 +474,7 @@ class MemoryStore:
 
     def __init__(self):
         self.positions: list[dict] = []
+        self.snapshots: list[dict] = []
         self.predictions: list[dict] = []
         self.events: dict[str, dict] = {}
         self.samples: dict[tuple, dict] = {}
@@ -317,6 +484,12 @@ class MemoryStore:
         self.positions.append({"id": obs_id, "route_id": self.ROUTE_ID, "pattern_key": self.PATTERN, "stop_seq": seq,
                                "vehicle_no": "대전75자1234", "collected_at": at(arr + 20), "run_group": run,
                                "arr_time_at": at(arr).isoformat()})
+
+    def add_snapshot(self, obs_id: int, seq: int, received: float, run: str = "tago:DJB30300130:대전75자1234:run1"):
+        """received초에 응답을 받은 TAGO 조회의 기록(조회를 보낸 시각은 그 1초 전)."""
+        self.snapshots.append({"id": obs_id, "route_id": self.ROUTE_ID, "pattern_key": self.PATTERN, "stop_seq": seq,
+                               "vehicle_no": "대전75자1234", "collected_at": at(received), "run_group": run,
+                               "requested_at": at(received - 1)})
 
     def add_prediction(self, obs_id: int, basis: float, remaining: float, msg_tp: str = "03"):
         self.predictions.append({"id": obs_id, "basis_at": at(basis), "predicted_arrival_at": at(basis + remaining),
@@ -352,6 +525,8 @@ class MemoryStore:
             mock.patch.object(transit, "route_visits", lambda conn, ids: {self.ROUTE_ID: visits}),
             mock.patch.object(transit, "daejeon_positions_since",
                               lambda conn, ids, since: [p for p in self.positions if p["collected_at"] >= since]),
+            mock.patch.object(transit, "snapshot_positions_since",
+                              lambda conn, ids, since: [p for p in self.snapshots if p["collected_at"] >= since]),
             mock.patch.object(transit, "existing_event_keys",
                               lambda conn, keys: {key for key in keys if key in self.events}),
             mock.patch.object(transit, "insert_arrival_event", insert_event),
@@ -427,6 +602,35 @@ class DeriveFlowTest(unittest.TestCase):
         self.assertEqual(result, {"status": "skipped", "reason": "eta_error_samples_table_missing"})
         self.assertEqual(store.events, {})
 
+    def test_tago_source_bounds_the_arrival_by_the_two_snapshot_times(self):
+        store = self.filled_store()   # 대전시 위치 기록도 들어 있지만 TAGO 원천일 때는 읽지 않는다
+        for obs_id, (seq, received) in enumerate([(19, 830), (19, 920), (20, 1010), (21, 1100)], start=11):
+            store.add_snapshot(obs_id, seq, received)
+        config = sampling_config(eta_error_sampling_stops="DJB8001488", eta_error_position_source="tago")
+        first = self.run_flow(store, config, at(1200))
+        self.assertEqual((first["events_created"], first["samples_created"]), (1, 2))
+        (key, event), = store.events.items()
+        self.assertEqual(key, "tago-position-arrival:tago:DJB30300130:대전75자1234:run1:20")
+        self.assertEqual((event["quality"], event["event_at"], event["stop_seq"], event["collected_at"]),
+                         ("bounded", None, 20, at(1010)))
+        details = event["details"]
+        self.assertEqual((details["bounded_lower_at"], details["bounded_upper_at"]),
+                         (at(919).isoformat(), at(1010).isoformat()))
+        self.assertEqual((details["provider"], details["rule"], details["basis"], details["source_observation_ids"]),
+                         ("tago", "tago-position-arrival/1", "snapshot_before_to_snapshot_at_or_after", [12, 13]))
+        self.assertNotIn("arr_time_meaning", details)
+        sample = store.samples[(details["run_group"], "provider", "", "600+")]
+        # 예측 도착 1020초, 도착 범위 (919, 1010] → 오차 −101 ~ −10초.
+        self.assertEqual((sample["error_lower_seconds"], sample["error_upper_seconds"], sample["quality"]),
+                         (-101.0, -10.0, "bounded"))
+        self.assertEqual((sample["details"]["position_source"], sample["details"]["event_rule"]),
+                         ("tago", "tago-position-arrival/1"))
+        again = self.run_flow(store, config, at(1260))
+        self.assertEqual((again["events_created"], again["samples_created"]), (0, 0))
+        # 읽는 범위가 밀려 직전 조회가 빠져도 이미 만든 이벤트는 다시 만들지 않고 다른 범위로 바꾸지도 않는다.
+        late = self.run_flow(store, config, at(920 + 3000 + 30))
+        self.assertEqual((late["events_created"], len(store.events)), (0, 1))
+
 
 class SamplingConfigTest(unittest.TestCase):
     def test_disabled_by_default(self):
@@ -459,9 +663,23 @@ class SamplingConfigTest(unittest.TestCase):
         for name, bad in (("eta_error_sampling_hours", "23-6"), ("eta_error_sampling_hours", "6"),
                           ("eta_error_sampling_hours", "6-25"), ("eta_error_horizon_edges_seconds", "300,120"),
                           ("eta_error_horizon_edges_seconds", "0,120"), ("eta_error_sampling_interval_seconds", "0"),
-                          ("daejeon_position_arr_time_meaning", "guess")):
+                          ("daejeon_position_arr_time_meaning", "guess"), ("eta_error_position_source", "gps"),
+                          ("eta_error_sampling_position_daily_call_limit", "0")):
             with self.assertRaises(ValidationError, msg=(name, bad)):
                 Settings(_env_file=None, **{name: bad})
+
+    def test_position_source_and_its_own_daily_limit(self):
+        default = sampling_config(eta_error_sampling_daily_call_limit=5000)
+        self.assertEqual((default.position_source, default.uses_tago_positions), ("daejeon", False))
+        self.assertEqual(default.services, {"arrivals": ("daejeon", 5000), "positions": ("daejeon", 5000)},
+                         "노선 위치 상한을 비우면 공통 상한을 쓴다")
+        self.assertEqual(sampling_config(eta_error_position_source="").position_source, "daejeon")
+        tago = sampling_config(eta_error_position_source=" TAGO ", eta_error_sampling_daily_call_limit=5000,
+                               eta_error_sampling_position_daily_call_limit="7000")
+        self.assertEqual((tago.position_source, tago.uses_tago_positions), ("tago", True))
+        self.assertEqual(tago.services, {"arrivals": ("daejeon", 5000), "positions": ("tago", 7000)})
+        self.assertEqual(sampling_config(eta_error_position_source="tago").services,
+                         {"arrivals": ("daejeon", None), "positions": ("tago", None)})
 
     def test_hours_are_kst(self):
         config = sampling_config(eta_error_sampling_hours="6-23")
@@ -550,28 +768,72 @@ class SamplingScheduleTest(unittest.TestCase):
         self.assertEqual(calls, 1)
         self.assertLessEqual(due.at - clock, timedelta(seconds=60))
 
-    def test_daily_call_limit_drops_only_the_exhausted_service(self):
-        config = sampling_config(eta_error_sampling_daily_call_limit=10000)
-        counts = {"arrivals": 10000, "positions": 9999}
+    def test_tago_source_samples_routes_through_the_tago_position_target(self):
+        plan = flow.collection_plan(None, sampling_config(eta_error_position_source="tago"), self.INSIDE)
+        self.assertEqual({(t.kind, t.external_id) for t in plan.targets},
+                         {("arrivals", "DJB8001488"), ("arrivals", "DJB8002695"), ("positions", "DJB30300130")})
+        self.assertEqual(plan.intervals, {
+            "daejeon:getArrInfoByStopID?nodeId=DJB8001488": 60.0,
+            "daejeon:getArrInfoByStopID?nodeId=DJB8002695": 60.0,
+            "tago:getRouteAcctoBusLcList?cityCode=25&routeId=DJB30300130": 60.0})
+        # 검색·혼잡도가 등록한 같은 노선의 TAGO 위치 대상과는 한 대상으로 합친다(호출은 한 번).
+        regular = RealtimeTarget("positions", "DJB30300130", frozenset({"congestion"}))
+        merged = {(t.kind, t.external_id): t.sources
+                  for t in collection_targets(Settings(_env_file=None), extra=[*plan.targets, regular])}
+        self.assertEqual(merged[("positions", "DJB30300130")], frozenset({"congestion", "eta_error_sampling"}))
+        self.assertEqual(len(merged), 3)
+
+    def plan_with(self, config, counts, limit_errors=()):
         seen = []
 
         def count(conn, provider, since, api_kind=None):
-            seen.append((provider, since, api_kind))
-            return counts[api_kind]
+            seen.append((provider, api_kind, since))
+            return counts[(provider, api_kind)]
 
-        with mock.patch.object(flow.transit_repository, "provider_call_count", side_effect=count):
-            plan = flow.collection_plan(object(), config, self.INSIDE)
-            self.assertEqual((plan.status, plan.limited), ("active", {"arrivals": 10000}))
-            self.assertEqual([t.kind for t in plan.targets], ["daejeon_positions"])
-            counts["positions"] = 12000
-            stopped = flow.collection_plan(object(), config, self.INSIDE)
-        self.assertEqual((stopped.status, stopped.targets, stopped.intervals),
-                         ("daily_call_limit_reached", (), {}))
-        self.assertEqual({item[0] for item in seen}, {"daejeon"})
-        self.assertEqual({item[1] for item in seen}, {datetime(2026, 11, 26, 15, 0, tzinfo=UTC)},
+        def limit_error(conn, provider, api_kind, since):
+            return (provider, api_kind) in limit_errors
+
+        with mock.patch.object(flow.transit_repository, "provider_call_count", side_effect=count), \
+                mock.patch.object(flow.transit_repository, "provider_limit_error_since", side_effect=limit_error):
+            return flow.collection_plan(object(), config, self.INSIDE), seen
+
+    def test_daily_call_limit_of_either_service_stops_all_sampling(self):
+        config = sampling_config(eta_error_sampling_daily_call_limit=10000)
+        under = {("daejeon", "arrivals"): 9999, ("daejeon", "positions"): 9999}
+        plan, seen = self.plan_with(config, under)
+        self.assertEqual((plan.status, len(plan.targets), plan.limited), ("active", 3, {}))
+        self.assertEqual({item[2] for item in seen}, {datetime(2026, 11, 26, 15, 0, tzinfo=UTC)},
                          "그날(KST) 0시부터 센다")
-        unlimited = flow.collection_plan(object(), sampling_config(), self.INSIDE)
-        self.assertEqual(len(unlimited.targets), 3, "상한을 비우면 제한하지 않는다")
+        stopped, _ = self.plan_with(config, {**under, ("daejeon", "arrivals"): 10000})
+        self.assertEqual((stopped.status, stopped.targets, stopped.intervals, stopped.limited),
+                         ("daily_call_limit_reached", (), {}, {"arrivals": 10000}),
+                         "표본은 두 서비스가 다 있어야 만들어지므로 한쪽만 받지 않는다")
+        unlimited, _ = self.plan_with(sampling_config(), {("daejeon", "arrivals"): 10 ** 6,
+                                                         ("daejeon", "positions"): 10 ** 6})
+        self.assertEqual(len(unlimited.targets), 3, "상한을 비우면 호출 수로는 제한하지 않는다")
+
+    def test_position_service_has_its_own_provider_and_limit(self):
+        config = sampling_config(eta_error_position_source="tago", eta_error_sampling_daily_call_limit=5000,
+                                 eta_error_sampling_position_daily_call_limit=7000)
+        counts = {("daejeon", "arrivals"): 4999, ("tago", "positions"): 6999}
+        plan, seen = self.plan_with(config, counts)
+        self.assertEqual(plan.status, "active")
+        self.assertEqual({item[:2] for item in seen}, {("daejeon", "arrivals"), ("tago", "positions")},
+                         "TAGO 원천이면 노선 위치 호출은 TAGO 기록에서 센다")
+        stopped, _ = self.plan_with(config, {**counts, ("tago", "positions"): 7000})
+        self.assertEqual((stopped.status, stopped.limited), ("daily_call_limit_reached", {"positions": 7000}))
+
+    def test_a_limit_rejection_today_stops_sampling_even_under_the_configured_limit(self):
+        """제공처가 그날 한도 초과로 거절했으면(2026-11-27 대전시 노선 위치: 100건째에 HTTP 429) 호출을 멈춘다."""
+        counts = {("daejeon", "arrivals"): 700, ("daejeon", "positions"): 138}
+        for config in (sampling_config(eta_error_sampling_daily_call_limit=5000), sampling_config()):
+            stopped, _ = self.plan_with(config, counts, limit_errors={("daejeon", "positions")})
+            self.assertEqual((stopped.status, stopped.targets, stopped.limited),
+                             ("daily_call_limit_reached", (), {"positions": 138}))
+        tago = sampling_config(eta_error_position_source="tago")
+        active, _ = self.plan_with(tago, {("daejeon", "arrivals"): 700, ("tago", "positions"): 138},
+                                   limit_errors={("daejeon", "positions")})
+        self.assertEqual(active.status, "active", "쓰지 않는 서비스의 거절은 보지 않는다")
 
 
 if __name__ == "__main__":

@@ -291,6 +291,97 @@ class EtaErrorSamplingDbTest(base.Phase4TestCase):
         self.assertEqual(self.query("SELECT count(*) FROM app.transit_observations WHERE kind = 'position' "
                                     "AND route_id = %s", (self.route_id,)), [(0,)])
 
+        # 한도 초과로 거절된 날에는 상한 설정이 없어도 표본 수집 호출을 멈춘다(도착정보 쪽도 함께).
+        calls = len(self.daejeon.requests)
+        self.offset = timedelta(seconds=260)
+        stopped = worker.run_pass()
+        self.assertEqual((stopped.targets, stopped.eta_errors["status"], stopped.eta_errors["daily_call_limit_reached"]),
+                         (0, "daily_call_limit_reached", {"positions": 2}))
+        self.assertEqual(len(self.daejeon.requests), calls)
+
+    def test_tago_source_keeps_every_snapshot_and_bounds_the_arrival_by_query_times(self):
+        """노선 위치 원천이 TAGO면 대전시 노선 위치를 부르지 않고, 도착을 앞뒤 조회 시각 사이의 범위로 남긴다."""
+        self.use_settings(eta_error_position_source="tago")
+        worker = self.sampling_worker()
+        key = "tago:getRouteAcctoBusLcList?cityCode=25&routeId=" + ROUTE
+        now = datetime.now(UTC).replace(microsecond=0)
+
+        def tago_bus(order: int) -> dict:
+            return {"routenm": 608, "routetp": "간선버스", "nodeid": f"DJB{NODES[order - 1]}",
+                    "nodenm": f"합성정류소{order}", "nodeord": order, "vehicleno": PLATE,
+                    "gpslati": 36.335552, "gpslong": 127.449017}
+
+        # ---- 1·2회차: 차량이 대상 정류소(순번 3) 직전(순번 2)에 머문다. 조회마다 행을 남긴다.
+        self.tago.world["positions"][ROUTE] = [tago_bus(2)]
+        self.daejeon.arrivals = [arrival(PLATE, 120, now - timedelta(seconds=30))]   # 예측 도착 = now + 90초
+        first = worker.run_pass()
+        self.assertEqual({o["target_key"]: o["action"] for o in first.outcomes},
+                         {key: "published", ARRIVALS_KEY: "published"})
+        self.assertEqual(self.fetches(key), [("tago", "positions", "success", "00", True, True)],
+                         "표본 수집 대상의 정상 응답은 원본 본문을 남기지 않는다")
+        self.offset = timedelta(seconds=130)
+        self.daejeon.arrivals = []
+        second = worker.run_pass()
+        self.assertEqual(second.eta_errors["derived"]["events_created"], 0)
+
+        # ---- 3회차: 대상 정류소를 지나 순번 4에 있다. 도착은 (2회차 조회를 보낸 시각, 3회차 응답을 받은 시각] 범위다.
+        self.offset = timedelta(seconds=260)
+        self.tago.world["positions"][ROUTE] = [tago_bus(4)]
+        third = worker.run_pass()
+        self.assertEqual((third.eta_errors["derived"]["events_created"],
+                          third.eta_errors["derived"]["samples_created"]), (1, 1))
+        self.assertEqual(self.daejeon.calls("getBusPosByRtid"), 0)
+        positions = self.query(
+            "SELECT o.stop_seq, o.run_key, o.location IS NOT NULL, o.details ->> 'run_group', "
+            "o.details ->> 'run_direction', o.id, f.requested_at, f.received_at, o.collected_at "
+            "FROM app.transit_observations o JOIN app.api_fetches f ON f.id = o.fetch_id "
+            "WHERE o.kind = 'position' AND o.route_id = %s ORDER BY o.id", (self.route_id,))
+        self.assertEqual([row[:3] for row in positions], [(2, None, True), (2, None, True), (4, None, True)])
+        run_group = positions[0][3]
+        self.assertTrue(run_group.startswith(f"tago:{ROUTE}:{PLATE}:"))
+        self.assertEqual({row[3] for row in positions}, {run_group}, "같은 운행")
+        self.assertEqual({row[4] for row in positions}, {"0"})
+        lower, upper = positions[1][6], positions[2][7]
+        self.assertEqual(positions[2][8], upper, "관측 행의 수집 시각은 응답을 받은 시각이다")
+        (event,) = self.query(
+            "SELECT id, quality, event_at, run_key, stop_seq, stop_id, vehicle_no, event_key, details, collected_at "
+            "FROM app.transit_observations WHERE kind = 'event'")
+        self.assertEqual(event[1:8], ("bounded", None, None, 3, self.stop_ids[3], PLATE,
+                                      f"tago-position-arrival:{run_group}:3"))
+        details = event[8]
+        self.assertEqual((details["bounded_lower_at"], details["bounded_upper_at"], details["provider"],
+                          details["rule"], details["basis"], details["source_observation_ids"]),
+                         (lower.isoformat(), upper.isoformat(), "tago", "tago-position-arrival/1",
+                          "snapshot_before_to_snapshot_at_or_after", [positions[1][5], positions[2][5]]))
+        self.assertEqual(event[9], upper)
+        (sample,) = self.query(
+            "SELECT run_group, eta_source, horizon_bucket, quality, arrival_lower_at, arrival_upper_at, "
+            "predicted_arrival_at, error_lower_seconds, error_upper_seconds, event_observation_id, "
+            "details ->> 'position_source', details ->> 'event_rule' FROM app.eta_error_samples")
+        self.assertEqual(sample[:6], (run_group, "provider", "120-300", "bounded", lower, upper))
+        self.assertEqual(sample[6], now + timedelta(seconds=90))
+        self.assertAlmostEqual(sample[7], (lower - sample[6]).total_seconds(), places=3)
+        self.assertAlmostEqual(sample[8], (upper - sample[6]).total_seconds(), places=3)
+        self.assertEqual(sample[9:], (event[0], "tago", "tago-position-arrival/1"))
+
+        # ---- 다시 돌려도 늘지 않고, 현황에는 원천별로 나온다.
+        self.offset = timedelta(seconds=390)
+        fourth = worker.run_pass()
+        self.assertEqual((fourth.eta_errors["derived"]["events_created"],
+                          fourth.eta_errors["derived"]["samples_created"]), (0, 0))
+        status = eta_error_status.report(self.settings, self.db, None)
+        collection = status["collection"]
+        self.assertEqual((collection["position_records"]["count"], collection["position_records"]["runs"],
+                          collection["position_records"]["by_source"]["tago"]["count"],
+                          collection["position_records"]["by_source"]["daejeon"]["count"]), (4, 1, 4, 0))
+        self.assertEqual((collection["arrival_events"]["by_quality"],
+                          collection["arrival_events"]["by_source"]["tago"]["by_quality"]),
+                         ({"bounded": 1}, {"bounded": 1}))
+        self.assertEqual(status["sampling"]["position_source"], "tago")
+        described = describe_targets(self.settings, self.db)
+        self.assertEqual({(t["kind"], t["interval_seconds"]) for t in described["targets"]},
+                         {("positions", 60.0), ("arrivals", 60.0)})
+
     def test_no_calls_outside_hours_after_the_daily_limit_or_with_a_config_error(self):
         hour = datetime.now(KST).hour
         start = (hour + 2) % 24

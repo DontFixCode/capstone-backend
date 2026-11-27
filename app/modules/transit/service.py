@@ -269,10 +269,13 @@ class FetchRecorder:
             raise ValueError("FetchRecorder에는 autocommit 연결이 필요합니다(공개 트랜잭션과 분리).")
         self.conn = conn
         self.batch: Batch | None = None
+        self.store_body = True
         self.counts: Counter[str] = Counter()
 
-    def start(self, api_kind: str, key: str, normalizer_version: str) -> Batch:
+    def start(self, api_kind: str, key: str, normalizer_version: str, *, store_body: bool = True) -> Batch:
+        """store_body가 False면 이 배치의 정상·빈 응답은 원본 본문을 남기지 않는다(오류·시간초과 응답은 남긴다)."""
         self.batch = Batch(uuid4(), api_kind, key, normalizer_version)
+        self.store_body = store_body
         return self.batch
 
     def __call__(self, record: AttemptRecord) -> None:
@@ -291,7 +294,8 @@ class FetchRecorder:
             requested_at=parse_utc(record.started_at), received_at=parse_utc(record.received_at),
             http_status=record.http_status, provider_code=record.provider_code, result_status=status,
             total_count=record.total_count if record.total_count is None or record.total_count >= 0 else None,
-            raw_body=record.body, normalizer_version=batch.normalizer_version, error_reason=error_reason,
+            raw_body=record.body if self.store_body or status not in ("success", "empty") else None,
+            normalizer_version=batch.normalizer_version, error_reason=error_reason,
         )
         fetch_id = repository.insert_fetch(self.conn, row)
         batch.attempts.append(RecordedAttempt(fetch_id, row.page_no, row.attempt_no, status))
@@ -883,21 +887,33 @@ def _visit_match(visits: list[dict[str, Any]], stop_ext: str) -> tuple[str | Non
 
 def normalize_positions(
     conn: psycopg.Connection, request_route_id: str, pages: list[tuple[int, int, list[dict[str, Any]]]],
-    collected: dict[int, datetime], static_version: str | None,
+    collected: dict[int, datetime], static_version: str | None, *, run_gap_seconds: float | None = None,
 ) -> list[ObservationRow]:
     """노선별 버스 위치. 응답에 routeid가 없어 노선은 요청 조건으로만 연결하고, 경유 위치는 nodeid·nodeord가 현재
-    패턴의 같은 행과 일치할 때만 확정한다. 원천 관측 시각은 제공되지 않는다."""
+    패턴의 같은 행과 일치할 때만 확정한다. 원천 관측 시각은 제공되지 않는다.
+
+    run_gap_seconds를 주면(ETA 오차 표본 수집 대상 노선) 차량마다 운행 키(details.run_group)를 정해 함께 남긴다
+    (arrival_events.snapshot_run_group). 회차 키는 원천이 주지 않으므로 run_key 컬럼은 비워 둔다.
+    """
     route_map = repository.route_ids(conn, [request_route_id])
     route_internal = route_map.get(request_route_id)
     visits = repository.route_visits(conn, [route_internal]).get(route_internal, []) if route_internal else []
     stop_map = repository.stop_ids(conn, [text_value(i, "nodeid") or "" for _, _, items in pages for i in items])
+    states: dict[str, arrival_events.VehicleState] = {}
+    track_runs = run_gap_seconds is not None and route_internal is not None
+    if track_runs:
+        plates = sorted({plate for _, _, items in pages for i in items if (plate := text_value(i, "vehicleno"))})
+        times = [collected[fetch_id] for _, fetch_id, _ in pages if collected.get(fetch_id) is not None]
+        if plates and times:
+            states = {plate: arrival_events.VehicleState(**row) for plate, row in repository.latest_snapshot_runs(
+                conn, route_internal, plates, min(times) - timedelta(seconds=run_gap_seconds)).items()}
     rows: list[ObservationRow] = []
     for _, fetch_id, items in pages:
         for index, item in enumerate(items):
             node_id = text_value(item, "nodeid")
             order_text = text_value(item, "nodeord")
             lat, lon, coord = parse_coordinate(item.get("gpslati"), item.get("gpslong"))
-            pattern, seq = None, None
+            pattern, seq, direction = None, None, None
             if route_internal is None:
                 position = {"status": "unmatched", "reason": "route_not_in_current_static"}
             elif node_id is None or order_text is None:
@@ -905,16 +921,31 @@ def normalize_positions(
             else:
                 same = [v for v in visits if v["source_node_order"] == order_text]
                 if len(same) == 1 and same[0]["stop_external_id"] == node_id:
-                    pattern, seq = same[0]["pattern_key"], same[0]["seq"]
+                    pattern, seq, direction = same[0]["pattern_key"], same[0]["seq"], same[0].get("direction_code")
                     position = {"status": "matched", "basis": "nodeid_and_nodeord_match_route_stops"}
                 elif not same:
                     position = {"status": "unmatched", "reason": "nodeord_not_in_current_pattern"}
                 else:
                     position = {"status": "unmatched", "reason": "nodeord_stop_mismatch"}
+            vehicle_no = text_value(item, "vehicleno")
+            run_details: dict[str, Any] = {}
+            if track_runs and vehicle_no and collected.get(fetch_id) is not None:
+                state = states.get(vehicle_no)
+                run_group, started = arrival_events.snapshot_run_group(
+                    state, route_external_id=request_route_id, vehicle_no=vehicle_no, stop_seq=seq,
+                    direction=direction, collected_at=collected[fetch_id], run_gap_seconds=run_gap_seconds)
+                carried = None if started else state
+                last_seq = seq if seq is not None else (carried.last_seq if carried else None)
+                last_direction = direction if direction is not None else (carried.direction if carried else None)
+                # 같은 응답에 같은 차량이 다시 나와도 방금 만든 기록을 직전 기록으로 본다.
+                states[vehicle_no] = arrival_events.VehicleState(run_group, "", last_seq, collected[fetch_id],
+                                                                 last_direction)
+                run_details = {"run_group": run_group, "run_started": started, "run_last_seq": last_seq,
+                               "run_direction": last_direction}
             rows.append(ObservationRow(
                 fetch_id=fetch_id, item_index=index, kind="position", collected_at=collected[fetch_id],
                 route_id=route_internal, stop_id=stop_map.get(node_id) if node_id else None,
-                pattern_key=pattern, stop_seq=seq, vehicle_no=text_value(item, "vehicleno"),
+                pattern_key=pattern, stop_seq=seq, vehicle_no=vehicle_no,
                 lat=lat, lon=lon,
                 details={
                     "source": {k: item.get(k) for k in ("routenm", "routetp", "nodeid", "nodenm", "nodeord",
@@ -925,10 +956,11 @@ def normalize_positions(
                     "stop_match": {"status": "matched" if node_id in stop_map else "unmatched"},
                     "position_match": position,
                     "location_status": coord,
-                    "vehicle_no_status": "provided" if text_value(item, "vehicleno") else field_state(item, "vehicleno"),
+                    "vehicle_no_status": "provided" if vehicle_no else field_state(item, "vehicleno"),
                     "not_provided": list(NOT_PROVIDED["positions"]),
                     "collected_at_meaning": "server_received_at (원천 관측 시각 아님)",
                     "static_version": static_version,
+                    **run_details,
                 },
             ))
     return rows
@@ -1034,15 +1066,19 @@ def normalize_daejeon_positions(
             continue
         node_ext = f"{DAEJEON_ID_PREFIX}{node}"
         pattern, seq, visit = _visit_match(visits, node_ext)
+        direction = next((v.get("direction_code") for v in visits
+                          if v["pattern_key"] == pattern and v["seq"] == seq), None) if seq is not None else None
         state = states.get(plate)
         run_group, started = arrival_events.next_run_group(
             state, route_external_id=request_route_id, vehicle_no=plate, node_id=node, stop_seq=seq,
-            collected_at=collected_at, run_gap_seconds=run_gap_seconds)
+            collected_at=collected_at, run_gap_seconds=run_gap_seconds, direction=direction)
         if run_group is None:
             continue
-        last_seq = seq if seq is not None else (None if started or state is None else state.last_seq)
+        carried = None if started else state
+        last_seq = seq if seq is not None else (carried.last_seq if carried else None)
+        last_direction = direction if direction is not None else (carried.direction if carried else None)
         # 같은 응답에 같은 차량이 다시 나와도 방금 만든 기록을 직전 기록으로 본다.
-        states[plate] = arrival_events.VehicleState(run_group, node, last_seq, collected_at)
+        states[plate] = arrival_events.VehicleState(run_group, node, last_seq, collected_at, last_direction)
         arr_time = parse_compact_kst(item.get("ARR_TIME"))
         rows.append(ObservationRow(
             fetch_id=fetch_id, item_index=index, kind="position", collected_at=collected_at,
@@ -1053,6 +1089,7 @@ def normalize_daejeon_positions(
                 "source": dict(item),
                 "request": {"busRouteId": bus_route_id, "routeId": request_route_id},
                 "run_group": run_group, "run_started": started, "run_last_seq": last_seq,
+                "run_direction": last_direction,
                 "arr_time_at": arr_time.isoformat() if arr_time else None,
                 "arr_time_meaning": "unverified (도착·출발 미확인, 설정 BACKEND_DAEJEON_POSITION_ARR_TIME_MEANING으로 해석)",
                 "stored_when": "bus_node_id_changed",
@@ -1157,18 +1194,21 @@ class RealtimeCollector:
         self.db = db
         self.client = client
         self.daejeon_client = daejeon_client
-        # 대전시 노선 위치 기록을 운행으로 나누는 간격(초). ETA 오차 표본 수집 설정에서 받으며, 없으면 그 대상은 수집하지 않는다.
+        # 노선 위치 기록을 운행으로 나누는 간격(초). ETA 오차 표본 수집 설정에서 받는다. 없으면 대전시 노선 위치는 수집하지
+        # 않고, TAGO 노선 위치에는 운행 키를 남기지 않는다.
         self.position_run_gap_seconds = position_run_gap_seconds
         self.interval = timedelta(seconds=interval_seconds)
         self.city_code = city_code
         self.rows = rows
         self.clock = clock
 
-    def collect(self, target: RealtimeTarget, *, force: bool = False, store_body: bool = True) -> CollectOutcome:
-        """store_body가 False면 대전시 정상·빈 응답의 원본 본문을 남기지 않는다(오류 응답은 남긴다).
+    def collect(self, target: RealtimeTarget, *, force: bool = False, store_body: bool = True,
+                track_runs: bool = False) -> CollectOutcome:
+        """store_body가 False면 정상·빈 응답의 원본 본문을 남기지 않는다(오류 응답은 남긴다).
 
-        짧은 주기로 도는 ETA 오차 표본 수집 대상에만 쓴다. 도착정보 항목의 원값은 관측 행의 details.source에 남고, 노선 위치는
-        정류소가 바뀐 항목만 관측 행으로 남는다(바뀌지 않은 항목은 남기지 않는다).
+        짧은 주기로 도는 ETA 오차 표본 수집 대상에만 쓴다. 항목의 원값은 관측 행의 details.source에 남는다. 대전시 노선
+        위치는 정류소가 바뀐 항목만 관측 행으로 남긴다. track_runs가 True면 TAGO 노선 위치의 관측 행에 운행 키를 남긴다
+        (운행 분리 간격 설정이 있을 때).
         """
         key = realtime_target_key(target, self.city_code)
         uses_daejeon = target.kind in DAEJEON_KINDS
@@ -1197,7 +1237,7 @@ class RealtimeCollector:
                 previous = self.client.on_attempt
                 self.client.on_attempt = recorder
                 try:
-                    recorder.start(target.kind, key, REALTIME_NORMALIZER[target.kind])
+                    recorder.start(target.kind, key, REALTIME_NORMALIZER[target.kind], store_body=store_body)
                     if target.kind == "positions":
                         collection = self.client.bus_locations(target.external_id, self.city_code, rows=self.rows)
                     else:
@@ -1220,8 +1260,12 @@ class RealtimeCollector:
                     collected = self._received_times(lock_conn, list(received))
                     versions = repository.current_static_versions(lock_conn)
                     version = str(versions[0]) if len(versions) == 1 else None
-                    normalize = normalize_positions if target.kind == "positions" else normalize_arrivals
-                    observations = normalize(lock_conn, target.external_id, pages, collected, version)
+                    if target.kind == "positions":
+                        observations = normalize_positions(
+                            lock_conn, target.external_id, pages, collected, version,
+                            run_gap_seconds=self.position_run_gap_seconds if track_runs else None)
+                    else:
+                        observations = normalize_arrivals(lock_conn, target.external_id, pages, collected, version)
                     inserted = repository.insert_observations(lock_conn, observations)
                     published_at = repository.clock_now(lock_conn)
                     adopted = batch.adopted_ids()

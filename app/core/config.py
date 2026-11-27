@@ -234,6 +234,12 @@ class Settings(BaseSettings):
     # 서비스(도착정보·노선 위치)별로 그날(KST) 대전시 API 호출 수가 이 값에 닿으면 표본 수집 호출을 멈춘다. 검색·안내용
     # 호출은 계속하므로 계정 한도보다 낮게 잡아 여유를 남긴다. 비우면 제한하지 않는다.
     eta_error_sampling_daily_call_limit: int | None = Field(default=None, gt=0)
+    # 실제 도착 시각을 재는 노선 위치의 원천. daejeon은 대전시 노선 위치(정류소 이벤트 시각 ARR_TIME이 있으나 이 계정의 일일
+    # 한도가 100건으로 확인됨), tago는 TAGO 노선 위치(시각이 없어 도착을 앞뒤 조회 시각 사이의 범위로만 안다)다.
+    eta_error_position_source: Literal["daejeon", "tago"] = "daejeon"
+    # 노선 위치 서비스에만 따로 적용할 일일 호출 상한. 비우면 위의 공통 상한을 쓴다. tago일 때는 검색·안내가 함께 쓰는 TAGO
+    # 노선 위치 호출을 모두 세므로, 그 한도보다 충분히 낮게 잡는다.
+    eta_error_sampling_position_daily_call_limit: int | None = Field(default=None, gt=0)
     # 예측 기준 시각부터 도착까지가 이 시간(초)을 넘으면 예측과 도착을 잇지 않는다(같은 차량의 다른 운행을 잇지 않게 한다).
     eta_error_match_window_seconds: float | None = Field(default=None, gt=0)
     # 잔여시간(예측 도착 − 기준 시각) 구간의 경계(초, 오름차순 쉼표 구분. 예: 120,300,600). 표본 생성과 확률 계산이 같은 값을 쓴다.
@@ -249,12 +255,20 @@ class Settings(BaseSettings):
         return value
 
     @field_validator("eta_error_sampling_interval_seconds", "eta_error_sampling_daily_call_limit",
+                     "eta_error_sampling_position_daily_call_limit",
                      "eta_error_match_window_seconds", "eta_error_run_gap_seconds", "eval_marginal_window_days",
                      "eval_min_marginal_samples", mode="before")
     @classmethod
     def blank_eta_error_setting_is_missing(cls, value: object) -> object:
         if isinstance(value, str):
             return value.strip() or None
+        return value
+
+    @field_validator("eta_error_position_source", mode="before")
+    @classmethod
+    def blank_position_source_is_default(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower() or "daejeon"
         return value
 
     @field_validator("eta_error_sampling_hours", mode="before")
