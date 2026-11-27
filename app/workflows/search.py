@@ -398,6 +398,13 @@ def lookup_walks(
         lookup.query_options = query.options()
         coord_key = (round(query.from_lat, 7), round(query.from_lon, 7), round(query.to_lat, 7),
                      round(query.to_lon, 7), search_option)
+        if coord_key[:2] == coord_key[2:4]:
+            # 출발 좌표와 도착 좌표가 같다(정류소를 출발점으로 한 이동 중 재탐색 등). 걸을 거리가 없으므로 조회하지 않는다.
+            lookup.status, lookup.distance_m, lookup.duration_seconds = "available", 0.0, 0.0
+            lookup.provider, lookup.reason = None, "same_coordinates_no_lookup"
+            results[(from_ref, to_ref)] = lookup
+            stats["same_coordinates"] += 1
+            continue
         response = by_coords.get(coord_key)
         if response is None:
             if client is None or len(by_coords) >= max_lookups:

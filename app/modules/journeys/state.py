@@ -26,6 +26,22 @@ STATE_EVENTS = ("board", "alight", "completed", "cancelled", "missed_bus", "dest
 SUPPORTED_EVENTS = (*STATE_EVENTS, "correction", "transfer_result")
 DEFERRED_EVENTS = {
 }
+# 이동 중 재탐색(선택 스냅샷의 reroute_* 값). 목적지 변경은 새 목적지로, 버스 놓침은 같은 목적지로 현재 위치에서 다시 검색한다.
+REROUTE_DESTINATION, REROUTE_MISSED_BUS = "destination", "missed_bus"
+REROUTE_KEYS = ("reroute_kind", "reroute_search_id", "reroute_status", "reroute_reason", "reroute_requested_at",
+                "reroute_origin")
+
+
+def reroute_kind(snapshot: dict[str, Any]) -> str | None:
+    """선택 스냅샷에 걸려 있는 재탐색의 종류. 목적지가 바뀐 채 새 경로를 아직 수락하지 않았으면 항상 destination이다."""
+    if snapshot.get("destination_changed_at"):
+        return REROUTE_DESTINATION
+    return REROUTE_MISSED_BUS if snapshot.get("reroute_kind") == REROUTE_MISSED_BUS else None
+
+
+def clear_reroute(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """재탐색 값을 뺀 선택 스냅샷(목적지 변경 표시 destination_changed_at은 건드리지 않는다)."""
+    return {key: value for key, value in snapshot.items() if key not in REROUTE_KEYS}
 
 
 class TransitionError(Exception):

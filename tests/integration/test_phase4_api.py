@@ -601,29 +601,201 @@ class JourneyApiTest(Phase4TestCase):
         third = datetime.fromisoformat(self.detail(jid)["guidance"]["nextBoarding"]["predictedArrivalAt"])
         self.assertTrue(timedelta(seconds=595) <= third - second <= timedelta(seconds=605), third - second)
 
-    def test_destination_change_queues_fresh_search_from_current_location(self):
+    # ---- 이동 중 재탐색: 버스 놓침은 지금 위치에서 다시 검색해 더 일찍 도착하는 경로를, 목적지 변경은 새 목적지로 가는
+    #      경로를 제안한다(수락해야 바뀐다). 2026-11-27 사용자 제보 재현.
+
+    def snapshot(self, jid):
+        return self.query("SELECT selected_snapshot FROM app.journeys WHERE id = %s", (UUID(jid),))[0][0]
+
+    def send_location(self, jid, latitude, longitude):
+        response = self.client.put(f"/api/v1/journeys/{jid}/location", headers=self.auth(self.user_a),
+                                   json={"latitude": latitude, "longitude": longitude,
+                                         "observedAt": datetime.now(UTC).isoformat(), "accuracyM": 8})
+        self.assertEqual(response.status_code, 204, response.text)
+
+    def accept_proposal(self, jid):
+        detail = self.detail(jid)
+        response = self.event(jid, "route_accepted", detail["stateVersion"],
+                              {"proposalVersion": detail["proposedRoute"]["proposalVersion"]})
+        self.assertEqual(response.status_code, 200, response.text)
+
+    @staticmethod
+    def bus_route_numbers(route):
+        return [(leg.get("route") or {}).get("routeNo") or leg.get("routeNo")
+                for leg in route["legs"] if leg["kind"] == "bus"]
+
+    def test_missed_bus_proposes_a_faster_route_from_a_fresh_search(self):
+        journey, _, search_id = self.start()
+        jid = journey["journeyId"]
+        provider = synthetic_provider()
+        self.recalc(provider)
+        shown = self.detail(jid)["guidance"]["nextBoarding"]
+        self.assertEqual(self.event(jid, "missed_bus", 1, {"legIndex": shown["legIndex"]}).status_code, 200)
+        snapshot = self.snapshot(jid)
+        self.assertEqual((snapshot["reroute_kind"], snapshot["reroute_status"], snapshot["reroute_origin"]["basis"]),
+                         ("missed_bus", "queued", "missed_stop"), "위치가 없으면 놓친 정류소에서 다시 검색")
+        reroute_id = snapshot["reroute_search_id"]
+        self.assertNotEqual(reroute_id, search_id)
+        self.assertEqual(self.query("SELECT status, source, user_id FROM app.route_searches WHERE id = %s",
+                                    (UUID(reroute_id),)), [("processing", "app", self.user_a)])
+
+        self.recalc(provider)   # 한 번에 검색 실행 → 안내 재계산
+        detail = self.detail(jid)
+        guided = detail["guidance"]
+        self.assertEqual((guided["reroute"]["kind"], guided["reroute"]["status"]), ("missed_bus", "ready"))
+        self.assertEqual(guided["nextBoarding"]["routeNo"], shown["routeNo"], "수락 전에는 원래 경로의 다음 차량을 안내")
+        self.assertGreater(datetime.fromisoformat(guided["nextBoarding"]["predictedArrivalAt"]),
+                           datetime.fromisoformat(shown["predictedArrivalAt"]))
+        proposal = detail["proposedRoute"]
+        self.assertIsNotNone(proposal, "원래 경로의 다음 차량보다 일찍 도착하는 경로가 있으면 제안")
+        self.assertEqual((proposal["searchId"], proposal["changeDecision"]["kind"]), (reroute_id, "missed_bus"))
+        improvement = proposal["changeDecision"]["improvementSeconds"]
+        self.assertGreater(improvement, 0)
+        self.assertAlmostEqual(guided["arrival"]["remainingSeconds"] - proposal["nominalTotalSeconds"], improvement,
+                               delta=1, msg="도착 예정 시각의 차이로 비교")
+        self.assertNotEqual(self.bus_route_numbers(proposal), self.bus_route_numbers(detail["selectedRoute"]))
+
+        self.accept_proposal(jid)
+        self.recalc(provider)
+        detail = self.detail(jid)
+        self.assertEqual((detail["selectionVersion"], detail["selectedRoute"]["candidateId"]),
+                         (2, proposal["candidateId"]))
+        self.assertIsNone(detail["proposedRoute"], "수락한 직후 다른 경로를 다시 제안하지 않는다")
+        self.assertNotIn("reroute_search_id", self.snapshot(jid))
+        self.assertIsNone(detail["guidance"].get("reroute"))
+        self.assertEqual(detail["guidance"]["nextBoarding"]["routeNo"], self.bus_route_numbers(proposal)[0])
+        self.assertIsNotNone(detail["guidance"]["arrival"]["plannedArrivalAt"])
+
+    def test_missed_bus_then_boarding_the_original_route_ends_the_reroute(self):
         journey, _, _ = self.start()
         jid = journey["journeyId"]
-        location = self.client.put(f"/api/v1/journeys/{jid}/location", headers=self.auth(self.user_a),
-                                   json={"latitude": ORIGIN["latitude"], "longitude": ORIGIN["longitude"],
-                                         "observedAt": datetime.now(UTC).isoformat(), "accuracyM": 8})
-        self.assertEqual(location.status_code, 204, location.text)
+        provider = synthetic_provider()
+        self.recalc(provider)
+        leg = self.detail(jid)["guidance"]["nextBoarding"]["legIndex"]
+        self.assertEqual(self.event(jid, "missed_bus", 1, {"legIndex": leg}).status_code, 200)
+        self.recalc(provider)
+        self.assertIsNotNone(self.detail(jid)["proposedRoute"])
+        self.assertEqual(self.event(jid, "board", 2, {"legIndex": leg}).status_code, 200)
+        self.assertNotIn("reroute_kind", self.snapshot(jid))
+        self.recalc(provider)
+        detail = self.detail(jid)
+        self.assertEqual((detail["movementState"], detail["proposedRoute"]), ("onboard", None))
+
+    def test_destination_change_proposes_a_route_to_the_new_destination(self):
+        journey, _, _ = self.start()
+        jid = journey["journeyId"]
+        self.send_location(jid, ORIGIN["latitude"], ORIGIN["longitude"])
         changed = self.event(jid, "destination_changed", 1,
                              {"latitude": 36.360, "longitude": 127.380, "name": "변경 목적지"})
         self.assertEqual(changed.status_code, 200, changed.text)
-        route_search_id, status = self.query(
-            "SELECT selected_snapshot->>'reroute_search_id', selected_snapshot->>'reroute_status' "
-            "FROM app.journeys WHERE id = %s", (UUID(jid),))[0]
-        self.assertIsNotNone(route_search_id)
-        self.assertEqual(status, "queued")
+        snapshot = self.snapshot(jid)
+        route_search_id = snapshot["reroute_search_id"]
+        self.assertEqual((snapshot["reroute_kind"], snapshot["reroute_status"], snapshot["reroute_origin"]["basis"]),
+                         ("destination", "queued", "current_location"))
         self.assertEqual(self.query("SELECT status, source, user_id FROM app.route_searches WHERE id = %s",
                                     (UUID(route_search_id),)), [("processing", "app", self.user_a)])
         self.worker(synthetic_provider()).run_jobs_pass()
         self.assertEqual(self.query("SELECT status FROM app.route_searches WHERE id = %s",
                                     (UUID(route_search_id),))[0][0], "ready")
-        self.assertGreater(self.query("SELECT count(*) FROM app.route_candidates WHERE search_id = %s",
-                                      (UUID(route_search_id),))[0][0], 0)
-        self.assertEqual(self.detail(jid)["guidanceStatus"], "current")
+        detail = self.detail(jid)
+        self.assertEqual(detail["guidanceStatus"], "current")
+        guided = detail["guidance"]
+        # 기존 경로(가상E행)는 새 목적지로 가지 않는다. 그 경로의 다음 승차·도착은 내보내지 않고 새 경로를 제안한다.
+        self.assertEqual((guided["nextBoarding"], guided["arrival"], guided["alternativesReason"]),
+                         (None, None, "destination_changed_route_proposed"))
+        proposal = detail["proposedRoute"]
+        self.assertIsNotNone(proposal, "기존 경로와 같은 후보가 새 검색에 없어도 제안한다")
+        self.assertEqual((proposal["searchId"], proposal["destination"]["name"]), (route_search_id, "변경 목적지"))
+        self.assertEqual([leg["alight"]["name"] for leg in proposal["legs"] if leg["kind"] == "bus"][-1], "가상C")
+        self.assertIsNotNone(proposal["nominalTotalSeconds"])
+
+        self.accept_proposal(jid)
+        self.recalc(synthetic_provider())
+        detail = self.detail(jid)
+        self.assertEqual((detail["selectionVersion"], detail["proposedRoute"]), (2, None))
+        self.assertEqual(detail["selectedRoute"]["destination"]["name"], "변경 목적지")
+        snapshot = self.snapshot(jid)
+        self.assertFalse({"destination_changed_at", "reroute_kind", "reroute_search_id"} & set(snapshot))
+        self.assertEqual((snapshot["legs"][-1]["to"]["lat"], snapshot["legs"][-1]["to"]["lon"]), (36.360, 127.380),
+                         "마지막 도보가 새 목적지로 간다")
+        self.assertIsNotNone(detail["guidance"]["nextBoarding"]["predictedArrivalAt"])
+        self.assertIsNotNone(detail["guidance"]["arrival"]["plannedArrivalAt"])
+
+    def test_destination_change_without_location_waits_for_a_location(self):
+        journey, _, _ = self.start()
+        jid = journey["journeyId"]
+        self.assertEqual(self.event(jid, "destination_changed", 1,
+                                    {"latitude": 36.360, "longitude": 127.380, "name": "변경 목적지"}).status_code, 200)
+        self.assertEqual(self.snapshot(jid)["reroute_status"], "location_unavailable")
+        self.worker(synthetic_provider()).run_jobs_pass()
+        self.assertEqual(self.detail(jid)["guidance"]["alternativesReason"],
+                         "fresh_location_required_for_destination_change")
+        self.send_location(jid, ORIGIN["latitude"], ORIGIN["longitude"])
+        self.assertEqual(self.snapshot(jid)["reroute_status"], "queued")
+        self.worker(synthetic_provider()).run_jobs_pass()
+        self.assertIsNotNone(self.detail(jid)["proposedRoute"])
+
+    def test_destination_change_while_onboard_previews_then_applies_after_alight(self):
+        """환승 경로의 첫 버스(가상A→가상C)를 타고 가다가 목적지를 가상F 근처로 바꾼다."""
+        new_destination = {"latitude": 36.3651, "longitude": 127.3851, "name": "가상F 근처"}
+        journey, _, _ = self.start(multi=True)
+        jid = journey["journeyId"]
+        provider = synthetic_provider()
+        bus = [leg for leg in journey["selectedRoute"]["legs"] if leg["kind"] == "bus"]
+        self.assertEqual(bus[0]["alight"]["name"], "가상C", "합성 노선망에서 가상F로 이어지는 정류소")
+        first = bus[0]["legIndex"]
+        self.recalc(provider)
+        vehicle = self.detail(jid)["guidance"]["nextBoarding"]["vehicle"]["vehicleId"]
+        self.assertEqual(self.event(jid, "board", 1, {"legIndex": first, "vehicleId": vehicle}).status_code, 200)
+        self.recalc(provider)
+        alight_eta = self.detail(jid)["guidance"]["onboard"]["alightEta"]["predictedArrivalAt"]
+
+        self.assertEqual(self.event(jid, "destination_changed", 2, new_destination).status_code, 200)
+        snapshot = self.snapshot(jid)
+        preview_id = snapshot["reroute_search_id"]
+        self.assertEqual((snapshot["reroute_kind"], snapshot["reroute_status"], snapshot["reroute_origin"]["basis"]),
+                         ("destination", "queued", "planned_alight_stop"))
+        self.assertEqual(self.query("SELECT start_at FROM app.route_searches WHERE id = %s", (UUID(preview_id),))[0][0],
+                         datetime.fromisoformat(alight_eta), "하차 예상 시각에 그 정류소에서 출발하는 경로를 찾는다")
+        self.recalc(provider)
+        detail = self.detail(jid)
+        guided = detail["guidance"]
+        self.assertIsNotNone(guided["onboard"]["alightEta"], "타고 있는 구간의 하차 안내는 유지")
+        self.assertEqual((guided["arrival"], guided["alternativesReason"]),
+                         (None, "destination_reroute_preview_until_alight"))
+        preview = detail["proposedRoute"]
+        self.assertEqual(preview["destination"]["name"], "가상F 근처")
+        self.assertEqual(self.bus_route_numbers(preview)[0], bus[0]["route"]["routeNo"], "타고 있는 구간은 그대로")
+        blocked = self.event(jid, "route_accepted", 3, {"proposalVersion": preview["proposalVersion"]})
+        self.assertEqual((blocked.status_code, blocked.json()["error"]["code"]), (409, "CANNOT_SWITCH_ONBOARD"))
+
+        self.assertEqual(self.event(jid, "alight", 3, {"legIndex": first}).status_code, 200)
+        snapshot = self.snapshot(jid)
+        self.assertEqual((snapshot["reroute_status"], snapshot["reroute_origin"]["basis"]), ("queued", "alight_stop"))
+        self.assertNotEqual(snapshot["reroute_search_id"], preview_id, "하차한 정류소·시각으로 다시 검색")
+        self.recalc(provider)
+        detail = self.detail(jid)
+        self.assertEqual(detail["guidance"]["alternativesReason"], "destination_changed_route_proposed")
+        proposal = detail["proposedRoute"]
+        self.assertEqual(proposal["searchId"], snapshot["reroute_search_id"])
+        self.assertEqual(proposal["acceptedProgress"]["completedBusLegs"], [first])
+
+        self.accept_proposal(jid)
+        self.recalc(provider)
+        detail = self.detail(jid)
+        self.assertEqual((detail["selectionVersion"], detail["movementState"], detail["proposedRoute"]),
+                         (2, "transferring", None))
+        self.assertEqual(detail["selectedRoute"]["destination"]["name"], "가상F 근처")
+        self.assertEqual(detail["currentProgress"]["completedBusLegs"], [first], "이미 탄 구간은 보존")
+        next_leg = detail["currentProgress"]["nextBusLegIndex"]
+        self.assertEqual(detail["guidance"]["nextBoarding"]["legIndex"], next_leg)
+        self.assertIsNotNone(detail["guidance"]["arrival"]["plannedArrivalAt"])
+        self.assertFalse({"destination_changed_at", "reroute_kind"} & set(self.snapshot(jid)))
+        # 새 경로로 끝까지 진행할 수 있다.
+        self.assertEqual(self.event(jid, "board", detail["stateVersion"], {"legIndex": next_leg}).status_code, 200)
+        self.assertEqual(self.event(jid, "alight", detail["stateVersion"] + 1, {"legIndex": next_leg}).status_code,
+                         200)
+        self.assertEqual(self.event(jid, "completed", detail["stateVersion"] + 2, {}).status_code, 200)
 
     def test_start_restore_events_and_snapshots(self):
         journey, chosen, search_id = self.start(multi=True)
