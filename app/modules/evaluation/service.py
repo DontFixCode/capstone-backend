@@ -17,6 +17,7 @@ from app.modules.evaluation.eta import EtaTable, build_ride_legs, index_etas, in
 from app.modules.evaluation.probability import (
     MARGINAL_ECDF,
     MARGINAL_ERROR_SAMPLES_INSUFFICIENT,
+    MARGINAL_ERROR_SOURCE_APPROXIMATED,
     MARGINAL_ERROR_SOURCE_UNSUPPORTED,
     MARGINAL_ERROR_SOURCES,
     PAIRED_ECDF,
@@ -72,11 +73,13 @@ class _SharedData:
     marginal_errors: dict[tuple, tuple[tuple[float, float], ...]] = field(default_factory=dict)
 
     def marginal_errors_for(self, eta: VehicleEta) -> tuple[tuple[float, float], ...]:
+        """그 예측에 쓸 단일 차량 오차. 표본을 쌓지 않는 생성 방식이면 같은 잔여시간 구간의 제공처 예측 표본을 빌린다(근사)."""
         key = (eta.eta_source, eta.model_version, eta.basis_source, eta.horizon_seconds)
         if key not in self.marginal_errors:
             self.marginal_errors[key] = select_marginal_errors(
                 self.inputs.eta_error_samples, eta=eta,
-                horizon_edges_seconds=self.policy.marginal_probability.horizon_edges_seconds)
+                horizon_edges_seconds=self.policy.marginal_probability.horizon_edges_seconds,
+                borrow_from=() if eta.eta_source in MARGINAL_ERROR_SOURCES else MARGINAL_ERROR_SOURCES)
         return self.marginal_errors[key]
 
 
@@ -445,7 +448,9 @@ def _transfer_probability(
     """환승 순번의 개별 확률과 근거, 짝 표본 수, 짝 표본 제외 이유. 기준 여유와 두 차량의 ETA가 확인되지 않으면 확률이 없다.
 
     ① 짝지은 두 차량의 상대 오차 표본(기존 계산·선정 그대로) → ② 단일 차량 오차 결합(정책이 켜져 있을 때만) → ③ 없음.
-    ②는 두 예측이 모두 표본을 쌓는 생성 방식이고, 각각 같은 조건의 표본이 최소 수 이상일 때만 낸다.
+    ②는 두 예측이 모두 표본을 쌓는 생성 방식이고, 각각 같은 조건의 표본이 최소 수 이상일 때만 낸다. 표본을 쌓지 않는 생성
+    방식은 정책이 근사를 허용한 것(approximate_sources)만 같은 잔여시간 구간의 제공처 예측 표본을 빌려 내고, 그 사실을 사유
+    코드로 남긴다.
     """
     if len(journey.connections) <= transfer_index or len(journey.legs) <= transfer_index:
         return TransferProbability(), 0, {}
@@ -470,19 +475,24 @@ def _transfer_probability(
                                      probability_range=(probability, probability), sample_counts=counts)
         return detail, len(pairs), rejected
     marginal = shared.policy.marginal_probability
-    if marginal is None:
+    if marginal is None or next_eta is None:
         return TransferProbability(sample_counts=counts), len(pairs), rejected
-    if front_eta.eta_source not in MARGINAL_ERROR_SOURCES or next_eta.eta_source not in MARGINAL_ERROR_SOURCES:
+    # 표본을 쌓지 않는 생성 방식. 정책이 허용한 방식만 제공처 예측의 오차 분포를 빌린다(근사).
+    borrowed = {eta.eta_source for eta in (front_eta, next_eta) if eta.eta_source not in MARGINAL_ERROR_SOURCES}
+    if not borrowed <= set(marginal.approximate_sources):
         detail = TransferProbability(sample_counts=counts, reason_codes=(MARGINAL_ERROR_SOURCE_UNSUPPORTED,))
         return detail, len(pairs), rejected
+    approximated = (MARGINAL_ERROR_SOURCE_APPROXIMATED,) if borrowed else ()
     front_errors, next_errors = shared.marginal_errors_for(front_eta), shared.marginal_errors_for(next_eta)
     counts.update(front=len(front_errors), next=len(next_errors))
     if min(len(front_errors), len(next_errors)) < marginal.min_samples:
-        detail = TransferProbability(sample_counts=counts, reason_codes=(MARGINAL_ERROR_SAMPLES_INSUFFICIENT,))
+        detail = TransferProbability(sample_counts=counts,
+                                     reason_codes=(MARGINAL_ERROR_SAMPLES_INSUFFICIENT, *approximated))
         return detail, len(pairs), rejected
     lower, upper = marginal_transfer_probability_bounds(connection.slack_seconds, front_errors, next_errors)
     detail = TransferProbability(probability=lower, source=MARGINAL_ECDF, probability_range=(lower, upper),
-                                 sample_counts=counts, reason_codes=(TRANSFER_PROBABILITY_BY_MARGINAL_ERRORS,))
+                                 sample_counts=counts,
+                                 reason_codes=(TRANSFER_PROBABILITY_BY_MARGINAL_ERRORS, *approximated))
     return detail, len(pairs), rejected
 
 

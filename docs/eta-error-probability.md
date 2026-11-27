@@ -22,11 +22,13 @@
 | `probabilitySampleCounts` | 선정한 표본 수. `paired`(짝 표본), `front`·`next`(앞·다음 차량의 단일 차량 표본) |
 
 - `probability`는 `marginal_ecdf`일 때 범위의 **하한**이다.
-- 사유 코드 세 가지가 환승의 `reasonCodes`와 후보의 `evaluation.reasonCodes`에 들어간다.
+- 사유 코드가 환승의 `reasonCodes`와 후보의 `evaluation.reasonCodes`에 들어간다.
   - `transfer_probability_by_marginal_errors`: 단일 차량 오차 결합으로 확률을 냈다.
   - `marginal_error_samples_insufficient`: 앞 또는 다음 차량의 표본이 최소 수에 못 미친다.
-  - `marginal_error_source_unsupported`: 표본을 쌓지 않는 방식의 예측이다(`leading_vehicle_gap`, `headway_estimate`,
-    `historical_segments`).
+  - `marginal_error_source_unsupported`: 표본을 쌓지 않는 방식의 예측이고(`leading_vehicle_gap`, `headway_estimate`,
+    `historical_segments`) 근사도 허용하지 않았다.
+  - `marginal_error_source_approximated`: 표본을 쌓지 않는 방식의 예측에 제공처 예측의 오차 분포를 빌려 썼다(근사).
+    위의 두 코드 중 하나와 함께 나온다.
 - 같은 값이 후보의 `evaluation` JSON(`slack_grade`, `probability_source` 등), `evaluation_snapshot` 이벤트,
   `transfer_samples.probability_context`에 남는다.
 - `journeyProbability`와 `expectedTotalSeconds`의 계산은 바꾸지 않았다.
@@ -44,7 +46,17 @@
      - 상한 = (앞 오차 하한ᵢ − 다음 오차 상한ⱼ ≤ m 인 조합 수) ÷ 전체 조합 수
    - 예: 앞 오차 0·60·180초, 다음 오차 0·120초, m = 120초이면 6개 조합 중 5개가 연결되어 5/6이다.
    - 두 차량의 오차가 서로 독립이라는 가정 아래의 값이다.
+   - **근사**(`BACKEND_EVAL_MARGINAL_APPROXIMATE_SOURCES`, 기본 없음): 오차 표본은 제공처 예측(`provider`)에만 쌓인다.
+     여기에 적은 생성 방식의 예측은 같은 잔여시간 구간의 제공처 예측 표본을 빌려 같은 식으로 계산하고,
+     `marginal_error_source_approximated`를 남긴다. 다른 방식의 오차를 대신 쓰는 것이라 실제 오차가 더 큰 방식은 확률이
+     실제보다 높게 나온다. `leading_vehicle_gap`은 제공처 잔여시간 두 개를 더한 값이라 차이가 작을 것으로 보지만,
+     `headway_estimate`는 배차간격이 실제 출발 간격과 수 분 어긋날 수 있어 차이가 크다. 적지 않은 방식이 낀 환승은
+     확률을 내지 않는다.
 3. 없음(`null`).
+
+2026-11-27 서버 기록(11월 20일 이후 평가한 후보의 환승 1,142건)에서 앞·다음 예측이 모두 제공처 예측인 환승은 32건(약 3%)
+이었다. 나머지는 앞 차량 하차 ETA나 다음 차량 승차 ETA가 `leading_vehicle_gap` 또는 `headway_estimate`다. 근사를 켜지 않으면
+환승 대부분은 확률이 `null`이다.
 
 표본은 노선·정류소별로 나누지 않고 합쳐 쓴다. 그래서 수집 대상에 없는 노선의 환승에도 확률이 나오지만, 그 노선의 오차가
 수집한 노선과 비슷하다는 가정이 들어간다.
@@ -158,6 +170,7 @@ HTTP 429, 게이트웨이 코드 22(`LIMITED_NUMBER_OF_SERVICE_REQUESTS_EXCEEDS_
 | `BACKEND_EVAL_MARGINAL_PROBABILITY_ENABLED` | `false` | 기본 꺼짐 |
 | `BACKEND_EVAL_MARGINAL_WINDOW_DAYS` | `14` | 확률 결합을 켜면 필수 |
 | `BACKEND_EVAL_MIN_MARGINAL_SAMPLES` | `30` | 확률 결합을 켜면 필수 |
+| `BACKEND_EVAL_MARGINAL_APPROXIMATE_SOURCES` | `leading_vehicle_gap,headway_estimate` | 선택(비우면 근사하지 않음) |
 | `BACKEND_ETA_ERROR_HORIZON_EDGES_SECONDS` | `120,300,600` | 수집 또는 확률 결합을 켜면 필수 |
 | `BACKEND_ETA_ERROR_SAMPLING_ENABLED` | `false` | 기본 꺼짐 |
 | `BACKEND_ETA_ERROR_SAMPLING_STOPS` | `DJB8001488` | 수집을 켜면 필수 |
@@ -197,3 +210,5 @@ HTTP 429, 게이트웨이 코드 22(`LIMITED_NUMBER_OF_SERVICE_REQUESTS_EXCEEDS_
 - TAGO의 `nodeord`가 '가장 최근에 도착한 정류소'인지 '향하는 다음 정류소'인지. 뒤쪽이면 도착을 한 구간만큼 이르게 잰다.
 - 경유 순번이 일시적으로 줄어드는 응답이 있는지(있으면 한 운행이 둘로 나뉜다).
 - 두 차량의 오차가 독립이라는 가정과, 노선·정류소를 합친 분포가 개별 환승에 맞는지.
+- 근사를 켰을 때 `leading_vehicle_gap`·`headway_estimate` 예측의 실제 오차가 제공처 예측과 얼마나 다른지(그 방식의 오차
+  표본은 아직 모으지 않는다).

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from statistics import fmean
@@ -73,11 +73,13 @@ def estimate_transfer_probability(
 PAIRED_ECDF = "paired_ecdf"
 MARGINAL_ECDF = "marginal_ecdf"
 # 단일 차량 오차 표본을 쌓는 예측 생성 방식. 앞차 ETA 기반 근사·배차간격 예상·관측 구간시간 예측은 사후 도착과 이은 표본이
-# 없으므로 결합하지 않는다(다른 방식의 표본을 대신 쓰지 않는다).
+# 없으므로 기본으로는 결합하지 않는다. 설정(MarginalProbabilityPolicy.approximate_sources)으로 고른 방식만 같은 잔여시간
+# 구간의 이 방식 표본을 빌려 근사하고, 그때는 사유 코드 MARGINAL_ERROR_SOURCE_APPROXIMATED를 함께 남긴다.
 MARGINAL_ERROR_SOURCES = frozenset({"provider"})
 TRANSFER_PROBABILITY_BY_MARGINAL_ERRORS = "transfer_probability_by_marginal_errors"
 MARGINAL_ERROR_SAMPLES_INSUFFICIENT = "marginal_error_samples_insufficient"
 MARGINAL_ERROR_SOURCE_UNSUPPORTED = "marginal_error_source_unsupported"
+MARGINAL_ERROR_SOURCE_APPROXIMATED = "marginal_error_source_approximated"
 
 
 def select_marginal_errors(
@@ -85,16 +87,22 @@ def select_marginal_errors(
     *,
     eta: VehicleEta,
     horizon_edges_seconds: Sequence[float],
+    borrow_from: Collection[str] = (),
 ) -> tuple[tuple[float, float], ...]:
     """현재 예측과 같은 조건의 단일 차량 오차 (하한, 상한) 목록. 결과(오차 크기)는 선정 기준에 쓰지 않는다.
 
     생성 방식·모델 버전·기준 시각 출처·잔여시간 구간이 모두 같은 표본만 고르고, 같은 운행은 하나만 센다.
+    borrow_from을 주면(표본을 쌓지 않는 생성 방식의 근사) 그 생성 방식들의 표본 가운데 잔여시간 구간이 같은 것을 고른다.
+    이때 모델 버전·기준 시각 출처는 보지 않는다.
     """
-    wanted = (eta.eta_source, eta.model_version, eta.basis_source, horizon_bucket(eta.horizon_seconds,
-                                                                                    horizon_edges_seconds))
+    bucket = horizon_bucket(eta.horizon_seconds, horizon_edges_seconds)
+    wanted = (eta.eta_source, eta.model_version, eta.basis_source, bucket)
     selected: dict[str, tuple[str, tuple[float, float]]] = {}
     for sample in samples:
-        if (sample.eta_source, sample.model_version, sample.basis_source, sample.horizon_bucket) != wanted:
+        if borrow_from:
+            if sample.eta_source not in borrow_from or sample.horizon_bucket != bucket:
+                continue
+        elif (sample.eta_source, sample.model_version, sample.basis_source, sample.horizon_bucket) != wanted:
             continue
         current = selected.get(sample.run_group_key)
         if current is None or sample.sample_id < current[0]:

@@ -12,6 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "fixtures"))
 import phase3_world as w  # noqa: E402
 import test_search_phase3 as base  # noqa: E402
 
+from pydantic import ValidationError  # noqa: E402
+
 from app.core.config import Settings  # noqa: E402
 from app.integrations.walking_api import TmapWalkingClient  # noqa: E402
 from app.modules.evaluation import samples as sample_rules  # noqa: E402
@@ -133,6 +135,26 @@ class SelectionTest(unittest.TestCase):
         chosen = select_marginal_errors(rows, eta=eta(horizon=200), horizon_edges_seconds=self.EDGES)
         self.assertEqual(sorted(chosen), [(10.0, 10.0), (30.0, 30.0)])
 
+    def test_borrowing_takes_the_named_methods_samples_of_the_same_bucket(self):
+        """표본을 쌓지 않는 생성 방식의 근사: 제공처 예측 표본 가운데 잔여시간 구간만 같은 것을 고른다."""
+        rows = [
+            sample(1, 10),
+            sample(2, 20, source="leading_vehicle_gap", model="m"),
+            sample(3, 30, basis="daejeon_info_offer_tm"),
+            sample(4, 40, bucket="300-600"),
+            sample(5, 50, run="run-1"),
+        ]
+        gap_eta = eta("leading_vehicle_gap", 200, model="leading-vehicle-gap/1", basis="daejeon_info_offer_tm")
+        borrowed = select_marginal_errors(rows, eta=gap_eta, horizon_edges_seconds=self.EDGES,
+                                          borrow_from={"provider"})
+        self.assertEqual(sorted(borrowed), [(10.0, 10.0), (30.0, 30.0)],
+                         "모델 버전·기준 출처는 보지 않고, 다른 구간·다른 방식의 표본은 빼며, 같은 운행은 하나만 센다")
+        self.assertEqual(select_marginal_errors(rows, eta=gap_eta, horizon_edges_seconds=self.EDGES), (),
+                         "빌리지 않으면 그 방식의 표본만 고른다")
+        far = eta("headway_estimate", 700, model="headway-estimate/1")
+        self.assertEqual(select_marginal_errors(rows, eta=far, horizon_edges_seconds=self.EDGES,
+                                                borrow_from={"provider"}), ())
+
 
 class StageSelectionTest(unittest.TestCase):
     """환승 하나의 단계 선택. 여유 120초, 앞 차량 하차 예측과 다음 차량 승차 예측은 잔여시간 200초의 제공처 예측이다."""
@@ -217,6 +239,36 @@ class StageSelectionTest(unittest.TestCase):
                 self.assertEqual(detail.reason_codes, ("marginal_error_source_unsupported",))
                 self.assertEqual(detail.sample_counts, {"paired": 0})
 
+    def test_allowed_generation_methods_borrow_the_provider_errors_and_say_so(self):
+        """근사를 허용한 생성 방식은 같은 잔여시간 구간의 제공처 예측 표본으로 확률을 내고 사유 코드로 구분한다."""
+        cfg = base.config(**{**MARGINAL, "eval_min_marginal_samples": 2,
+                             "eval_marginal_approximate_sources": "leading_vehicle_gap, headway_estimate"})
+        self.assertEqual(cfg.evaluation_policy.marginal_probability.approximate_sources,
+                         ("leading_vehicle_gap", "headway_estimate"))
+        rows = [*self.FRONT, sample(11, 0, bucket="300-600"), sample(12, 120, bucket="300-600"),
+                sample(21, 999, source="leading_vehicle_gap", model="m")]
+        exact = self.decide(cfg, front=eta(horizon=200), following=eta(horizon=450), eta_samples=rows)
+        self.assertEqual(exact.reason_codes, ("transfer_probability_by_marginal_errors",),
+                         "두 예측이 모두 제공처 예측이면 근사 표시가 없다")
+        for front, following in ((eta("leading_vehicle_gap", 200, model="m"), eta(horizon=450)),
+                                 (eta(horizon=200), eta("headway_estimate", 450, model="headway-estimate/1")),
+                                 (eta("headway_estimate", 200, model="headway-estimate/1"),
+                                  eta("leading_vehicle_gap", 450, model="m", basis="daejeon_info_offer_tm"))):
+            detail = self.decide(cfg, front=front, following=following, eta_samples=rows)
+            self.assertEqual((detail.source, detail.probability, detail.probability_range),
+                             ("marginal_ecdf", 5 / 6, (5 / 6, 5 / 6)), (front.eta_source, following.eta_source))
+            self.assertEqual(detail.reason_codes, ("transfer_probability_by_marginal_errors",
+                                                   "marginal_error_source_approximated"))
+            self.assertEqual(detail.sample_counts, {"paired": 0, "front": 3, "next": 2})
+        # 허용하지 않은 방식은 그대로 확률을 내지 않는다.
+        other = self.decide(cfg, front=eta("historical_segments", 200, model="m"), eta_samples=rows)
+        self.assertEqual((other.probability, other.reason_codes), (None, ("marginal_error_source_unsupported",)))
+        # 빌린 구간의 표본이 부족하면 확률이 없다.
+        few = self.decide(cfg, front=eta("leading_vehicle_gap", 700, model="m"), eta_samples=rows)
+        self.assertEqual((few.probability, few.reason_codes, few.sample_counts),
+                         (None, ("marginal_error_samples_insufficient", "marginal_error_source_approximated"),
+                          {"paired": 0, "front": 0, "next": 3}))
+
     def test_paired_samples_take_priority(self):
         cfg = base.config(**{**MARGINAL, "eval_min_marginal_samples": 2, "eval_min_probability_samples": 5})
         paired = self.paired_samples(cfg, 10)
@@ -259,8 +311,23 @@ class MarginalSettingTest(unittest.TestCase):
         self.assertEqual(plain.config_version, base.config(eta_error_horizon_edges_seconds="120,300").config_version,
                          "꺼져 있으면 구간 경계가 있어도 검색 설정 버전이 그대로다")
         self.assertEqual(on.params["evaluation_policy"]["marginal_probability"],
-                         {"min_samples": 3, "window_days": 14.0, "horizon_edges_seconds": (120.0, 300.0, 600.0)})
+                         {"min_samples": 3, "window_days": 14.0, "horizon_edges_seconds": (120.0, 300.0, 600.0),
+                          "approximate_sources": ()})
         self.assertNotEqual(plain.config_version, on.config_version)
+
+    def test_approximate_sources_are_off_by_default_and_checked(self):
+        self.assertEqual(Settings(_env_file=None).eval_marginal_approximate_sources, ())
+        self.assertEqual(Settings(_env_file=None, eval_marginal_approximate_sources="").eval_marginal_approximate_sources,
+                         ())
+        approx = base.config(**MARGINAL, eval_marginal_approximate_sources="headway_estimate,leading_vehicle_gap")
+        self.assertEqual(approx.params["evaluation_policy"]["marginal_probability"]["approximate_sources"],
+                         ("headway_estimate", "leading_vehicle_gap"))
+        self.assertNotEqual(approx.config_version, base.config(**MARGINAL).config_version)
+        for bad in ("provider", "gps", "leading_vehicle_gap,unknown"):
+            with self.assertRaises(ValidationError, msg=bad):
+                Settings(_env_file=None, eval_marginal_approximate_sources=bad)
+        off = base.config(eval_marginal_approximate_sources="headway_estimate")
+        self.assertIsNone(off.evaluation_policy.marginal_probability, "확률 결합이 꺼져 있으면 근사 설정만으로는 켜지지 않는다")
 
 
 class EvaluationFlowTest(unittest.TestCase):

@@ -49,6 +49,9 @@ class MarginalProbabilityPolicy(FrozenSchema):
     window_days: PositiveFloat
     # 잔여시간 구간 경계(초). 표본을 만들 때와 같은 값이어야 같은 구간의 표본이 선정된다.
     horizon_edges_seconds: tuple[PositiveFloat, ...]
+    # 오차 표본을 쌓지 않는 생성 방식 가운데, 같은 잔여시간 구간의 제공처 예측 오차 분포를 빌려 확률을 낼 방식(근사).
+    # 비어 있으면 그 방식이 낀 환승은 확률을 내지 않는다.
+    approximate_sources: tuple[EtaSource, ...] = ()
 
 
 class EvaluationPolicy(SearchPolicy):

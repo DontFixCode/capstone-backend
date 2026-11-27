@@ -214,6 +214,7 @@ def load_search_config(settings: Settings) -> SearchConfig:
             marginal_probability=MarginalProbabilityPolicy(
                 min_samples=s.eval_min_marginal_samples, window_days=s.eval_marginal_window_days,
                 horizon_edges_seconds=s.eta_error_horizon_edges_seconds,
+                approximate_sources=s.eval_marginal_approximate_sources,
             ) if s.eval_marginal_probability_enabled else None,
         )
     except ValidationError as exc:

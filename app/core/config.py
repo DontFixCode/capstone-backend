@@ -126,6 +126,11 @@ class Settings(BaseSettings):
     eval_marginal_probability_enabled: bool = False
     eval_marginal_window_days: float | None = Field(default=None, gt=0)
     eval_min_marginal_samples: int | None = Field(default=None, gt=0)
+    # 오차 표본을 쌓지 않는 생성 방식(쉼표 구분: leading_vehicle_gap, headway_estimate, historical_segments) 가운데, 같은
+    # 잔여시간 구간의 제공처 예측 오차 분포를 빌려 확률을 낼 방식. 기본은 없음(그 방식이 낀 환승은 확률을 내지 않는다).
+    # 다른 방식의 오차를 대신 쓰는 근사이므로 실제 오차가 더 큰 방식(특히 배차간격 예상)은 확률이 실제보다 높게 나온다.
+    # 응답에는 사유 코드 marginal_error_source_approximated로 구분된다.
+    eval_marginal_approximate_sources: IdList = ()
     # 최초 검색 결과·필요 실시간 대상의 유효기간(초). 이 동안 워커가 대상을 공유 수집한다.
     search_expires_seconds: float | None = None
     # TMAP 보행자 경로 searchOption(0 추천, 4 추천+대로우선, 10 최단, 30 최단+계단제외)과 검색당 최대 조회 수.
@@ -389,8 +394,17 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("eval_marginal_approximate_sources")
+    @classmethod
+    def approximate_sources_are_known(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        allowed = ("leading_vehicle_gap", "headway_estimate", "historical_segments")
+        unknown = [source for source in value if source not in allowed]
+        if unknown:
+            raise ValueError(f"근사할 생성 방식은 {allowed} 중에서 고릅니다: {unknown}")
+        return value
+
     @field_validator("realtime_position_route_ids", "realtime_arrival_stop_ids", "eta_error_sampling_stops",
-                     "eta_error_sampling_routes", mode="before")
+                     "eta_error_sampling_routes", "eval_marginal_approximate_sources", mode="before")
     @classmethod
     def split_id_list(cls, value: object) -> object:
         """쉼표 구분 문자열을 순서를 지킨 중복 없는 ID 목록으로 바꾼다. ID는 문자열 그대로 다룬다."""
