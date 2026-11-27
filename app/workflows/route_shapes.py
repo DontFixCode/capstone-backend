@@ -398,6 +398,50 @@ def collect(db: Database, settings: Settings, client: OdsayClient, *, max_calls:
         conn.close()
 
 
+def remap_stored(db: Database, *, dry_run: bool = False,
+                 clock: Callable[[], datetime] | None = None) -> dict[str, Any]:
+    """정류소 순서가 바뀌어 현재 패턴의 형상을 잃은 노선을 저장해 둔 선에 다시 대응시킨다. 외부 호출이 없다.
+
+    형상은 패턴 키(정류소 순서의 서명)로 저장하는데 정적 정보는 매일 갱신된다. 정류소가 하나만 늘어도 키가 바뀌어, ODsay로
+    다시 받기 전까지 그 노선은 형상 미확보로 나간다(2026-11-26 서버: 연결된 107개 노선 중 15개). 일일 호출 한도가 비어
+    자동 수집이 꺼진 서버에서도 지도 형상이 유지되도록, 워커가 정적 갱신 뒤에 이 함수를 먼저 실행한다.
+    dry_run이면 저장하지 않고 결과만 돌려준다. 수집(collect)과 같은 잠금을 쓰며 잠겨 있으면 건너뛴다.
+    """
+    now = (clock or utc_now)()
+    result: dict[str, Any] = {"status": "done", "dry_run": dry_run, "routes_checked": 0, "remapped": [], "failed": []}
+    conn = db.connect(autocommit=True)
+    try:
+        if not conn.execute("SELECT pg_try_advisory_lock(%s)", (advisory_key(LOCK_NAME),)).fetchone()[0]:
+            return {**result, "status": "locked"}
+        routes = [r for r in repository.shape_collection_routes(conn)
+                  if any((entry or {}).get("status") == "available" for entry in r["patterns"].values())]
+        points = repository.pattern_stop_points(conn, [r["id"] for r in routes])
+        for route in routes:
+            rows = points.get(route["id"], {})
+            if all((route["patterns"].get(key) or {}).get("status") == "available" for key in rows):
+                continue
+            result["routes_checked"] += 1
+            current = {key: [route_shapes.StopPoint(seq=seq, lon=lon, lat=lat) for seq, lon, lat in stop_rows
+                             if lon is not None and lat is not None] for key, stop_rows in rows.items()}
+            entries, remapped = route_shapes.remap_patterns(
+                repository.route_shape_patterns(conn, route["id"]), current, remapped_at=_iso(now))
+            label = {"route_no": route["route_no"], "external_id": route["external_id"]}
+            for key in rows:
+                if key in remapped:
+                    result["remapped"].append({**label, "pattern_key": key, "from": entries[key]["remapped_from"],
+                                               "stop_match": entries[key]["stop_match"]})
+                elif (entries.get(key) or {}).get("status") != "available":
+                    result["failed"].append({**label, "pattern_key": key})
+            if remapped and not dry_run:
+                repository.save_shape_patterns(conn, route["id"], route["provider"] or {}, entries)
+        if result["remapped"] or result["failed"]:
+            logger.info("형상 재대응%s: %d개 패턴 복구, %d개 실패", "(저장 안 함)" if dry_run else "",
+                        len(result["remapped"]), len(result["failed"]))
+        return result
+    finally:
+        conn.close()
+
+
 def _is_matched(route: dict[str, Any]) -> bool:
     provider = route["provider"]
     return bool(provider and provider.get("name") == PROVIDER and provider.get("status") == "matched"

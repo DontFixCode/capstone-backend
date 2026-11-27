@@ -13,6 +13,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from app.modules.congestion import levels as congestion_levels
+
 PROCESSING = "processing"
 TERMINAL_STATUSES = ("ready", "data_limited", "no_path", "out_of_scope", "error")
 START_RANKED = "ranked"
@@ -79,6 +81,8 @@ def leg_view(leg: dict[str, Any]) -> dict[str, Any]:
                                              "matchStatus": vehicle.get("match_status")},
         "boardEta": eta_view(leg.get("board_eta")), "alightEta": eta_view(leg.get("alight_eta")),
         "rideSeconds": leg.get("ride_seconds"), "reasonCodes": leg.get("reason_codes") or [],
+        # 평소 이 시간대 예상 혼잡(실시간 아님). 집계가 없거나 설정 전이면 status: unavailable과 사유다.
+        "congestion": congestion_levels.view(leg.get("congestion")),
         "geometry": leg.get("geometry"), "geometryStatus": leg.get("geometry_status"),
         "geometrySource": leg.get("geometry_source"), "geometryVersion": leg.get("geometry_version"),
         "geometryFetchedAt": leg.get("geometry_fetched_at"), "geometryReason": leg.get("geometry_reason"),
@@ -112,7 +116,14 @@ def evaluation_view(row: dict[str, Any]) -> dict[str, Any]:
         "transfers": [{
             "transferIndex": t.get("transfer_index"), "frontLegIndex": t.get("front_leg_index"),
             "nextLegIndex": t.get("next_leg_index"), "slackSeconds": t.get("slack_seconds"),
+            # 여유시간 등급(missed/tight/moderate/comfortable, 경계 설정이 없거나 시각 미확인이면 null)과, 여유에 제공처
+            # 예측이 아닌 ETA가 들어갔는지. 확률이 없어도 시간이 계산된 환승마다 준다.
+            "slackGrade": t.get("slack_grade"), "slackEstimated": t.get("slack_estimated"),
             "status": t.get("status"), "probability": t.get("probability"),
+            # 확률의 근거: paired_ecdf(짝지은 두 차량의 판정 표본) / marginal_ecdf(단일 차량 오차 결합) / null(확률 없음).
+            # probabilityRange는 [하한, 상한]이고 marginal_ecdf면 probability는 하한이다.
+            "probabilitySource": t.get("probability_source"), "probabilityRange": t.get("probability_range"),
+            "probabilitySampleCounts": t.get("probability_sample_counts") or {},
             "reasonCodes": t.get("reason") or [],
         } for t in ev.get("transfers") or []],
         "evaluatedAt": row.get("evaluated_at"), "dataSnapshotId": provenance.get("data_snapshot_id"),
@@ -170,6 +181,11 @@ def candidate_view(search: dict[str, Any], row: dict[str, Any], now: datetime) -
         "legs": [leg_view(leg) for leg in row.get("legs") or []],
         "evaluation": evaluation_view(row),
         "rankingReasonCodes": ranking.get("reason_codes") or [],
+        # 순위를 정한 비용 = 선택한 모드의 시간 + 내시균형 bias(혼잡 비용, 초). 순위가 없으면 null이다.
+        "cost": None if row.get("rank_no") is None else {
+            "timeSeconds": ranking.get("time_seconds"),
+            "equilibriumBiasSeconds": ranking.get("equilibrium_bias_seconds"),
+            "costSeconds": ranking.get("cost_seconds")},
     }
 
 

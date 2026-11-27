@@ -19,6 +19,7 @@ from app.core.dependencies import active_user, get_db, get_settings
 from app.core.exceptions import ApiError, not_found
 from app.core.security import AuthUser
 from app.db.session import Database
+from app.modules.congestion import levels as congestion_levels
 from app.modules.transit import repository, views
 from app.modules.transit.schemas import RealtimeTarget
 from app.modules.transit.service import find_nearby_stops, realtime_target_key
@@ -141,7 +142,8 @@ def stop_arrivals(stopId: int = _id(), _user: AuthUser = Depends(active_user), d
         register_view(db, settings, RealtimeTarget("arrivals", row["external_id"]))
     with db.transaction(isolation="REPEATABLE READ") as conn:
         return views.stop_arrivals(conn, row, interval_seconds=settings.realtime_interval_seconds, now=_now(),
-                                   basis_policy=settings.tago_eta_basis_policy)
+                                   basis_policy=settings.tago_eta_basis_policy,
+                                   congestion_policy=congestion_levels.policy_from_settings(settings))
 
 
 @router.get("/routes", tags=["routes"])

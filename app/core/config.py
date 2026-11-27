@@ -4,6 +4,7 @@
 DB 이름·비밀번호는 app/db/session.py가 루트 .env에서 직접 읽고, 접속 위치·계정은 여기(BACKEND_DB_*)서 읽는다.
 """
 
+from datetime import date
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -12,6 +13,14 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 # 쉼표로 구분한 외부 ID 목록. JSON 배열 대신 사람이 편집하기 쉬운 형식을 쓴다.
 IdList = Annotated[tuple[str, ...], NoDecode]
+
+
+def _split_numbers(value: object) -> tuple[float, ...]:
+    """쉼표 구분 숫자 문자열을 순서를 지킨 실수 목록으로 바꾼다. 비어 있으면 빈 목록(미설정)이다."""
+    if value is None:
+        return ()
+    parts = value.split(",") if isinstance(value, str) else list(value)
+    return tuple(float(str(part).strip()) for part in parts if str(part).strip())
 
 
 class Settings(BaseSettings):
@@ -39,6 +48,10 @@ class Settings(BaseSettings):
     # TAGO_SERVICE_KEY를 쓴다(해당 API 활용신청이 승인돼 있어야 한다). 현재는 devtools 확인 URL에서만 쓴다.
     daejeon_bus_service_key: SecretStr | None = Field(default=None, validation_alias="DAEJEON_BUS_SERVICE_KEY")
     daejeon_bus_timeout_seconds: float = Field(default=10.0, gt=0)
+    # 대전시 노선 위치(getBusPosByRtid) ARR_TIME의 뜻. 도착 시각인지 출발 시각인지 확인하지 못했으므로 기본은 unverified다.
+    # unverified면 그 정류소의 ARR_TIME을 도착 시각으로 쓰지 않고 앞뒤 정류소 기록 사이의 범위로만 도착을 남긴다.
+    # arrival은 점 시각으로, departure는 [직전 정류소 ARR_TIME, 그 정류소 ARR_TIME] 범위로 쓴다(app.modules.transit.arrival_events).
+    daejeon_position_arr_time_meaning: Literal["unverified", "arrival", "departure"] = "unverified"
 
     # 서비스별 승인 호출 한도. 계정에서 확인한 값이 없으므로 기본값을 두지 않으며 None은 '미확인'이다.
     # 공개 포털의 개발 트래픽 표기를 이 계정의 승인값으로 사용하지 않는다.
@@ -104,6 +117,20 @@ class Settings(BaseSettings):
     eval_sample_policy_version: str | None = None
     eval_recovery_policy_version: str | None = None
     eval_segment_model_version: str | None = None
+    # 환승 여유시간 등급의 경계(초, "하한,상한"). 여유 m이 0 미만이면 missed, 0 이상 하한 미만 tight, 하한 이상 상한 미만
+    # moderate, 상한 이상 comfortable이다. 근거 있는 공통 수치가 없어 기본값을 두지 않으며, 비우면 등급을 만들지 않는다(null).
+    eval_slack_grade_thresholds_seconds: Annotated[tuple[float, ...], NoDecode] = ()
+    # 환승 확률의 두 번째 단계: 짝지은 두 차량의 판정 표본이 부족하면 단일 차량 ETA 오차 표본(app.eta_error_samples)의 두
+    # 분포를 결합해 확률 범위를 낸다. 기본은 꺼짐이다. 켜면 아래 두 값과 BACKEND_ETA_ERROR_HORIZON_EDGES_SECONDS가 있어야
+    # 하고, 비어 있으면 검색 설정 오류다. 최근 며칠의 표본을 쓸지와 앞·다음 차량 각각의 최소 표본 수(독립 운행 기준)다.
+    eval_marginal_probability_enabled: bool = False
+    eval_marginal_window_days: float | None = Field(default=None, gt=0)
+    eval_min_marginal_samples: int | None = Field(default=None, gt=0)
+    # 오차 표본을 쌓지 않는 생성 방식(쉼표 구분: leading_vehicle_gap, headway_estimate, historical_segments) 가운데, 같은
+    # 잔여시간 구간의 제공처 예측 오차 분포를 빌려 확률을 낼 방식. 기본은 없음(그 방식이 낀 환승은 확률을 내지 않는다).
+    # 다른 방식의 오차를 대신 쓰는 근사이므로 실제 오차가 더 큰 방식(특히 배차간격 예상)은 확률이 실제보다 높게 나온다.
+    # 응답에는 사유 코드 marginal_error_source_approximated로 구분된다.
+    eval_marginal_approximate_sources: IdList = ()
     # 최초 검색 결과·필요 실시간 대상의 유효기간(초). 이 동안 워커가 대상을 공유 수집한다.
     search_expires_seconds: float | None = None
     # TMAP 보행자 경로 searchOption(0 추천, 4 추천+대로우선, 10 최단, 30 최단+계단제외)과 검색당 최대 조회 수.
@@ -156,6 +183,11 @@ class Settings(BaseSettings):
     # 활성 이동 재평가 간격(Development Phase·Phase 3 Algorithms: 1분, 공유 수집 600초와 별개)과 계산 임대 시간.
     journey_recalc_interval_seconds: float = Field(default=60.0, gt=0)
     journey_recalc_lease_seconds: float = Field(default=120.0, gt=0)
+    # 이동 안내에 바로 쓰이는 도착정보(다음 승차 정류소, 탑승 중이면 하차 정류소)를 재계산 직전에 새로 받는 기준(초).
+    # 이 시간 안에 받은 값은 다시 받지 않는다. 공유 수집 600초만 쓰면 이미 지나간 차량이 안내에 남는다.
+    journey_realtime_refresh_seconds: float = Field(default=60.0, gt=0)
+    # 사용자 입력·위치·스트림 연결이 이 시간(초) 넘게 없는 이동은 위 주기 갱신을 멈춘다(상태가 바뀌면 다시 받는다).
+    journey_realtime_refresh_idle_seconds: float = Field(default=1800.0, gt=0)
     # 위치 최신성 기준(초). 비우면 평가 자료 최신성 기준 BACKEND_EVAL_MAX_DATA_AGE_SECONDS를 쓴다.
     journey_location_max_age_seconds: float | None = Field(default=None, gt=0)
     # 기기 시계 오차로 허용하는 미래 관측 시각(초). 이보다 미래인 위치는 422로 거부한다.
@@ -176,6 +208,146 @@ class Settings(BaseSettings):
     # 워커가 차단 대기 계정(deleted_at 있음·auth_blocked_at 없음)을 다시 시도하는 간격과 한 번에 처리할 최대 계정 수.
     auth_block_retry_interval_seconds: float = Field(default=300.0, gt=0)
     auth_block_retry_batch_size: int = Field(default=20, ge=1, le=500)
+
+    # ---- 예상 혼잡도 (Phase 8) ----
+    # 근거 없는 기본값을 두지 않는다. 비어 있으면 그 값이 필요한 기능이 사유와 함께 멈춘다(.env.api.example의 가정값 참고).
+    # 집계 창: 집계 시점 기준 직전 n개월의 승하차 원본만 쓴다. 비우면 집계를 실행하지 않는다.
+    congestion_window_months: int | None = Field(default=None, gt=0, le=36)
+    # 표본 일수가 이 값보다 적으면 상위 80퍼센타일을 만들지 않고 응답에 신뢰도 낮음(lowConfidence)을 표시한다.
+    congestion_min_sample_days: int | None = Field(default=None, gt=0)
+    # 1대당 좌석 수·정원(단계 문턱값의 경계). 둘 다 있어야 혼잡 단계를 만든다. 실제 차량 제원으로 교체한다.
+    congestion_seats: int | None = Field(default=None, gt=0)
+    congestion_capacity: int | None = Field(default=None, gt=0)
+    # 공휴일(YYYY-MM-DD, 쉼표 구분). 일요일과 함께 holiday 요일유형으로 집계·조회한다.
+    congestion_holidays: Annotated[tuple[date, ...], NoDecode] = ()
+    # 혼잡 단계별 탑승시간 가중치 5개(버스 전세, 여유, 보통, 혼잡, 매우 혼잡 순, 쉼표 구분, 각 1 이상).
+    # 추천 비용의 내시균형 bias = Σ 버스 탑승시간 × (가중치 − 1). 비우면 혼잡을 순위에 반영하지 않는다(bias 0).
+    congestion_cost_weights: Annotated[tuple[float, ...], NoDecode] = ()
+
+    # ---- ETA 오차 표본 수집 (docs/eta-error-probability.md) ----
+    # 버스 한 대씩의 '실제 도착 − 예측 도착' 오차 표본을 워커가 모은다(app/workflows/eta_error_sampling.py). 기본은 꺼짐이다.
+    # 켜면 대상·주기·시간대·연결 창·잔여시간 구간 경계·운행 분리 간격이 모두 있어야 하고, 하나라도 비면 설정 오류로 표본
+    # 수집만 멈춘다(기존 수집은 계속). 근거 없는 수치를 코드 기본값으로 두지 않는다.
+    eta_error_sampling_enabled: bool = False
+    # 대상 정류소·노선의 원천 ID(쉼표 구분, 'DJB' 접두사 포함). 정류소는 도착정보를, 노선은 대전시 노선 위치를 아래 주기로 받는다.
+    eta_error_sampling_stops: IdList = ()
+    eta_error_sampling_routes: IdList = ()
+    # 표본 수집 대상의 수집 주기(초). 나머지 대상은 BACKEND_REALTIME_INTERVAL_SECONDS를 그대로 쓴다.
+    eta_error_sampling_interval_seconds: float | None = Field(default=None, gt=0)
+    # 수집 시간대(KST 시, "시작-끝"을 쉼표로 구분, 끝 시각 제외. 예: 6-23 또는 7-9,17-20). 시간대 밖에서는 호출하지 않는다.
+    eta_error_sampling_hours: Annotated[tuple[tuple[int, int], ...], NoDecode] = ()
+    # 서비스(도착정보·노선 위치)별로 그날(KST) 대전시 API 호출 수가 이 값에 닿으면 표본 수집 호출을 멈춘다. 검색·안내용
+    # 호출은 계속하므로 계정 한도보다 낮게 잡아 여유를 남긴다. 비우면 제한하지 않는다.
+    eta_error_sampling_daily_call_limit: int | None = Field(default=None, gt=0)
+    # 실제 도착 시각을 재는 노선 위치의 원천. daejeon은 대전시 노선 위치(정류소 이벤트 시각 ARR_TIME이 있으나 이 계정의 일일
+    # 한도가 100건으로 확인됨), tago는 TAGO 노선 위치(시각이 없어 도착을 앞뒤 조회 시각 사이의 범위로만 안다)다.
+    eta_error_position_source: Literal["daejeon", "tago"] = "daejeon"
+    # 노선 위치 서비스에만 따로 적용할 일일 호출 상한. 비우면 위의 공통 상한을 쓴다. tago일 때는 검색·안내가 함께 쓰는 TAGO
+    # 노선 위치 호출을 모두 세므로, 그 한도보다 충분히 낮게 잡는다.
+    eta_error_sampling_position_daily_call_limit: int | None = Field(default=None, gt=0)
+    # 예측 기준 시각부터 도착까지가 이 시간(초)을 넘으면 예측과 도착을 잇지 않는다(같은 차량의 다른 운행을 잇지 않게 한다).
+    eta_error_match_window_seconds: float | None = Field(default=None, gt=0)
+    # 잔여시간(예측 도착 − 기준 시각) 구간의 경계(초, 오름차순 쉼표 구분. 예: 120,300,600). 표본 생성과 확률 계산이 같은 값을 쓴다.
+    eta_error_horizon_edges_seconds: Annotated[tuple[float, ...], NoDecode] = ()
+    # 같은 차량의 위치 기록 간격이 이 시간(초)을 넘으면 다른 운행으로 나눈다.
+    eta_error_run_gap_seconds: float | None = Field(default=None, gt=0)
+
+    @field_validator("eta_error_sampling_enabled", "eval_marginal_probability_enabled", mode="before")
+    @classmethod
+    def blank_flag_is_off(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return False
+        return value
+
+    @field_validator("eta_error_sampling_interval_seconds", "eta_error_sampling_daily_call_limit",
+                     "eta_error_sampling_position_daily_call_limit",
+                     "eta_error_match_window_seconds", "eta_error_run_gap_seconds", "eval_marginal_window_days",
+                     "eval_min_marginal_samples", mode="before")
+    @classmethod
+    def blank_eta_error_setting_is_missing(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
+
+    @field_validator("eta_error_position_source", mode="before")
+    @classmethod
+    def blank_position_source_is_default(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip().lower() or "daejeon"
+        return value
+
+    @field_validator("eta_error_sampling_hours", mode="before")
+    @classmethod
+    def split_sampling_hours(cls, value: object) -> object:
+        """"6-23" 또는 "7-9,17-20" 같은 KST 시간대 목록. 각 구간은 0 ≤ 시작 < 끝 ≤ 24다."""
+        if value is None:
+            return ()
+        parts = value.split(",") if isinstance(value, str) else list(value)
+        ranges = []
+        for part in parts:
+            if isinstance(part, (tuple, list)):
+                start, end = part
+            elif str(part).strip():
+                start, _, end = str(part).strip().partition("-")
+            else:
+                continue
+            try:
+                start, end = int(str(start).strip()), int(str(end).strip())
+            except ValueError:
+                raise ValueError("수집 시간대는 '시작-끝' 형식의 KST 시(예: 6-23)여야 합니다.") from None
+            if not 0 <= start < end <= 24:
+                raise ValueError("수집 시간대는 0 ≤ 시작 < 끝 ≤ 24여야 합니다.")
+            ranges.append((start, end))
+        return tuple(ranges)
+
+    @field_validator("eta_error_horizon_edges_seconds", mode="before")
+    @classmethod
+    def split_horizon_edges(cls, value: object) -> object:
+        numbers = _split_numbers(value)
+        if any(not 0 < number < float("inf") for number in numbers) or list(numbers) != sorted(set(numbers)):
+            raise ValueError("잔여시간 구간 경계는 0보다 크고 서로 다른 오름차순 초 값이어야 합니다.")
+        return numbers
+
+    @field_validator("eval_slack_grade_thresholds_seconds", mode="before")
+    @classmethod
+    def split_slack_grade_thresholds(cls, value: object) -> object:
+        numbers = _split_numbers(value)
+        if numbers and (len(numbers) != 2 or not 0 < numbers[0] < numbers[1] < float("inf")):
+            raise ValueError("환승 여유시간 등급 경계는 0 < 하한 < 상한인 초 값 2개여야 합니다.")
+        return numbers
+
+    @field_validator("congestion_cost_weights", mode="before")
+    @classmethod
+    def split_cost_weights(cls, value: object) -> object:
+        if value is None:
+            return ()
+        parts = value.split(",") if isinstance(value, str) else list(value)
+        weights = tuple(float(str(part).strip()) for part in parts if str(part).strip())
+        if weights and (len(weights) != 5 or any(not 1.0 <= weight < float("inf") for weight in weights)
+                        or list(weights) != sorted(weights)):
+            raise ValueError("혼잡 단계별 가중치는 1 이상이고 단계가 높을수록 크거나 같은 값 5개여야 합니다.")
+        return weights
+
+    @field_validator("congestion_holidays", mode="before")
+    @classmethod
+    def split_holidays(cls, value: object) -> object:
+        """쉼표 구분 날짜 문자열을 중복 없는 날짜 목록으로 바꾼다. 형식이 틀리면 설정 오류로 알린다."""
+        if value is None:
+            return ()
+        parts = value.split(",") if isinstance(value, str) else list(value)
+        days = {date.fromisoformat(str(part).strip()) if not isinstance(part, date) else part
+                for part in parts if str(part).strip()}
+        return tuple(sorted(days))
+
+    @field_validator(
+        "congestion_window_months", "congestion_min_sample_days", "congestion_seats", "congestion_capacity",
+        mode="before",
+    )
+    @classmethod
+    def blank_congestion_setting_is_missing(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
 
     @field_validator(
         "search_max_boardings", "search_access_radius_meters", "search_transfer_radius_meters",
@@ -222,7 +394,17 @@ class Settings(BaseSettings):
             return None
         return value
 
-    @field_validator("realtime_position_route_ids", "realtime_arrival_stop_ids", mode="before")
+    @field_validator("eval_marginal_approximate_sources")
+    @classmethod
+    def approximate_sources_are_known(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        allowed = ("leading_vehicle_gap", "headway_estimate", "historical_segments")
+        unknown = [source for source in value if source not in allowed]
+        if unknown:
+            raise ValueError(f"근사할 생성 방식은 {allowed} 중에서 고릅니다: {unknown}")
+        return value
+
+    @field_validator("realtime_position_route_ids", "realtime_arrival_stop_ids", "eta_error_sampling_stops",
+                     "eta_error_sampling_routes", "eval_marginal_approximate_sources", mode="before")
     @classmethod
     def split_id_list(cls, value: object) -> object:
         """쉼표 구분 문자열을 순서를 지킨 중복 없는 ID 목록으로 바꾼다. ID는 문자열 그대로 다룬다."""

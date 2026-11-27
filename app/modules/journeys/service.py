@@ -6,6 +6,10 @@
   목적지)을 저장하고 최초 재평가를 바로 예약하며, 환승별 예측을 evaluation_snapshot 이벤트로 결과 전에 고정한다.
 - 입력: 세션 행을 잠그고 Idempotency-Key 중복을 먼저 검사한다(같은 입력은 기존 결과, 다른 입력은 409). 이어서 stateVersion·
   종료 여부·전이를 확인하고 이벤트 저장·상태 전이·버전 증가·재평가 예약(또는 종료 시 해제)을 한 트랜잭션에서 처리한다.
+- 이동 중 재탐색: 버스 놓침(missed_bus)은 최근 위치(없으면 놓친 정류소)에서, 목적지 변경(destination_changed)은 최근 위치에서
+  (탑승 중이면 계획 하차 정류소에서 하차 예상 시각 기준으로, 하차를 확인하면 그 정류소에서 다시) 새 검색을 접수하고 선택
+  스냅샷에 reroute_* 값을 남긴다. 검색은 워커가 실행하고 제안은 workflows.guidance가 만든다. 놓친 뒤 원래 경로의 버스에 타면
+  그 재탐색을 지우고, 대안을 수락하면 재탐색·목적지 변경 표시를 모두 지운다.
 - 환승 결과(transfer_result)·결과 수정(correction): 이동 상태를 바꾸지 않는 기록이라 상태 버전을 올리거나 재평가를 예약하지
   않으며 종료된 이동에서도 받는다. 결과는 이 이동에서 결과 전에 고정한 evaluation_snapshot의 snapshotKey·선택 버전·환승 순번과
   일치해야 하고, 발생 시각·환승 도달 여부·실제 이용 연결을 확인한다. 한 환승의 결과는 1건이며, 바꾸려면 가장 최근 응답을
@@ -73,11 +77,21 @@ def _require_writable_profile(conn: psycopg.Connection, user_id: UUID) -> None:
         raise JourneyError(403, "ACCOUNT_DELETED", "탈퇴 처리된 계정입니다.")
 
 
-def _queue_destination_reroute(db: Database, user_id: UUID, snapshot: dict[str, Any], *,
-                               origin: search_flow.PlaceInput, now: datetime,
-                               settings: Settings | None) -> dict[str, Any]:
+def _queue_reroute(db: Database, user_id: UUID, snapshot: dict[str, Any], *, kind: str,
+                   origin: search_flow.PlaceInput, origin_basis: str, now: datetime, settings: Settings | None,
+                   start_at: datetime | None = None) -> dict[str, Any]:
+    """현재 목적지로 가는 새 검색을 접수하고 선택 스냅샷에 재탐색 값을 남긴다(계산은 워커, 안내는 workflows.guidance).
+
+    origin_basis는 출발점의 근거다: current_location(최근 위치) / missed_stop(놓친 승차 정류소) / waiting_stop(기다리던
+    승차 정류소) / planned_alight_stop(탑승 중인 구간의 계획 하차 정류소) / alight_stop(실제 하차 정류소).
+    start_at은 그 출발점에서 걷기 시작할 수 있는 시각(탑승 중이면 하차 예상 시각, 생략하면 지금)이다.
+    접수하지 못하면 이전 재탐색 검색을 지우고 사유만 남긴다.
+    """
+    cleared = journey_state.clear_reroute(snapshot)
+    base = {**cleared, "reroute_kind": kind, "reroute_requested_at": now.isoformat(),
+            "reroute_origin": {"basis": origin_basis, "lat": origin.lat, "lon": origin.lon}}
     if settings is None:
-        return {**snapshot, "reroute_status": "search_unavailable", "reroute_reason": "search_settings_unavailable"}
+        return {**base, "reroute_status": "search_unavailable", "reroute_reason": "search_settings_unavailable"}
     try:
         config = search_flow.load_search_config(settings)
         destination = snapshot["destination"]
@@ -86,12 +100,72 @@ def _queue_destination_reroute(db: Database, user_id: UUID, snapshot: dict[str, 
             search_flow.PlaceInput(destination["lat"], destination["lon"], name=destination.get("name"),
                                    address=destination.get("address"), provider=destination.get("provider"),
                                    external_id=destination.get("external_id")),
-            start_at=now, source=search_flow.SOURCE_APP)
+            start_at=start_at or now, source=search_flow.SOURCE_APP)
         accepted = search_flow.accept_app_search(db, config, user_id, request, now=now)
-        return {**snapshot, "reroute_search_id": str(accepted["search_id"]), "reroute_status": "queued",
+        return {**base, "reroute_search_id": str(accepted["search_id"]), "reroute_status": "queued",
                 "reroute_reason": None}
     except (search_flow.SearchConfigError, search_flow.StaticDataUnavailable):
-        return {**snapshot, "reroute_status": "search_unavailable", "reroute_reason": "route_search_unavailable"}
+        return {**base, "reroute_status": "search_unavailable", "reroute_reason": "route_search_unavailable"}
+
+
+def _fresh_location(journey: dict[str, Any], now: datetime, settings: Settings | None) -> search_flow.PlaceInput | None:
+    """최근에 받은 사용자 위치. 없거나 오래됐으면 None(안내의 위치 최신성 기준과 같은 값으로 판단한다)."""
+    if settings is None or journey.get("location_lat") is None or journey.get("location_lon") is None:
+        return None
+    try:
+        config = search_flow.load_search_config(settings)
+    except search_flow.SearchConfigError:
+        return None
+    max_age = settings.journey_location_max_age_seconds or config.evaluation_policy.max_data_age_seconds
+    observed = journey.get("location_observed_at")
+    if observed is None or (now - observed).total_seconds() > max_age:
+        return None
+    return search_flow.PlaceInput(journey["location_lat"], journey["location_lon"])
+
+
+def _stop_place(point: dict[str, Any] | None) -> search_flow.PlaceInput | None:
+    """구간의 승차·하차 지점(또는 정류소 행)을 검색 출발점으로. 좌표가 없으면 None."""
+    point = point or {}
+    if point.get("lat") is None or point.get("lon") is None:
+        return None
+    return search_flow.PlaceInput(point["lat"], point["lon"], name=point.get("name"))
+
+
+def _expected_alight_at(journey: dict[str, Any], leg: dict[str, Any], now: datetime) -> datetime | None:
+    """탑승 중인 구간의 하차 예상 시각: 현재 상태로 계산한 안내의 하차 ETA, 없으면 선택 당시 계획 차량의 하차 ETA.
+
+    이미 지난 값은 쓰지 않는다. 둘 다 없으면 None(재탐색은 지금을 기준으로 접수하고 안내가 시각 없이 미리 보여 준다).
+    """
+    guidance = journey.get("guidance") or {}
+    onboard = guidance.get("onboard") or {}
+    values = []
+    if guidance.get("base_state_version") == journey["state_version"] and onboard.get("leg_index") == leg["leg_index"]:
+        values.append((onboard.get("alight_eta") or {}).get("predicted_arrival_at"))
+    values.append((leg.get("alight_eta") or {}).get("predicted_arrival_at"))
+    for value in values:
+        try:
+            at = datetime.fromisoformat(value) if isinstance(value, str) else None
+        except ValueError:
+            at = None
+        if at is not None and at.tzinfo is not None and at > now:
+            return at
+    return None
+
+
+def _queue_from_planned_alight(db: Database, user_id: UUID, journey: dict[str, Any], snapshot: dict[str, Any],
+                               leg: dict[str, Any], *, now: datetime, settings: Settings | None) -> dict[str, Any]:
+    """탑승 중 목적지가 바뀐 경우: 타고 있는 구간은 유지하고, 계획 하차 정류소에서 하차 예상 시각에 출발하는 경로를 미리 찾는다.
+
+    제안은 하차 확인 전까지 미리보기이며(수락은 하차 뒤), 하차를 확인하면 실제 하차 정류소·그 시각으로 다시 검색한다.
+    """
+    origin = _stop_place(leg.get("alight"))
+    if origin is None:
+        return {**journey_state.clear_reroute(snapshot), "reroute_kind": journey_state.REROUTE_DESTINATION,
+                "reroute_status": "deferred_until_alight",
+                "reroute_reason": "confirmed_onboard_segment_fixed_until_alight"}
+    return _queue_reroute(db, user_id, snapshot, kind=journey_state.REROUTE_DESTINATION, origin=origin,
+                          origin_basis="planned_alight_stop", now=now, settings=settings,
+                          start_at=_expected_alight_at(journey, leg, now))
 
 
 # ---------------------------------------------------------------- 시작
@@ -259,6 +333,10 @@ def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key:
                     any(k in payload for k in RESULT_CORRECTION_FIELDS):
                 raise JourneyError(422, "INVALID_CORRECTION", "result·actualConnection은 환승 결과 수정에만 쓸 수 있습니다.")
         resolved = _resolve_references(conn, journey_id, body.eventType, payload)
+        if body.eventType == "missed_bus":
+            guided = _guided_boarding(journey, payload.get("legIndex"))
+            if guided is not None:
+                resolved["guided"] = guided
         legs = (journey["selected_snapshot"] or {}).get("legs") or []
         proposed_snapshot = journey.get("proposed_snapshot") or {}
         if body.eventType in ("route_accepted", "route_rejected"):
@@ -288,32 +366,60 @@ def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key:
             progress=progress, state_version=version, ended_at=now if transition.ended else journey["ended_at"],
             # 상태가 바뀌면 즉시 재평가를 예약하고, 완료·취소면 예약을 해제한다(수집 대상도 함께 빠진다).
             next_recalc_at=now if active else None)
+        destination_kind = journey_state.REROUTE_DESTINATION
         if body.eventType == "destination_changed":
-            snapshot = dict(journey["selected_snapshot"] or {})
+            snapshot = journey_state.clear_reroute(dict(journey["selected_snapshot"] or {}))
             snapshot["destination"] = transition.effect["destination"]
             snapshot["destination_changed_at"] = now.isoformat()
-            snapshot.pop("reroute_search_id", None)
-            if journey["movement_state"] == journey_state.ONBOARD:
-                snapshot.update(reroute_status="deferred_until_alight",
+            boarded_index = ((journey["current_progress"] or {}).get("boarded") or {}).get("leg_index")
+            if journey["movement_state"] == journey_state.ONBOARD and isinstance(boarded_index, int):
+                # 타고 있는 구간은 유지하고 계획 하차 정류소에서 이어 갈 경로를 미리 찾는다(적용은 하차 확인 뒤).
+                snapshot = _queue_from_planned_alight(db, user_id, journey, snapshot, legs[boarded_index],
+                                                      now=now, settings=settings)
+            elif journey["movement_state"] == journey_state.ONBOARD:
+                snapshot.update(reroute_kind=destination_kind, reroute_status="deferred_until_alight",
                                 reroute_reason="confirmed_onboard_segment_fixed_until_alight")
             else:
-                try:
-                    config = search_flow.load_search_config(settings) if settings is not None else None
-                    max_age = (settings.journey_location_max_age_seconds or config.evaluation_policy.max_data_age_seconds
-                               if config is not None and settings is not None else 0)
-                except search_flow.SearchConfigError:
-                    config, max_age = None, 0
-                observed = journey.get("location_observed_at")
-                fresh = observed is not None and (now - observed).total_seconds() <= max_age
-                if fresh:
-                    snapshot = _queue_destination_reroute(
-                        db, user_id, snapshot,
-                        origin=search_flow.PlaceInput(journey["location_lat"], journey["location_lon"]),
-                        now=now, settings=settings)
+                origin, basis = _fresh_location(journey, now, settings), "current_location"
+                next_index = (journey["current_progress"] or {}).get("next_bus_leg_index")
+                if origin is None and journey["movement_state"] == journey_state.WAITING \
+                        and isinstance(next_index, int) and 0 <= next_index < len(legs):
+                    # 버스를 놓친 뒤 기다리는 중이면 그 승차 정류소에 있다고 본다.
+                    origin, basis = _stop_place(legs[next_index].get("board")), "waiting_stop"
+                if origin is not None:
+                    snapshot = _queue_reroute(db, user_id, snapshot, kind=destination_kind, origin=origin,
+                                              origin_basis=basis, now=now, settings=settings)
                 else:
-                    snapshot.update(reroute_status="location_unavailable",
+                    snapshot.update(reroute_kind=destination_kind, reroute_status="location_unavailable",
                                     reroute_reason="fresh_location_required_for_destination_change")
-            repository.update_destination(conn, journey_id, snapshot)
+            repository.replace_selected_snapshot(conn, journey_id, snapshot)
+        elif body.eventType == "missed_bus":
+            # 원래 경로의 다음 차량을 기다리는 것과 지금 위치에서 다른 경로로 가는 것을 비교할 수 있게 새 검색을 접수한다.
+            # 최근 위치가 없으면 놓친 승차 정류소를 출발점으로 쓴다. 목적지 변경이 걸려 있으면 그 재탐색을 이 위치에서 다시 한다.
+            snapshot = dict(journey["selected_snapshot"] or {})
+            origin, basis = _fresh_location(journey, now, settings), "current_location"
+            if origin is None:
+                origin, basis = _stop_place(legs[payload["legIndex"]].get("board")), "missed_stop"
+            pending_destination = bool(snapshot.get("destination_changed_at"))
+            if origin is not None:
+                queued = _queue_reroute(
+                    db, user_id, snapshot, origin=origin, origin_basis=basis, now=now, settings=settings,
+                    kind=destination_kind if pending_destination else journey_state.REROUTE_MISSED_BUS)
+                # 버스 놓침 재탐색을 접수하지 못하면 재탐색 없이 최초 검색의 후보로 비교한다(기존 방식).
+                snapshot = queued if pending_destination or queued["reroute_status"] == "queued" \
+                    else journey_state.clear_reroute(snapshot)
+                repository.replace_selected_snapshot(conn, journey_id, snapshot)
+        elif body.eventType == "board":
+            snapshot = dict(journey["selected_snapshot"] or {})
+            if snapshot.get("destination_changed_at"):
+                # 목적지를 바꾼 뒤 기존 경로의 버스에 탔다. 그 구간의 계획 하차 정류소에서 이어 갈 경로를 다시 찾는다.
+                snapshot = _queue_from_planned_alight(db, user_id, journey, snapshot,
+                                                      legs[transition.effect["boarded"]["leg_index"]],
+                                                      now=now, settings=settings)
+                repository.replace_selected_snapshot(conn, journey_id, snapshot)
+            elif snapshot.get("reroute_kind") == journey_state.REROUTE_MISSED_BUS:
+                # 놓친 뒤 원래 경로의 버스에 탔으므로 그 정류소 기준 재탐색은 끝낸다.
+                repository.replace_selected_snapshot(conn, journey_id, journey_state.clear_reroute(snapshot))
         elif body.eventType == "route_rejected":
             conn.execute("UPDATE app.journeys SET proposed_candidate_id = NULL, proposed_snapshot = NULL WHERE id = %s",
                          (journey_id,))
@@ -325,28 +431,26 @@ def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key:
                          (Jsonb(progress), journey_id))
         elif body.eventType == "alight":
             snapshot = dict(journey["selected_snapshot"] or {})
-            if snapshot.get("destination_changed_at") and snapshot.get("reroute_status") == "deferred_until_alight":
+            if snapshot.get("destination_changed_at"):
+                # 탑승 중에 미리 찾은 경로는 하차 예상 기준이라, 실제로 내린 정류소·시각으로 다시 검색한다.
                 alighted_leg = legs[transition.effect["alighted"]["leg_index"]]
-                point = alighted_leg.get("alight") or {}
-                if point.get("lat") is not None and point.get("lon") is not None:
-                    snapshot = _queue_destination_reroute(
-                        db, user_id, snapshot,
-                        origin=search_flow.PlaceInput(point["lat"], point["lon"]), now=now, settings=settings)
+                origin = _stop_place(resolved.get("stop_location")) or _stop_place(alighted_leg.get("alight"))
+                if origin is not None:
+                    snapshot = _queue_reroute(db, user_id, snapshot, kind=destination_kind, origin=origin,
+                                              origin_basis="alight_stop", now=now, settings=settings)
                 else:
-                    snapshot.update(reroute_status="location_unavailable",
-                                    reroute_reason="fresh_location_required_after_alight")
-                repository.update_destination(conn, journey_id, snapshot)
+                    snapshot = {**journey_state.clear_reroute(snapshot), "reroute_kind": destination_kind,
+                                "reroute_status": "location_unavailable",
+                                "reroute_reason": "fresh_location_required_after_alight"}
+                repository.replace_selected_snapshot(conn, journey_id, snapshot)
         elif body.eventType == "route_accepted":
-            chosen = dict(proposed_snapshot)
+            chosen = journey_state.clear_reroute(dict(proposed_snapshot))
             accepted_progress = chosen.get("accepted_progress")
             chosen.pop("base_state_version", None)
             chosen.pop("proposal_version", None)
             chosen.pop("accepted_progress", None)
             chosen.pop("change_decision", None)
             chosen.pop("destination_changed_at", None)
-            chosen.pop("reroute_search_id", None)
-            chosen.pop("reroute_status", None)
-            chosen.pop("reroute_reason", None)
             chosen["selection_version"] = journey["selection_version"] + 1
             chosen["selected_at"] = now.isoformat()
             progress = accepted_progress or journey_state.initial_progress(chosen.get("legs") or [])
@@ -356,7 +460,8 @@ def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key:
                                            selected_snapshot=chosen,
                                            selection_version=journey["selection_version"] + 1)
             repository.update_state(conn, journey_id, lifecycle_status=journey["lifecycle_status"],
-                                    movement_state=journey["movement_state"],
+                                    movement_state=_movement_after_accept(journey, legs, chosen.get("legs") or [],
+                                                                          progress),
                                     progress=progress, state_version=version, ended_at=journey["ended_at"],
                                     next_recalc_at=now)
             accepted_candidate = {**chosen, "id": chosen["candidate_id"]}
@@ -368,6 +473,44 @@ def record_event(db: Database, user_id: UUID, journey_id: UUID, idempotency_key:
                                         received_at=now, state_version_after=version,
                                         payload=snapshot_payload, skip_existing=True)
         return {"event_id": event_id, "state_version_after": version, "replayed": False}
+
+
+def _movement_after_accept(journey: dict[str, Any], old_legs: list[dict[str, Any]], new_legs: list[dict[str, Any]],
+                           new_progress: dict[str, Any]) -> str:
+    """대안을 수락한 뒤의 이동 상태. 정류소에서 기다리다가(waiting) 다른 정류소에서 타는 경로로 바꾸면 다시 걷는 상태로 둔다.
+
+    waiting은 '다음 승차 정류소에 이미 있다'는 뜻이라, 그대로 두면 새 정류소까지의 도보 시간이 안내에서 빠진다.
+    같은 정류소에서 타는 경로면 기다리는 상태를 유지한다.
+    """
+    movement = journey["movement_state"]
+    if movement != journey_state.WAITING:
+        return movement
+
+    def board_stop(route_legs: list[dict[str, Any]], index: Any) -> Any:
+        if not isinstance(index, int) or not 0 <= index < len(route_legs):
+            return None
+        return (route_legs[index].get("board") or {}).get("stop_id")
+
+    old_stop = board_stop(old_legs, (journey["current_progress"] or {}).get("next_bus_leg_index"))
+    new_stop = board_stop(new_legs, new_progress.get("next_bus_leg_index"))
+    if old_stop is not None and old_stop == new_stop:
+        return movement
+    return journey_state.TRANSFERRING if new_progress.get("completed_bus_legs") else journey_state.WALKING
+
+
+def _guided_boarding(journey: dict[str, Any], leg_index: Any) -> dict[str, Any] | None:
+    """현재 상태 버전의 안내가 그 버스 구간에서 타라고 알려주던 차량과 승차 예상 시각. 그런 안내가 없으면 None.
+
+    앱이 차량번호 없이 '버스를 놓쳤어요'를 보내도 사용자가 화면에서 본 차량을 놓친 차량으로 기록하는 데 쓴다.
+    """
+    guidance = journey.get("guidance") or {}
+    boarding = guidance.get("next_boarding") or {}
+    if guidance.get("base_state_version") != journey["state_version"] or boarding.get("leg_index") != leg_index:
+        return None
+    if boarding.get("predicted_arrival_at") is None:
+        return None
+    return {"vehicle_id": (boarding.get("vehicle") or {}).get("vehicle_id"),
+            "predicted_arrival_at": boarding["predicted_arrival_at"]}
 
 
 def _resolve_references(conn, journey_id: UUID, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -382,6 +525,7 @@ def _resolve_references(conn, journey_id: UUID, event_type: str, payload: dict[s
         if stop is None:
             raise JourneyError(422, "STOP_NOT_FOUND", "stopId에 해당하는 정류소가 없습니다.")
         resolved["stop_internal_id"] = stop["id"]
+        resolved["stop_location"] = {"lat": stop["lat"], "lon": stop["lon"], "name": stop["name"]}
     if event_type == "correction":
         target = repository.get_event(conn, journey_id, int(payload["supersedesEventId"]))
         if target is None or target["event_type"] not in ("board", "alight"):
@@ -610,11 +754,13 @@ def update_location(db: Database, user_id: UUID, journey_id: UUID, body: Locatio
                                              recalc_now=was_limited)
         snapshot = journey.get("selected_snapshot") or {}
         if (updated and snapshot.get("destination_changed_at") and not snapshot.get("reroute_search_id")
-                and snapshot.get("reroute_status") == "location_unavailable"):
-            snapshot = _queue_destination_reroute(
-                db, user_id, dict(snapshot), origin=search_flow.PlaceInput(body.latitude, body.longitude),
+                and snapshot.get("reroute_status") == "location_unavailable"
+                and journey["movement_state"] != journey_state.ONBOARD):
+            snapshot = _queue_reroute(
+                db, user_id, dict(snapshot), kind=journey_state.REROUTE_DESTINATION,
+                origin=search_flow.PlaceInput(body.latitude, body.longitude), origin_basis="current_location",
                 now=now, settings=settings)
-            repository.update_destination(conn, journey_id, snapshot)
+            repository.replace_selected_snapshot(conn, journey_id, snapshot)
         return updated
 
 
@@ -717,6 +863,9 @@ def transfer_results_view(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "transferIndex": snap.get("transfer_index"), "frontLegIndex": snap.get("front_leg_index"),
             "nextLegIndex": snap.get("next_leg_index"),
             "prediction": {"probability": snap.get("predicted_probability"), "slackSeconds": snap.get("slack_seconds"),
+                           "probabilitySource": snap.get("probability_source"),
+                           "probabilityRange": snap.get("probability_range"),
+                           "slackGrade": snap.get("slack_grade"), "slackEstimated": snap.get("slack_estimated"),
                            "connectionStatus": snap.get("connection_status"), "fixedAt": row["fixed_at"]},
             "result": None if found is None else {
                 "value": found.result, "eventId": str(found.effective_event_id),

@@ -7,13 +7,16 @@
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from statistics import fmean
 
+from app.modules.evaluation.eta_errors import horizon_bucket
 from app.modules.evaluation.schemas import (
+    EtaErrorSample,
     EvaluationPolicy,
     JointScene,
     PlannedJourney,
@@ -64,6 +67,70 @@ def estimate_transfer_probability(
         return None
     successes = sum(front_error - next_error <= slack_seconds for front_error, next_error in eligible_error_pairs)
     return successes / len(eligible_error_pairs)
+
+
+# 환승 확률의 근거: 짝지은 두 차량의 상대 오차 표본(기존) / 단일 차량 오차 표본의 결합.
+PAIRED_ECDF = "paired_ecdf"
+MARGINAL_ECDF = "marginal_ecdf"
+# 단일 차량 오차 표본을 쌓는 예측 생성 방식. 앞차 ETA 기반 근사·배차간격 예상·관측 구간시간 예측은 사후 도착과 이은 표본이
+# 없으므로 기본으로는 결합하지 않는다. 설정(MarginalProbabilityPolicy.approximate_sources)으로 고른 방식만 같은 잔여시간
+# 구간의 이 방식 표본을 빌려 근사하고, 그때는 사유 코드 MARGINAL_ERROR_SOURCE_APPROXIMATED를 함께 남긴다.
+MARGINAL_ERROR_SOURCES = frozenset({"provider"})
+TRANSFER_PROBABILITY_BY_MARGINAL_ERRORS = "transfer_probability_by_marginal_errors"
+MARGINAL_ERROR_SAMPLES_INSUFFICIENT = "marginal_error_samples_insufficient"
+MARGINAL_ERROR_SOURCE_UNSUPPORTED = "marginal_error_source_unsupported"
+MARGINAL_ERROR_SOURCE_APPROXIMATED = "marginal_error_source_approximated"
+
+
+def select_marginal_errors(
+    samples: Iterable[EtaErrorSample],
+    *,
+    eta: VehicleEta,
+    horizon_edges_seconds: Sequence[float],
+    borrow_from: Collection[str] = (),
+) -> tuple[tuple[float, float], ...]:
+    """현재 예측과 같은 조건의 단일 차량 오차 (하한, 상한) 목록. 결과(오차 크기)는 선정 기준에 쓰지 않는다.
+
+    생성 방식·모델 버전·기준 시각 출처·잔여시간 구간이 모두 같은 표본만 고르고, 같은 운행은 하나만 센다.
+    borrow_from을 주면(표본을 쌓지 않는 생성 방식의 근사) 그 생성 방식들의 표본 가운데 잔여시간 구간이 같은 것을 고른다.
+    이때 모델 버전·기준 시각 출처는 보지 않는다.
+    """
+    bucket = horizon_bucket(eta.horizon_seconds, horizon_edges_seconds)
+    wanted = (eta.eta_source, eta.model_version, eta.basis_source, bucket)
+    selected: dict[str, tuple[str, tuple[float, float]]] = {}
+    for sample in samples:
+        if borrow_from:
+            if sample.eta_source not in borrow_from or sample.horizon_bucket != bucket:
+                continue
+        elif (sample.eta_source, sample.model_version, sample.basis_source, sample.horizon_bucket) != wanted:
+            continue
+        current = selected.get(sample.run_group_key)
+        if current is None or sample.sample_id < current[0]:
+            selected[sample.run_group_key] = (sample.sample_id, (sample.error_lower_seconds,
+                                                                 sample.error_upper_seconds))
+    return tuple(selected[key][1] for key in sorted(selected))
+
+
+def marginal_transfer_probability_bounds(
+    slack_seconds: float,
+    front_errors: Sequence[tuple[float, float]],
+    next_errors: Sequence[tuple[float, float]],
+) -> tuple[float, float] | None:
+    """앞 차량 오차 i와 다음 차량 오차 j의 모든 조합에서 '앞 오차 − 다음 오차 ≤ 여유 m'인 비율의 (하한, 상한).
+
+    오차는 (하한, 상한) 범위다. 하한은 범위 안 어떤 값이어도 연결되는 조합(앞 오차 상한_i − 다음 오차 하한_j ≤ m)의 비율,
+    상한은 범위 안 어떤 값에서는 연결되는 조합(앞 오차 하한_i − 다음 오차 상한_j ≤ m)의 비율이다. 범위를 대표값으로 바꾸지
+    않으며, 점 시각 표본만 있으면 하한과 상한이 같다. 두 차량의 오차가 서로 독립이라는 가정 아래의 값이다.
+    한쪽을 정렬해 이분 탐색으로 센다. 어느 쪽이든 표본이 없으면 None이다.
+    """
+    if not front_errors or not next_errors:
+        return None
+    total = len(front_errors) * len(next_errors)
+    front_uppers = sorted(upper for _, upper in front_errors)
+    front_lowers = sorted(lower for lower, _ in front_errors)
+    certain = sum(bisect_right(front_uppers, slack_seconds + lower) for lower, _ in next_errors)
+    possible = sum(bisect_right(front_lowers, slack_seconds + upper) for _, upper in next_errors)
+    return certain / total, possible / total
 
 
 def select_error_pairs(

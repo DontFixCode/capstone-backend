@@ -34,12 +34,31 @@ ConnectionStatus = Literal["feasible", "negative_slack", "time_unknown", "confir
 WalkStatus = Literal["available", "no_route", "lookup_failed"]
 EventType = Literal["arrival", "departure", "passage", "unknown"]
 MatchStatus = Literal["matched", "uncertain", "unmatched"]
+# 환승 확률의 근거: 짝지은 두 차량의 상대 오차 표본 / 단일 차량 오차 표본의 결합(app.modules.evaluation.probability).
+ProbabilitySource = Literal["paired_ecdf", "marginal_ecdf"]
 Version = Annotated[str, Field(min_length=1)]
 Probability = Annotated[float, Field(ge=0, le=1)]
 
 
+class MarginalProbabilityPolicy(FrozenSchema):
+    """환승 확률의 두 번째 단계(단일 차량 오차 결합) 설정. 근거 있는 공통 수치가 없어 모두 설정에서 받는다."""
+
+    # 앞 차량·다음 차량 각각에 필요한 최소 표본 수(독립 운행 기준).
+    min_samples: PositiveInt
+    # 이 일수 안에 도착한 표본만 쓴다(호출자가 표본을 읽을 때 적용).
+    window_days: PositiveFloat
+    # 잔여시간 구간 경계(초). 표본을 만들 때와 같은 값이어야 같은 구간의 표본이 선정된다.
+    horizon_edges_seconds: tuple[PositiveFloat, ...]
+    # 오차 표본을 쌓지 않는 생성 방식 가운데, 같은 잔여시간 구간의 제공처 예측 오차 분포를 빌려 확률을 낼 방식(근사).
+    # 비어 있으면 그 방식이 낀 환승은 확률을 내지 않는다.
+    approximate_sources: tuple[EtaSource, ...] = ()
+
+
 class EvaluationPolicy(SearchPolicy):
-    """평가 설정. 자료에 근거한 값이 정해지지 않았으므로 기본값을 두지 않으며 누락은 검증 오류다."""
+    """평가 설정. 자료에 근거한 값이 정해지지 않았으므로 기본값을 두지 않으며 누락은 검증 오류다.
+
+    끝의 선택 기능 설정만 None(끔)을 기본으로 둔다. 켰을 때 쓰는 수치는 모두 설정에서 받는다.
+    """
 
     search_horizon_seconds: PositiveFloat
     evaluation_budget_ms: PositiveInt
@@ -60,6 +79,10 @@ class EvaluationPolicy(SearchPolicy):
     sample_policy_version: Version
     recovery_policy_version: Version
     segment_model_version: Version
+    # 환승 여유시간 등급의 경계(하한, 상한 초). None이면 등급을 만들지 않는다(app.modules.evaluation.transfer.slack_grade).
+    slack_grade_thresholds_seconds: tuple[PositiveFloat, PositiveFloat] | None = None
+    # 짝 표본이 부족한 환승에 단일 차량 오차 결합을 시도할지. None이면 시도하지 않는다(기존과 같은 결과).
+    marginal_probability: MarginalProbabilityPolicy | None = None
 
 
 class WalkResult(FrozenSchema):
@@ -188,6 +211,28 @@ class TransferErrorSample(FrozenSchema):
     next: PredictionOutcome
 
 
+class EtaErrorSample(FrozenSchema):
+    """차량 한 대의 ETA 오차 표본(실제 도착 − 예측 도착, 초). 도착을 범위로만 알면 하한과 상한이 다르다.
+
+    같은 운행은 생성 방식·모델 버전·잔여시간 구간마다 표본 하나다(app.modules.evaluation.eta_errors).
+    """
+
+    sample_id: str
+    run_group_key: str
+    eta_source: EtaSource
+    model_version: str | None
+    basis_source: str | None
+    horizon_bucket: str
+    error_lower_seconds: float
+    error_upper_seconds: float
+
+    @model_validator(mode="after")
+    def bounds_are_ordered(self) -> EtaErrorSample:
+        if self.error_lower_seconds > self.error_upper_seconds:
+            raise ValueError("오차 하한이 상한보다 클 수 없습니다.")
+        return self
+
+
 class SceneRide(FrozenSchema):
     """과거 관측 묶음의 탑승 구간 하나. vehicle_rank는 그 시점 해당 구간의 도착 예정 순서(0이 가장 빠름)다."""
 
@@ -246,6 +291,8 @@ class EvaluationInputs(FrozenSchema):
     queried_stop_ids: frozenset[str] = frozenset()
     segment_observations: tuple[SegmentObservation, ...] = ()
     transfer_error_samples: tuple[TransferErrorSample, ...] = ()
+    # 단일 차량 ETA 오차 표본. 짝 표본이 부족한 환승의 확률을 두 분포의 결합으로 낼 때만 쓴다(정책이 켜져 있을 때).
+    eta_error_samples: tuple[EtaErrorSample, ...] = ()
     joint_scenes: tuple[JointScene, ...] = ()
     # 앞차 ETA 기반 승하차 ETA 근사의 차량 조합. 비면 이 근사를 쓰지 않는다.
     gap_anchors: tuple[GapAnchor, ...] = ()
@@ -254,6 +301,9 @@ class EvaluationInputs(FrozenSchema):
     # (pattern_id, vehicle_id): 노선 위치상 뒤에 운행 중인 차량이 없는 맨 뒤 차량. 기점 정류소의 '다음 차량 출발 전' 응답은
     # 직전 차량번호를 주지 않으므로, 이 확인이 있을 때만 그 응답을 맨 뒤 차량 뒤가 출발 전이라는 근거로 쓴다.
     rear_vehicles: frozenset[tuple[str, str]] = frozenset()
+    # 호출자가 준비한 추가 차량 옵션. 같은 (패턴, 승차 위치, 하차 위치)의 탑승 구간 옵션 뒤에 붙인다. 이동 안내가 실시간
+    # 응답으로 탈 수 있는 차량을 찾지 못했을 때 선택 당시 계획 차량·배차간격 예상을 넣는 데만 쓴다(workflows.guidance).
+    extra_legs: tuple[TimedLeg, ...] = ()
 
 
 class TimedLeg(FrozenSchema):
@@ -346,6 +396,20 @@ class CandidateProvenance(FrozenSchema):
     expected_scenario_count: int | None
 
 
+class TransferProbability(FrozenSchema):
+    """환승 하나의 확률과 근거. 단계 순서는 짝 표본(paired_ecdf) → 단일 차량 오차 결합(marginal_ecdf) → 없음(None)이다.
+
+    probability는 marginal_ecdf일 때 범위의 하한이다. probability_range는 (하한, 상한)이며 paired_ecdf는 두 값이 같다.
+    sample_counts는 선정한 표본 수다(paired: 짝 표본, front·next: 앞 차량·다음 차량의 단일 차량 표본).
+    """
+
+    probability: Probability | None = None
+    source: ProbabilitySource | None = None
+    probability_range: tuple[Probability, Probability] | None = None
+    sample_counts: dict[str, int] = Field(default_factory=dict)
+    reason_codes: tuple[str, ...] = ()
+
+
 class EvaluatedCandidate(FrozenSchema):
     """차량·시각 조합별 평가 결과. 필드 의미는 Phase 3 Algorithms의 출력 계약을 따른다."""
 
@@ -373,6 +437,8 @@ class EvaluatedCandidate(FrozenSchema):
     expected_comparison_key: str | None
     reason_codes: tuple[str, ...]
     provenance: CandidateProvenance
+    # 환승별 확률의 근거(transfer_probabilities와 같은 순서). 확률 값의 뜻은 바꾸지 않고 출처·범위·표본 수를 더한다.
+    transfer_probability_details: tuple[TransferProbability, ...] = ()
 
 
 class EvaluationCoverage(FrozenSchema):
@@ -405,3 +471,7 @@ class EvaluationResult(FrozenSchema):
     limited: tuple[EvaluatedCandidate, ...]
     search_coverage: SearchCoverage
     coverage: EvaluationCoverage
+
+
+# EvaluationInputs.extra_legs가 뒤에 정의된 TimedLeg를 참조하므로 모든 형식이 정의된 뒤에 확정한다.
+EvaluationInputs.model_rebuild()

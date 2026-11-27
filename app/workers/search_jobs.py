@@ -18,6 +18,7 @@ from app.db.session import Database
 from app.integrations.bus_api import TagoClient, TagoConfigError
 from app.integrations.daejeon_bus_api import DaejeonBusClient, DaejeonBusConfigError
 from app.integrations.walking_api import TmapConfigError, TmapWalkingClient
+from app.modules.journeys import repository as journey_repository
 from app.modules.routing import repository as search_repository
 from app.workflows import search as search_flow
 
@@ -73,6 +74,12 @@ def process_search_jobs(
             for client in (tago, daejeon, walking):
                 if client is not None:
                     client.close()
+        # 이동 중 재탐색(버스 놓침·목적지 변경)으로 접수된 검색이면 결과(실패 포함)를 기다리던 이동의 안내를 바로 다시 계산한다.
+        try:
+            with db.transaction() as conn:
+                journey_repository.schedule_recalc_for_reroute(conn, search_id, clock())
+        except Exception:  # 예약 실패는 다음 주기 재계산(기본 1분)으로 늦어질 뿐이라 검색 결과에 영향을 주지 않는다.
+            logger.exception("검색 %s 재탐색 대기 이동의 재계산 예약 실패", search_id)
     return results
 
 

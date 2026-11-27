@@ -19,6 +19,8 @@ import phase3_world as w  # noqa: E402
 
 from app.core.config import Settings  # noqa: E402
 from app.integrations.walking_api import TmapWalkingClient, WalkQuery, parse_pedestrian_response  # noqa: E402
+from app.modules.congestion import levels as congestion_levels  # noqa: E402
+from app.modules.congestion.service import Lookup  # noqa: E402
 from app.modules.evaluation import samples as sample_rules  # noqa: E402
 from app.modules.evaluation.schemas import EtaReport, EvaluationInputs, WalkResult  # noqa: E402
 from app.modules.evaluation.service import evaluate_candidates  # noqa: E402
@@ -404,6 +406,90 @@ class LegsTest(unittest.TestCase):
                 self.assertIn("same_stop", [leg.get("status") for leg in row["legs"]])
                 transfer = row["evaluation"]["transfers"][0]
                 self.assertEqual(row["legs"][transfer["front_leg_index"]]["kind"], "bus")
+
+
+class CongestionBiasTest(unittest.TestCase):
+    """내시균형 bias = Σ 버스 탑승시간 × (혼잡 단계 가중치 − 1). 추천 비용에 더해 순위를 정한다."""
+
+    ROUTE = "TSTR000010"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cfg, cls.net = config(), network()
+        cls.context, _, cls.result = search(cls.cfg, cls.net)
+        cls.evaluation, cls.plain = evaluate(cls.result, cls.context, cls.cfg, etas=provider_etas(cls.net))
+
+    def lookup(self, weights):
+        policy = congestion_levels.LevelPolicy(seats=25, capacity=50, min_sample_days=None, holidays=frozenset(),
+                                               cost_weights=weights)
+        internal = {route.external_id: route.route_id for route in self.net.routes}
+        pattern = next(p for p in self.net.patterns if p.route_external_id == self.ROUTE)
+        # 노선 10의 모든 구간이 시간당 6대에 600명(1대당 100명, 매우 혼잡)이다. 다른 노선은 집계가 없다.
+        row = {"flow_mean": 600.0, "flow_p80": None, "trips_per_hour": 6.0, "trips_source": "timetable",
+               "sample_days": 20, "source_period": "2026-08-01/2026-10-31"}
+        profiles = {(kind, hour, stop.seq): row for kind in ("weekday", "saturday", "holiday")
+                    for hour in range(24) for stop in pattern.stops}
+        return Lookup(policy, {(internal[self.ROUTE], pattern.pattern_key): profiles}), internal
+
+    def test_bias_is_added_to_the_cost_and_changes_the_order(self):
+        ranked = self.plain.ranked
+        self.assertGreater(len(ranked), 1)
+        self.assertEqual({(r.equilibrium_bias_seconds, r.cost_seconds == r.time_seconds) for r in ranked},
+                         {(0.0, True)}, "bias를 주지 않으면 비용은 시간이다")
+        top = ranked[0]
+        later = next(r for r in ranked if r.time_seconds > top.time_seconds)
+        extra = later.time_seconds - top.time_seconds + 1.0
+        biased = recommend_candidates(self.evaluation, {top.timed_candidate_id: extra})
+        self.assertEqual(biased.ranking_mode, self.plain.ranking_mode)
+        self.assertEqual({r.timed_candidate_id for r in biased.ranked}, {r.timed_candidate_id for r in ranked},
+                         "bias는 순서만 바꾸고 후보를 빼지 않는다")
+        moved = next(r for r in biased.ranked if r.timed_candidate_id == top.timed_candidate_id)
+        self.assertEqual((moved.time_seconds, moved.equilibrium_bias_seconds, moved.cost_seconds),
+                         (top.time_seconds, extra, top.time_seconds + extra))
+        self.assertGreater(moved.rank, next(r for r in biased.ranked
+                                            if r.timed_candidate_id == later.timed_candidate_id).rank)
+        self.assertIn("congestion_bias_applied", moved.reason_codes)
+        self.assertNotIn("recommended_lowest_cost", moved.reason_codes)
+        self.assertNotEqual(biased.recommended_timed_candidate_id, top.timed_candidate_id)
+        costs = [r.cost_seconds for r in biased.ranked]
+        self.assertEqual(costs, sorted(costs), "시간이 아니라 비용 순이다")
+        self.assertTrue(all("congestion_bias_applied" not in r.reason_codes
+                            for r in biased.ranked if r.timed_candidate_id != top.timed_candidate_id))
+
+    def test_bias_per_candidate_from_the_crowded_legs(self):
+        lookup, internal = self.lookup((1.0, 1.0, 1.2, 1.5, 2.0))
+        items = [*self.evaluation.candidates, *self.evaluation.limited]
+        biases, unknown = flow.congestion_biases(items, lookup, internal)
+        self.assertEqual(set(biases), {item.timed_candidate_id for item in items})
+        for item in items:
+            crowded = [leg for leg in item.legs if leg.route_id == self.ROUTE and leg.ride_seconds is not None]
+            # 매우 혼잡의 가중치 2.0 → 그 구간의 탑승시간만큼 비용이 더해진다. 집계가 없는 노선의 구간은 0이다.
+            self.assertAlmostEqual(biases[item.timed_candidate_id], sum(leg.ride_seconds for leg in crowded))
+            self.assertEqual(item.timed_candidate_id in unknown, len(crowded) != len(item.legs), item.legs)
+        self.assertTrue(any(value > 0 for value in biases.values()))
+        self.assertTrue(unknown, "집계가 없는 노선을 타는 후보는 반영하지 못한 구간이 있다고 남긴다")
+
+        recommendation = recommend_candidates(self.evaluation, biases)
+        for rank in recommendation.ranked:
+            bias = biases[rank.timed_candidate_id]
+            self.assertEqual((rank.equilibrium_bias_seconds, rank.cost_seconds), (bias, rank.time_seconds + bias))
+            self.assertEqual("congestion_bias_applied" in rank.reason_codes, bias > 0)
+        costs = [r.cost_seconds for r in recommendation.ranked]
+        self.assertEqual(costs, sorted(costs))
+
+        self.assertEqual(flow.congestion_biases(items, self.lookup(())[0], internal), ({}, set()),
+                         "가중치 설정이 없으면 순위에 반영하지 않는다")
+        self.assertEqual(flow.congestion_biases(items, Lookup(None), internal), ({}, set()))
+
+    def test_search_params_record_the_weights(self):
+        self.assertNotIn("congestion", config().params)
+        plain = config(congestion_seats=25, congestion_capacity=50)
+        self.assertEqual((plain.params["congestion"]["cost_weights"], plain.params["bias"]["equilibrium_seconds"]),
+                         ([], 0.0))
+        weighted = config(congestion_seats=25, congestion_capacity=50, congestion_cost_weights="1,1,1.2,1.5,2")
+        self.assertEqual((weighted.params["congestion"]["cost_weights"], weighted.params["bias"]["equilibrium_seconds"]),
+                         ([1.0, 1.0, 1.2, 1.5, 2.0], "congestion_ride_time_weight"))
+        self.assertNotEqual(plain.config_version, weighted.config_version, "가중치가 바뀌면 검색 설정 버전이 바뀐다")
 
 
 if __name__ == "__main__":

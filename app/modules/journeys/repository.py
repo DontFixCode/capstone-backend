@@ -126,9 +126,21 @@ def set_route_selection(conn: psycopg.Connection, journey_id: UUID, *, selected_
                  (selected_candidate_id, Jsonb(selected_snapshot), selection_version, journey_id))
 
 
-def update_destination(conn: psycopg.Connection, journey_id: UUID, snapshot: dict[str, Any]) -> None:
+def replace_selected_snapshot(conn: psycopg.Connection, journey_id: UUID, snapshot: dict[str, Any]) -> None:
+    """선택 스냅샷을 바꾼다(목적지 변경·재탐색 접수). 이전 조건으로 만든 제안은 함께 지운다. 선택 버전은 올리지 않는다."""
     conn.execute("UPDATE app.journeys SET selected_snapshot = %s, proposed_candidate_id = NULL, "
                  "proposed_snapshot = NULL WHERE id = %s", (Jsonb(snapshot), journey_id))
+
+
+def schedule_recalc_for_reroute(conn: psycopg.Connection, search_id: UUID, now: datetime) -> int:
+    """이 검색을 재탐색으로 기다리는 활성 이동의 안내를 바로 다시 계산하도록 예약한다. 반환: 예약한 이동 수.
+
+    계산 중(임대)인 이동도 예약을 앞당긴다. 저장 쪽(save_guidance)이 바뀐 예약을 늦추지 않으므로 다음 확인 때 다시 계산된다.
+    """
+    return conn.execute(
+        "UPDATE app.journeys SET next_recalc_at = LEAST(next_recalc_at, %s) WHERE lifecycle_status = 'active' "
+        "AND next_recalc_at IS NOT NULL AND selected_snapshot->>'reroute_search_id' = %s",
+        (now, str(search_id))).rowcount
 
 
 def update_location(conn: psycopg.Connection, journey_id: UUID, *, lat: float, lon: float, observed_at: datetime,

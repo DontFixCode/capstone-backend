@@ -11,7 +11,9 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-RealtimeKind = Literal["positions", "arrivals"]
+# positions: TAGO 노선 위치, arrivals: 대전시 정류소 도착정보, daejeon_positions: 대전시 노선 위치(정류소 기준, ETA 오차
+# 표본 수집 전용). 호출 기록(api_fetches.api_kind)은 daejeon_positions도 positions로 남기고 제공처로 구분한다.
+RealtimeKind = Literal["positions", "arrivals", "daejeon_positions"]
 # fresh: 마지막 공개 배치가 수집 간격 이내, stale: 공개 배치는 있으나 간격을 넘김, no_data: 공개 배치 없음
 Freshness = Literal["fresh", "stale", "no_data"]
 # items: 항목이 있는 공개 배치, empty: 정상 빈 응답을 공개한 빈 스냅샷

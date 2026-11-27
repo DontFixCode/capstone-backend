@@ -19,6 +19,8 @@ from typing import Any
 import psycopg
 
 from app.integrations import route_shapes_api as route_shapes
+from app.modules.congestion import levels as congestion_levels
+from app.modules.congestion import service as congestion_service
 from app.modules.transit import eta_basis, repository
 from app.modules.transit.schemas import LatestSnapshot, RealtimeTarget
 from app.modules.transit.service import latest_snapshot
@@ -88,10 +90,18 @@ def _route_briefs(conn: psycopg.Connection, external_ids: set[str]) -> dict[str,
 
 
 def stop_arrivals(conn: psycopg.Connection, stop: dict[str, Any], *, interval_seconds: float,
-                  now: datetime, basis_policy: str = eta_basis.UNCONFIRMED) -> dict[str, Any]:
+                  now: datetime, basis_policy: str = eta_basis.UNCONFIRMED,
+                  congestion_policy: congestion_levels.LevelPolicy | None = None) -> dict[str, Any]:
     snap = latest_snapshot(conn, RealtimeTarget("arrivals", stop["external_id"]), interval_seconds=interval_seconds,
                            now=now)
     briefs = _route_briefs(conn, {o["route_external_id"] for o in snap.observations})
+
+    def route_id(obs: dict[str, Any]) -> int | None:
+        brief = briefs.get(obs["route_external_id"])
+        return int(brief["id"]) if brief else None
+
+    congestion = congestion_service.Lookup.load(
+        conn, congestion_policy, {(route_id(o), o["pattern_key"]) for o in snap.observations})
     items = []
     for obs in snap.observations:
         # 대전시 도착정보는 차량번호를 직접 준다(운행 회차 키는 없음). 차량번호가 없으면 차량을 표시하지 않는다.
@@ -111,6 +121,10 @@ def stop_arrivals(conn: psycopg.Connection, stop: dict[str, Any], *, interval_se
             "collectedAt": obs["collected_at"],
             "stopsAway": (obs.get("details") or {}).get("stops_away"),
             "vehicle": {"vehicleNo": obs["vehicle_no"], "runKey": obs["run_key"]} if linked else None,
+            # 이 정류소를 출발한 직후 구간의 평소 이 시간대 예상 혼잡(실시간 아님). 도착 예상 시각이 없으면 지금 시각 기준.
+            "congestion": congestion_levels.view(congestion.describe(
+                route_id(obs), obs["pattern_key"],
+                at=eta_basis.predicted_arrival(obs, basis_at) or now, from_seq=obs["stop_seq"])),
         })
     return {"stopId": sid(stop["id"]), "items": items, "dataStatus": data_status(snap)}
 

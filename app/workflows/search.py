@@ -41,6 +41,9 @@ from app.integrations import route_shapes_api as route_shapes
 from app.integrations.bus_api import TagoClient
 from app.integrations.daejeon_bus_api import DaejeonBusClient
 from app.integrations.walking_api import PROVIDER as WALK_PROVIDER, TmapWalkingClient, WalkQuery, WalkResponse
+from app.modules.congestion import levels as congestion_levels
+from app.modules.congestion import service as congestion_service
+from app.modules.evaluation import eta_errors
 from app.modules.evaluation import repository as evaluation_repository
 from app.modules.evaluation import samples as sample_rules
 from app.modules.evaluation.eta import (
@@ -50,15 +53,18 @@ from app.modules.evaluation.eta import (
     index_etas,
     index_segment_durations,
 )
+from app.modules.evaluation.probability import MARGINAL_ERROR_SOURCES
 from app.modules.evaluation.schemas import (
     DESTINATION_REF,
     ORIGIN_REF,
+    EtaErrorSample,
     EtaReport,
     EvaluatedCandidate,
     EvaluationInputs,
     EvaluationPolicy,
     EvaluationResult,
     GapAnchor,
+    MarginalProbabilityPolicy,
     ObservedEvent,
     RouteHeadway,
     SegmentObservation,
@@ -66,6 +72,7 @@ from app.modules.evaluation.schemas import (
     WalkResult,
 )
 from app.modules.evaluation.service import evaluate_candidates
+from app.modules.evaluation.transfer import slack_estimated, slack_grade
 from app.modules.recommendation.schemas import RecommendationResult
 from app.modules.recommendation.service import recommend_candidates, uses_headway_estimate
 from app.modules.routing import repository as search_repository
@@ -140,6 +147,14 @@ _REQUIRED = {
     "tmap_max_lookups_per_search": "BACKEND_TMAP_MAX_LOOKUPS_PER_SEARCH",
     "sample_label_deadline_seconds": "BACKEND_SAMPLE_LABEL_DEADLINE_SECONDS",
 }
+# 평가 정책의 선택 기능 설정. 켰을 때만 적용 설정(params)에 남겨, 꺼져 있으면 기존 설정 버전이 그대로다.
+_OPTIONAL_EVALUATION_SETTINGS = ("slack_grade_thresholds_seconds", "marginal_probability")
+# 단일 차량 오차 결합(BACKEND_EVAL_MARGINAL_PROBABILITY_ENABLED)을 켰을 때 필요한 설정.
+_MARGINAL_REQUIRED = {
+    "eval_marginal_window_days": "BACKEND_EVAL_MARGINAL_WINDOW_DAYS",
+    "eval_min_marginal_samples": "BACKEND_EVAL_MIN_MARGINAL_SAMPLES",
+    "eta_error_horizon_edges_seconds": "BACKEND_ETA_ERROR_HORIZON_EDGES_SECONDS",
+}
 
 
 @dataclass(frozen=True)
@@ -157,6 +172,8 @@ class SearchConfig:
     service_area_path: str | None = None
     # TAGO 도착정보 ETA 기준 시각 정책(app.modules.transit.eta_basis). 기본은 기준 미확인(절대 ETA 미산출).
     eta_basis_policy: str = eta_basis.UNCONFIRMED
+    # 예상 혼잡 단계 정책(좌석 수·정원 설정). None이면 후보 구간의 혼잡 정보를 미확인(congestion_not_configured)으로 둔다.
+    congestion_policy: congestion_levels.LevelPolicy | None = None
 
     @property
     def eta_basis_policy_version(self) -> str:
@@ -166,6 +183,9 @@ class SearchConfig:
 def load_search_config(settings: Settings) -> SearchConfig:
     """검색 설정을 읽는다. 하나라도 비어 있으면 누락된 키 이름을 모두 알려준다(근거 없는 기본값을 쓰지 않는다)."""
     missing = [env for name, env in _REQUIRED.items() if getattr(settings, name) is None]
+    if settings.eval_marginal_probability_enabled:
+        # 켰는데 필수 값이 빠지면 조용히 끄지 않고 설정 오류로 알린다.
+        missing += [env for name, env in _MARGINAL_REQUIRED.items() if getattr(settings, name) in (None, ())]
     if missing:
         raise SearchConfigError("검색 설정이 없습니다(.env.api): " + ", ".join(missing))
     s = settings
@@ -190,6 +210,12 @@ def load_search_config(settings: Settings) -> SearchConfig:
             timing_policy_version=s.eval_timing_policy_version, sample_policy_version=s.eval_sample_policy_version,
             recovery_policy_version=s.eval_recovery_policy_version,
             segment_model_version=s.eval_segment_model_version,
+            slack_grade_thresholds_seconds=s.eval_slack_grade_thresholds_seconds or None,
+            marginal_probability=MarginalProbabilityPolicy(
+                min_samples=s.eval_min_marginal_samples, window_days=s.eval_marginal_window_days,
+                horizon_edges_seconds=s.eta_error_horizon_edges_seconds,
+                approximate_sources=s.eval_marginal_approximate_sources,
+            ) if s.eval_marginal_probability_enabled else None,
         )
     except ValidationError as exc:
         fields = sorted({".".join(str(p) for p in error["loc"]) for error in exc.errors()})
@@ -197,9 +223,13 @@ def load_search_config(settings: Settings) -> SearchConfig:
     for name in ("search_expires_seconds", "sample_label_deadline_seconds", "tmap_max_lookups_per_search"):
         if getattr(s, name) <= 0:
             raise SearchConfigError(f"{_REQUIRED[name]}은 0보다 커야 합니다.")
+    evaluation_params = policy.model_dump()
+    for name in _OPTIONAL_EVALUATION_SETTINGS:
+        if evaluation_params[name] is None:
+            del evaluation_params[name]
     params = {
         "search_policy": search_policy.model_dump(),
-        "evaluation_policy": policy.model_dump(),
+        "evaluation_policy": evaluation_params,
         "search_expires_seconds": s.search_expires_seconds,
         "tmap": {"provider": WALK_PROVIDER, "searchOption": s.tmap_search_option,
                  "max_lookups_per_search": s.tmap_max_lookups_per_search},
@@ -208,11 +238,20 @@ def load_search_config(settings: Settings) -> SearchConfig:
         "sample_label_deadline_seconds": s.sample_label_deadline_seconds,
         "bias": {"user_seconds": 0.0, "equilibrium_seconds": 0.0},
     }
+    congestion_policy = congestion_levels.policy_from_settings(s)
+    if congestion_policy is not None:
+        # 혼잡 단계 설정이 있을 때만 적용 설정에 남긴다(없으면 기존 설정 버전이 그대로다).
+        params["congestion"] = {"policy_version": congestion_policy.version, "seats": congestion_policy.seats,
+                                "capacity": congestion_policy.capacity,
+                                "min_sample_days": congestion_policy.min_sample_days,
+                                "cost_weights": list(congestion_policy.cost_weights)}
+        if congestion_policy.cost_weights:
+            params["bias"]["equilibrium_seconds"] = "congestion_ride_time_weight"
     version = "cfg-" + hashlib.sha256(json.dumps(params, sort_keys=True, default=str).encode()).hexdigest()[:16]
     return SearchConfig(search_policy, policy, s.search_expires_seconds, s.tmap_search_option,
                         s.tmap_max_lookups_per_search, s.sample_label_deadline_seconds,
                         s.realtime_interval_seconds, params, version, s.service_area_geojson,
-                        s.tago_eta_basis_policy)
+                        s.tago_eta_basis_policy, congestion_policy)
 
 
 # ---------------------------------------------------------------- 입력·결과 형식
@@ -359,6 +398,13 @@ def lookup_walks(
         lookup.query_options = query.options()
         coord_key = (round(query.from_lat, 7), round(query.from_lon, 7), round(query.to_lat, 7),
                      round(query.to_lon, 7), search_option)
+        if coord_key[:2] == coord_key[2:4]:
+            # 출발 좌표와 도착 좌표가 같다(정류소를 출발점으로 한 이동 중 재탐색 등). 걸을 거리가 없으므로 조회하지 않는다.
+            lookup.status, lookup.distance_m, lookup.duration_seconds = "available", 0.0, 0.0
+            lookup.provider, lookup.reason = None, "same_coordinates_no_lookup"
+            results[(from_ref, to_ref)] = lookup
+            stats["same_coordinates"] += 1
+            continue
         response = by_coords.get(coord_key)
         if response is None:
             if client is None or len(by_coords) >= max_lookups:
@@ -948,6 +994,13 @@ def build_legs(candidate: StaticCandidate, evaluated: EvaluatedCandidate, walks:
             "alight_eta": _jsonable(timed.alight_eta) if timed and timed.alight_eta else None,
             "ride_seconds": timed.ride_seconds if timed else None,
             "reason_codes": list(timed.reason_codes) if timed else ["ride_not_reached_or_no_vehicle_option"],
+            # 평소 이 시간대의 예상 혼잡(과거 승하차 집계, 실시간 아님). 타는 구간 중 가장 붐비는 구간의 값이며,
+            # 사용자에게 보여준 값과 설정 버전을 후보에 복사해 둔다(집계 행은 재집계로 교체된다).
+            "congestion": None if network_info.get("congestion") is None else network_info["congestion"].describe(
+                route.route_id if route else None, ride.pattern_id,
+                at=timed.board_eta.predicted_arrival_at if timed else network_info.get("start_at"),
+                from_seq=ride.board_position, to_seq=ride.alight_position,
+                vehicle_id=timed.vehicle_id if timed else None),
             # 승하차 구간 형상: 검증된 제공처의 패턴 형상(routes.shape_info)이 있을 때만 잘라 붙이고, 없으면 미확보와 사유.
             **route_shapes.segment_geometry(
                 route_shapes.pattern_entry(network_info.get("shapes", {}).get(ride.route_id), ride.pattern_id),
@@ -959,9 +1012,60 @@ def build_legs(candidate: StaticCandidate, evaluated: EvaluatedCandidate, walks:
     return legs, bus_indices
 
 
+def transfer_summary(evaluated: EvaluatedCandidate, transfer_index: int,
+                     policy: EvaluationPolicy | None) -> dict[str, Any]:
+    """환승 순번(1부터) 하나의 여유·판정·확률 저장 값. 최초 검색 후보와 이동 중 재평가 제안이 같은 값을 쓴다.
+
+    여유시간 등급은 확률이 없어도 시간이 계산된 환승마다 준다(경계 설정이 없으면 None). slack_estimated는 앞 차량 하차
+    ETA·다음 차량 승차 ETA 중 하나라도 제공처 예측이 아니면 True다.
+    """
+    t = transfer_index
+    connection = evaluated.connections[t] if t < len(evaluated.connections) else None
+    front_eta = evaluated.legs[t - 1].alight_eta if t - 1 < len(evaluated.legs) else None
+    next_eta = evaluated.legs[t].board_eta if t < len(evaluated.legs) else None
+    slack = connection.slack_seconds if connection else None
+    detail = (evaluated.transfer_probability_details[t - 1]
+              if t - 1 < len(evaluated.transfer_probability_details) else None)
+    return {
+        "slack_seconds": slack,
+        "slack_grade": slack_grade(slack, policy.slack_grade_thresholds_seconds if policy else None),
+        "slack_estimated": slack_estimated(slack, front_eta, next_eta),
+        "status": connection.status if connection else None,
+        "probability": evaluated.transfer_probabilities[t - 1] if t - 1 < len(evaluated.transfer_probabilities)
+        else None,
+        # 확률의 근거(paired_ecdf / marginal_ecdf / None), 범위 [하한, 상한], 선정한 표본 수. marginal_ecdf면 probability는 하한이다.
+        "probability_source": detail.source if detail else None,
+        "probability_range": list(detail.probability_range) if detail and detail.probability_range else None,
+        "probability_sample_counts": dict(detail.sample_counts) if detail else {},
+    }
+
+
+def transfer_reason_codes(evaluated: EvaluatedCandidate, transfer_index: int) -> list[str]:
+    """환승 순번 하나의 사유: 연결 판정 사유에 확률 단계의 사유(단일 차량 오차 결합 사용·표본 부족·방식 미지원)를 더한다."""
+    t = transfer_index
+    connection = evaluated.connections[t] if t < len(evaluated.connections) else None
+    detail = (evaluated.transfer_probability_details[t - 1]
+              if t - 1 < len(evaluated.transfer_probability_details) else None)
+    return [*(connection.reason_codes if connection else ()), *(detail.reason_codes if detail else ())]
+
+
+def marginal_error_samples(conn, policy: EvaluationPolicy, before: datetime) -> list[EtaErrorSample]:
+    """단일 차량 오차 결합에 쓸 표본. 정책이 꺼져 있거나 테이블이 아직 없으면 읽지 않는다(그 단계는 표본 부족이 된다).
+
+    최근 window_days일 안에 도착했고 평가 기준시각 이전에 만들어진 표본만 읽는다.
+    """
+    marginal = policy.marginal_probability
+    if marginal is None or not evaluation_repository.eta_error_samples_ready(conn):
+        return []
+    return eta_errors.error_samples(evaluation_repository.eta_error_samples(
+        conn, eta_sources=sorted(MARGINAL_ERROR_SOURCES), since=before - timedelta(days=marginal.window_days),
+        before=before))
+
+
 def candidate_row(candidate: StaticCandidate, evaluated: EvaluatedCandidate, recommendation: RecommendationResult,
                   walks, points, network_info, sample_ids: dict[tuple[str, int], str],
-                  sample_skips: dict[tuple[str, int], str], scene_id: str | None) -> dict[str, Any]:
+                  sample_skips: dict[tuple[str, int], str], scene_id: str | None,
+                  policy: EvaluationPolicy | None = None) -> dict[str, Any]:
     legs, bus_indices = build_legs(candidate, evaluated, walks, points, network_info)
     ranked = {item.timed_candidate_id: item for item in recommendation.ranked}
     excluded = {item.timed_candidate_id: item for item in recommendation.excluded}
@@ -971,13 +1075,10 @@ def candidate_row(candidate: StaticCandidate, evaluated: EvaluatedCandidate, rec
         connection = evaluated.connections[t] if t < len(evaluated.connections) else None
         transfers.append({
             "transfer_index": t, "front_leg_index": bus_indices[t - 1], "next_leg_index": bus_indices[t],
-            "slack_seconds": connection.slack_seconds if connection else None,
-            "status": connection.status if connection else None,
-            "probability": evaluated.transfer_probabilities[t - 1] if t - 1 < len(evaluated.transfer_probabilities)
-            else None,
+            **transfer_summary(evaluated, t, policy),
             "sample_id": sample_ids.get((evaluated.timed_candidate_id, t)),
             "sample_reason": sample_skips.get((evaluated.timed_candidate_id, t)),
-            "reason": None if connection is None else (list(connection.reason_codes) or None),
+            "reason": None if connection is None else (transfer_reason_codes(evaluated, t) or None),
         })
     evaluation = {
         "timed_candidate_id": evaluated.timed_candidate_id,
@@ -1019,6 +1120,33 @@ def candidate_row(candidate: StaticCandidate, evaluated: EvaluatedCandidate, rec
         "rank_no": rank.rank if rank else None,
         "evaluated_at": evaluated.provenance.evaluated_at,
     }
+
+
+def congestion_biases(items: Iterable[EvaluatedCandidate], lookup: congestion_service.Lookup,
+                      internal_ids: Mapping[str, int]) -> tuple[dict[str, float], set[str]]:
+    """후보(timed_candidate_id)별 혼잡 비용(초)과, 혼잡 정보를 몰라 일부 버스 구간을 반영하지 못한 후보의 ID.
+
+    버스 구간마다 승차 예상 시각의 예상 혼잡 단계(타는 구간 중 가장 붐비는 구간)를 구해 탑승시간 × (가중치 − 1)을 더한다.
+    혼잡 정보가 없는 구간은 더하지 않는다.
+    """
+    biases: dict[str, float] = {}
+    unknown: set[str] = set()
+    policy = lookup.policy
+    if policy is None or not policy.cost_weights:
+        return biases, unknown
+    for item in items:
+        total = 0.0
+        for leg in item.legs:
+            described = lookup.describe(internal_ids.get(leg.route_id), leg.pattern_id,
+                                        at=leg.board_eta.predicted_arrival_at, from_seq=leg.board_position,
+                                        to_seq=leg.alight_position, vehicle_id=leg.vehicle_id)
+            value = congestion_levels.ride_bias_seconds(described, leg.ride_seconds, policy)
+            if value is None:
+                unknown.add(item.timed_candidate_id)
+            else:
+                total += value
+        biases[item.timed_candidate_id] = total
+    return biases, unknown
 
 
 def search_status(candidates: CandidateSearchResult, recommendation: RecommendationResult | None) -> tuple[str, str]:
@@ -1316,8 +1444,15 @@ class SearchWorkflow:
                                             cohort, until=context.evaluated_at)
             shapes = transit_repository.route_shape_infos(
                 conn, {r.route_id for c in result.candidates for r in c.rides})
+            internal_ids = {r.external_id: r.route_id for r in network.routes}
+            # 앱이 지금 안내 중인 다른 사용자의 탑승을 예상 재차에 더한다(이 검색을 요청한 사용자의 이동은 뺀다).
+            congestion = congestion_service.Lookup.load(
+                conn, config.congestion_policy,
+                {(internal_ids.get(r.route_id), r.pattern_id) for c in result.candidates for r in c.rides},
+                guided_at=now, exclude_search_id=search_id)
             error_samples = sample_rules.transfer_error_samples(
                 evaluation_repository.labeled_samples(conn, cohort, before=context.evaluated_at))
+            marginal_samples = marginal_error_samples(conn, policy, context.evaluated_at)
             scenes = sample_rules.joint_scenes(
                 evaluation_repository.complete_scenes(conn, cohort, before=context.evaluated_at))
         rear_vehicles: set[tuple[str, str]] = set()
@@ -1331,6 +1466,8 @@ class SearchWorkflow:
                                           "anchor_stops": sorted({a.anchor_stop_id for a in anchors})}
         summary["history_inputs"] = {"segment_observations": len(segments), "transfer_error_samples":
                                      len(error_samples), "joint_scenes": len(scenes), "cohort_key": cohort}
+        if policy.marginal_probability is not None:
+            summary["history_inputs"]["eta_error_samples"] = len(marginal_samples)
         data_snapshot_id = hashlib.sha256(json.dumps([str(network.data_version), sorted(realtime.batch_refs, key=str)],
                                                      default=str).encode()).hexdigest()[:32]
         summary["data_snapshot_id"] = data_snapshot_id
@@ -1340,12 +1477,21 @@ class SearchWorkflow:
             walks=tuple(w for w in (lookup.as_walk_result() for lookup in walks.values()) if w is not None),
             eta_reports=tuple(realtime.eta_reports), queried_stop_ids=realtime.queried_stop_ids,
             segment_observations=tuple(segments), transfer_error_samples=tuple(error_samples),
+            eta_error_samples=tuple(marginal_samples),
             joint_scenes=tuple(scenes), gap_anchors=tuple(anchors), route_headways=headways,
             rear_vehicles=frozenset(rear_vehicles),
         )
         evaluation = evaluate_candidates(result, context, inputs, policy,
                                          search_index=index if policy.recovery_search else None)
-        recommendation = recommend_candidates(evaluation)
+        # 내시균형 bias: 후보의 버스 구간마다 탑승시간 × (혼잡 단계 가중치 − 1). 가중치 설정이 없으면 반영하지 않는다.
+        congestion_bias, bias_unknown = congestion_biases(
+            [*evaluation.candidates, *evaluation.limited], congestion, internal_ids)
+        recommendation = recommend_candidates(evaluation, congestion_bias)
+        summary["congestion_bias"] = {
+            "applied": bool(config.congestion_policy and config.congestion_policy.cost_weights),
+            "candidates_with_bias": sum(1 for value in congestion_bias.values() if value > 0),
+            "candidates_with_unknown_leg": len(bias_unknown),
+            "guided_rides": sum(len(rides) for rides in congestion.guided.values())}
         status, status_reason = search_status(result, recommendation)
         timed = [*evaluation.candidates, *evaluation.limited]
         statics = {c.static_candidate_id: c for c in result.candidates}
@@ -1371,7 +1517,7 @@ class SearchWorkflow:
         network_info = {"routes": {r.external_id: r for r in network.routes},
                         "directions": {(p.pattern_key, s.seq): s.direction_code
                                        for p in network.patterns for s in p.stops},
-                        "shapes": shapes}
+                        "shapes": shapes, "congestion": congestion, "start_at": context.start_at}
         with self.db.transaction() as conn:
             if not search_repository.lock_processing_search(conn, search_id):
                 raise SearchError("검색이 이미 확정됐거나 실패 처리되어 다시 저장하지 않습니다.")
@@ -1383,7 +1529,7 @@ class SearchWorkflow:
                 candidate_row(statics[item.static_candidate_id], item, recommendation, walks, points, network_info,
                               sample_ids, sample_skips,
                               str(scene_ids[scene_records[item.static_candidate_id].scene_key])
-                              if item.static_candidate_id in scene_records else None)
+                              if item.static_candidate_id in scene_records else None, policy=policy)
                 for item in timed
             ]
             summary.update({

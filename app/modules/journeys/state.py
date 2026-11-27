@@ -26,6 +26,22 @@ STATE_EVENTS = ("board", "alight", "completed", "cancelled", "missed_bus", "dest
 SUPPORTED_EVENTS = (*STATE_EVENTS, "correction", "transfer_result")
 DEFERRED_EVENTS = {
 }
+# 이동 중 재탐색(선택 스냅샷의 reroute_* 값). 목적지 변경은 새 목적지로, 버스 놓침은 같은 목적지로 현재 위치에서 다시 검색한다.
+REROUTE_DESTINATION, REROUTE_MISSED_BUS = "destination", "missed_bus"
+REROUTE_KEYS = ("reroute_kind", "reroute_search_id", "reroute_status", "reroute_reason", "reroute_requested_at",
+                "reroute_origin")
+
+
+def reroute_kind(snapshot: dict[str, Any]) -> str | None:
+    """선택 스냅샷에 걸려 있는 재탐색의 종류. 목적지가 바뀐 채 새 경로를 아직 수락하지 않았으면 항상 destination이다."""
+    if snapshot.get("destination_changed_at"):
+        return REROUTE_DESTINATION
+    return REROUTE_MISSED_BUS if snapshot.get("reroute_kind") == REROUTE_MISSED_BUS else None
+
+
+def clear_reroute(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """재탐색 값을 뺀 선택 스냅샷(목적지 변경 표시 destination_changed_at은 건드리지 않는다)."""
+    return {key: value for key, value in snapshot.items() if key not in REROUTE_KEYS}
 
 
 class TransitionError(Exception):
@@ -100,8 +116,18 @@ def apply(
         leg = _leg(legs, payload.get("legIndex"))
         if leg.get("kind") != "bus" or leg["leg_index"] != progress.get("next_bus_leg_index"):
             raise TransitionError(409, "LEG_NOT_NEXT", "놓친 버스는 다음 버스 구간이어야 합니다.")
+        # 앱이 차량을 알려주지 않으면 그 시점에 안내하던 차량(guided)을, 안내가 없었으면 선택 경로의 계획 차량을 놓친 것으로 본다.
+        # 그 차량의 승차 예상 시각(board_eta_at)도 함께 남겨, 차량번호가 없는 예상 차량도 다음 안내에서 뺄 수 있게 한다.
+        guided = resolved.get("guided")
+        planned = {**(leg.get("vehicle") or {}),
+                   "predicted_arrival_at": (leg.get("board_eta") or {}).get("predicted_arrival_at")}
+        source = guided if guided is not None else planned
+        vehicle_id = payload.get("vehicleId") or source.get("vehicle_id")
         missed = [*progress.get("missed_vehicles", []), {"leg_index": leg["leg_index"],
-                  "vehicle_id": payload.get("vehicleId"),
+                  "vehicle_id": vehicle_id,
+                  "vehicle_basis": ("user" if payload.get("vehicleId") else None if vehicle_id is None
+                                    else "guidance" if guided is not None else "selection"),
+                  "board_eta_at": source.get("predicted_arrival_at"),
                   "run_key": (leg.get("vehicle") or {}).get("run_key"),
                   "pattern_key": leg.get("pattern_key"), **when}]
         progress["missed_vehicles"] = missed

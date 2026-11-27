@@ -349,6 +349,68 @@ class CollectorTest(unittest.TestCase):
                                          ("loadLane", "31198")])
 
 
+class RemapTest(unittest.TestCase):
+    """정류소 순서가 바뀌어 패턴 키가 달라진 노선: 저장해 둔 선에 현재 정류소를 다시 대응시킨다."""
+
+    def stored(self):
+        return {"old": shapes.build_pattern_shape(LINE_A, points(stops_a()), source="odsay", source_route_id="31014",
+                                                  fetched_at=NOW.isoformat())}
+
+    def test_added_stop_is_remapped_onto_the_stored_line(self):
+        added = [*stops_a()[:3], (4, 127.3895, LAT - 0.00003), *[(seq + 1, lon, lat) for seq, lon, lat in stops_a()[3:]]]
+        entries, remapped = shapes.remap_patterns(self.stored(), {"new": points(added)},
+                                                  remapped_at="2026-11-26T00:00:00+00:00")
+        self.assertEqual((remapped, list(entries)), (["new"], ["new"]), "예전 키는 남기지 않는다")
+        entry = entries["new"]
+        self.assertEqual((entry["status"], entry["stop_match"]["matched"], entry["remapped_from"]),
+                         ("available", 7, "old"))
+        self.assertEqual((entry["source"], entry["source_route_id"], entry["fetched_at"]),
+                         ("odsay", "31014", NOW.isoformat()), "제공처 조회 시각은 원래 값을 유지")
+        self.assertEqual(len(entry["geometry"]["coordinates"]), len(LINE_A) + 7,
+                         "예전 정류소 투영점은 빼고 다시 넣는다(꼭짓점이 쌓이지 않음)")
+        segment = shapes.segment_geometry(shapes.pattern_entry({"patterns": entries}, "new"), 2, 6)
+        self.assertEqual(segment["geometry_status"], "available")
+        self.assertIn([127.39, LAT], segment["geometry"]["coordinates"])
+
+    def test_changed_route_or_current_shape_is_left_alone(self):
+        entries, remapped = shapes.remap_patterns(self.stored(), {"new": points(stops_b())}, remapped_at="t")
+        self.assertEqual((entries, remapped), ({}, []), "다른 길로 바뀐 노선은 대응 기준을 넘지 못해 만들지 않는다")
+        stored = self.stored()
+        entries, remapped = shapes.remap_patterns(stored, {"old": points(stops_a())}, remapped_at="t")
+        self.assertEqual(remapped, [])
+        self.assertIs(entries["old"], stored["old"], "현재 패턴에 형상이 있으면 건드리지 않는다")
+        self.assertIsNone(shapes.source_line({"status": "error", "geometry": None}))
+
+    def test_remap_stored_saves_only_routes_that_lost_their_shape(self):
+        from app.workflows import route_shapes as flow
+
+        routes = [{"id": 1, "external_id": "DJB1", "route_no": "613", "provider": {"name": "odsay", "status": "matched"},
+                   "patterns": {"old": {"status": "available"}}},
+                  {"id": 2, "external_id": "DJB2", "route_no": "608", "provider": {"name": "odsay", "status": "matched"},
+                   "patterns": {"keep": {"status": "available"}}},
+                  {"id": 3, "external_id": "DJB3", "route_no": "2002", "provider": {"status": "not_found"},
+                   "patterns": {}}]
+        stop_rows = {1: {"new": stops_a()}, 2: {"keep": stops_a()}}
+        conn = mock.Mock()
+        conn.execute.return_value.fetchone.return_value = (True,)
+        db = mock.Mock(connect=mock.Mock(return_value=conn))
+        with mock.patch.object(flow.repository, "shape_collection_routes", return_value=routes), \
+                mock.patch.object(flow.repository, "pattern_stop_points", return_value=stop_rows) as stop_points, \
+                mock.patch.object(flow.repository, "route_shape_patterns", return_value=self.stored()), \
+                mock.patch.object(flow.repository, "save_shape_patterns") as save:
+            planned = flow.remap_stored(db, dry_run=True, clock=lambda: NOW)
+            save.assert_not_called()
+            done = flow.remap_stored(db, clock=lambda: NOW)
+        self.assertEqual(stop_points.call_args.args[1], [1, 2], "형상이 하나도 없는 노선은 대상이 아니다")
+        self.assertEqual([(r["route_no"], r["pattern_key"], r["from"]) for r in planned["remapped"]],
+                         [("613", "new", "old")])
+        self.assertEqual((done["routes_checked"], len(done["remapped"]), done["failed"]), (1, 1, []))
+        (_conn, route_id, provider, entries), _ = save.call_args
+        self.assertEqual((route_id, provider, list(entries)), (1, routes[0]["provider"], ["new"]))
+        conn.execute.return_value.fetchone.return_value = (False,)
+        self.assertEqual(flow.remap_stored(db, clock=lambda: NOW)["status"], "locked")
+
+
 class WorkerShapeHookTest(unittest.TestCase):
     def test_worker_refreshes_all_shapes_after_static_refresh(self):
         from app.workers.main import Worker
@@ -358,15 +420,20 @@ class WorkerShapeHookTest(unittest.TestCase):
                         shape_client_factory=lambda s: OdsayClient(FAKE_KEY, transport=httpx.MockTransport(
                             lambda request: httpx.Response(500))))
         report = mock.Mock(calls=[], shapes_saved=0, pending_shapes=0, pending_mapping=0, stopped=None)
+        remap = {"remapped": [{"route_no": "613"}], "failed": []}
         with mock.patch("app.workflows.route_shapes.collect", return_value=report) as collect, \
+                mock.patch("app.workflows.route_shapes.remap_stored", return_value=remap) as remap_stored, \
                 mock.patch("app.workers.main.asdict", return_value={}):
             result = worker.collect_route_shapes(settings, db=mock.sentinel.db)
-        self.assertEqual(result, {"status": "done"})
-        self.assertTrue(collect.call_args.kwargs["refresh_all"])
-        unset = Settings(_env_file=None, route_shape_provider="odsay", ODSAY_API_KEY=FAKE_KEY)
-        self.assertEqual(worker.collect_route_shapes(unset, db=mock.sentinel.db),
-                         {"status": "skipped", "reason": "daily_call_limit_unset"})
-        self.assertIsNone(worker.collect_route_shapes(Settings(_env_file=None), db=mock.sentinel.db))
+            self.assertEqual(result, {"status": "done"})
+            self.assertTrue(collect.call_args.kwargs["refresh_all"])
+            unset = Settings(_env_file=None, route_shape_provider="odsay", ODSAY_API_KEY=FAKE_KEY)
+            self.assertEqual(worker.collect_route_shapes(unset, db=mock.sentinel.db),
+                             {"status": "skipped", "reason": "daily_call_limit_unset", "remapped": 1,
+                              "remap_failed": 0}, "수집이 꺼져 있어도 저장된 형상의 재대응은 한다(외부 호출 없음)")
+            self.assertEqual(remap_stored.call_count, 2)
+            self.assertIsNone(worker.collect_route_shapes(Settings(_env_file=None), db=mock.sentinel.db))
+            self.assertEqual(remap_stored.call_count, 2, "제공처 미설정이면 재대응도 하지 않는다")
 
 
 class StaticResponseShapeTest(unittest.TestCase):

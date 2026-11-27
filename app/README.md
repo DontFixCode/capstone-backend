@@ -401,10 +401,39 @@ uv run python -m app.workers.main                                    # 워커: �
   `PUT /journeys/{id}/location`은 역순 위치를 무시한다.
 - WebSocket: 헤더 인증이 기본이며, 헤더를 보낼 수 없으면 연결 후 첫 메시지 `{"type":"auth","accessToken":"..."}`(제한 시간 내).
   종료 코드 4401(인증)·4403(탈퇴)·4404(없음/타인). 토큰을 URL에 넣지 않는다.
-- Phase 5: `missed_bus`는 현재 회차를 제외하고 최초 검색의 실행 가능한 대안을 공유 수집 자료로 다시 평가한다. 동일 모드·자료 시점에서
-  최소 개선량을 넘을 때만 `proposedRoute`를 만든다. `destination_changed`는 최신 위치로 일반 앱 경로 검색을 접수하고,
-  워커 결과가 준비되면 현재 남은 버스 구간과 일치하는 경로를 기준으로 다시 비교한다. 위치가 오래됐거나 현재 경로와 비교할 수 없으면
-  `guidanceStatus=current`, `guidance.status=data_limited`와 제한 사유를 반환한다. 탑승 중 목적지를 바꾸면 확인된 현재 탑승을 유지하고 하차 후 검색한다.
+- Phase 5 주기 재평가: 최초 검색의 실행 가능한 대안을 공유 수집 자료로 다시 평가하고, 동일 모드·자료 시점에서 최소 개선량을
+  넘을 때만 `proposedRoute`를 만든다. 제안은 수락(`route_accepted`)해야 선택 경로가 바뀐다.
+- 이동 중 재탐색(2026-11-27 수정). 버스 놓침·목적지 변경은 일반 앱 경로 검색을 새로 접수하고(선택 스냅샷 `reroute_*`),
+  워커가 검색을 끝내면 그 이동의 안내를 바로 다시 계산한다. 상태는 `guidance.reroute`(`kind`·`status`·`reason`·`origin`)로 보인다.
+  - `missed_bus`: 최근 위치(없으면 놓친 승차 정류소)에서 같은 목적지로 다시 검색한다. `nextBoarding`은 원래 경로의 다음 차량을
+    계속 안내하고, 새 검색의 후보가 그보다 **일찍 도착하면**(도착 예정 시각 비교, 최소 개선량 미적용) `proposedRoute`로 제안한다.
+    원래 경로와 같은 경로는 비교에서 빼고, 거절한 경로는 다시 제안하지 않는다. 원래 경로의 버스에 타면 재탐색을 끝낸다.
+    검색을 접수·실행하지 못하면 위의 주기 재평가 방식으로 비교한다.
+  - `destination_changed`(탑승 전): 최근 위치(없으면 `location_unavailable`로 위치를 기다림, 놓친 뒤 기다리는 중이면 그 정류소)
+    에서 새 목적지로 검색하고 가장 일찍 도착하는 후보를 제안한다. 기존 경로는 새 목적지로 가지 않으므로 비교하지 않으며, 수락 전까지
+    기존 경로의 `nextBoarding`·`arrival`은 내보내지 않는다(`guidance.status=data_limited`). 도착 예정을 구한 후보가 없으면 검색
+    순서상 첫 시작 가능 후보를 시간 미확인으로 제안한다.
+  - `destination_changed`(탑승 중): 타고 있는 구간과 `onboard` 하차 안내는 유지한다. 계획 하차 정류소에서 하차 예상 시각에
+    출발하는 경로를 미리 검색해 제안으로 보여 주고(`destination_reroute_preview_until_alight`, 수락은 409
+    `CANNOT_SWITCH_ONBOARD`), 하차를 확인하면 실제 하차 정류소·그 시각으로 다시 검색해 제안한다.
+  - 재탐색 후보의 도착 예정은 현재 수집 자료로 다시 평가한 값을 쓰고, 연결되는 조합을 구하지 못하면 검색이 저장한 평가를 쓴다
+    (첫 차량을 아직 탈 수 있고 놓친 차량이 없는 후보만. `alternatives[].reasonCodes`의 `arrival_from_*`로 구분).
+  - 수락하면 이미 탄 구간은 보존하고 남은 구간만 바꾼다. 기다리던 정류소와 다른 정류소에서 타는 경로면 이동 상태를 다시 걷는
+    상태로 바꿔 새 정류소까지의 도보를 안내에 넣는다.
+- 다음 승차 안내(`guidance.nextBoarding`, 2026-11-26 수정):
+  - 정류소에 닿는 시각(`readyAt`)은 걷기 시작한 시각(이동 시작 또는 직전 하차) + 도보 + 준비시간이고, 그 시각이 지났거나 버스를
+    놓친 뒤(`waiting`)면 지금이다. 그 시각 이후에 탈 수 있는 차량만 `vehicle`·`predictedArrivalAt`에 넣는다. `upcoming`은 정류소
+    응답 그대로이며 항목마다 `catchable`로 탈 수 있는지 구분한다.
+  - 예상 도착이 이미 지난 응답과 놓쳤다고 알린 차량은 뺀다. `missed_bus`에 `vehicleId`가 없으면 그때 안내하던 차량(없으면 선택 경로의
+    계획 차량)을 놓친 것으로 기록한다.
+  - 정류소 응답에 탈 수 있는 차량이 없으면(대전시 도착정보는 정류소·노선마다 다음 한 대만 준다) 선택 당시 계획 차량의 시각, 또는
+    마지막으로 지나간 차량 시각 + 노선 배차간격으로 채운다. 이때 `estimated: true`이고 `etaSource`(`headway_estimate` 등)·
+    `etaReasonCodes`로 근거를 구분한다(검증 전 예상, 화면에 "예상" 표시). 그래도 없으면 `predictedArrivalAt: null`과
+    `next_boarding_no_catchable_vehicle`이다.
+  - 워커는 재계산 직전에 다음 승차 정류소(탑승 중이면 하차 정류소) 도착정보를 새로 받는다
+    (`BACKEND_JOURNEY_REALTIME_REFRESH_SECONDS`, 기본 60초 이내 값은 재사용, 상태 변경 직후는 항상 새로). 공유 수집 600초만 쓰면
+    이미 지나간 차량이 안내에 남는다. 활성 이동 1건·재계산 1회에 대전시 도착정보 호출이 최대 1건 늘어난다. 사용자 입력·위치·
+    스트림 연결이 `BACKEND_JOURNEY_REALTIME_REFRESH_IDLE_SECONDS`(기본 1800초) 넘게 없는 이동은 이 주기 갱신을 멈춘다.
 
 ### 장소 검색 (카카오 로컬 API)
 
@@ -471,8 +500,8 @@ docker run --rm -v ${PWD}:/work -w /work ghcr.io/osgeo/gdal:ubuntu-small-3.10.3 
 
 ## 기록 관리·회원탈퇴 (Phase 6 선행 개발)
 
-Phase 5(이동 중 재평가·대안 추천) 없이 동작하는 범위만 구현했다. `proposedRoute`는 대안이 없으므로 항상 `null`이고, 대안 수락·거절
-이벤트는 계속 422다. 현장·배포 검증 절차는 [docs/phase6-manual-verification.md](../docs/phase6-manual-verification.md), 호출 예시는
+Phase 5(이동 중 재평가·대안 추천)보다 먼저 개발했고, 지금은 Phase 5와 함께 동작한다. `proposedRoute`와 대안 수락·거절 이벤트는
+위 Phase 5 설명을 따른다. 현장·배포 검증 절차는 [docs/phase6-manual-verification.md](../docs/phase6-manual-verification.md), 호출 예시는
 [docs/api-examples.md](../docs/api-examples.md) 7-4·7-6·10.
 
 | 위치 | 책임 |
@@ -498,3 +527,24 @@ Phase 5(이동 중 재평가·대안 추천) 없이 동작하는 범위만 구�
 ## 자동 탑승 추정 (Phase 7)
 
 `migrations/12_journey_presence.sql`은 추정에 필요한 짧은 GPS 표본을 저장한다. 표본은 이동 종료 시 지우고, 계속 이동하는 동안 새 위치를 받을 때 5분보다 오래된 표본을 정리한다. 탑승 후보는 `guidance.boardingEstimate`에 반환하며 자동으로 탑승 확정 상태를 바꾸지 않는다. 상세 계약과 프론트엔드가 결정할 하차·환승 알림 항목은 [docs/phase7-auto-boarding-contract.md](../docs/phase7-auto-boarding-contract.md)에 있다.
+
+## 예상 혼잡도 (Phase 8, 측정 부분)
+
+`migrations/13_congestion.sql`은 승하차 원본 누적 테이블 `ridership_counts`와 조회용 집계 테이블 `congestion_profiles`를 만든다.
+관리자가 대전교통빅데이터플랫폼에서 받은 원본 파일(HTML 표 형식 `.xls`)을 `python -m scripts.import_ridership`로 입력하면 구간별
+승객 흐름을 집계하고, 경로 후보의 버스 구간(`legs[].congestion`)과 정류소 도착 목록(`items[].congestion`)에 5단계 예상 혼잡을
+내보낸다. 값은 "평소 이 시간대 예상"이며 실시간이 아니다. 좌석 수·정원·집계 창은 `.env.api`의 `BACKEND_CONGESTION_*`로 정하고
+(기본값 없음), `BACKEND_CONGESTION_COST_WEIGHTS`가 있으면 버스 탑승시간 × (단계 가중치 − 1)을 추천 비용의 내시균형 bias로 더해
+순위에 반영한다(`candidates[].cost`). 앱이 안내 중인 다른 사용자의 탑승도 1대당 재차에 더한다(`guidedRiders`). 균형
+시뮬레이션은 오프라인 스크립트로 실행한다. 내려받는 절차, 계산식, 응답 형식, 설계 초안과 다른 점은
+[docs/phase8-congestion.md](../docs/phase8-congestion.md)에 있다.
+
+| 위치 | 책임 |
+| --- | --- |
+| `app/modules/congestion/source.py` | 플랫폼 원본 파일 해석·검증(글자만 읽고 합계 행으로 검산) |
+| `app/modules/congestion/aggregation.py` | 하차 보정·경유 순서 누적·요일유형별 평균과 p80·위치 관측 기반 통과 횟수(모자라면 배차간격) |
+| `app/modules/congestion/levels.py` | 조회 시점의 1대당 재차·5단계·대체 시간대·미확인 사유 |
+| `app/modules/congestion/service.py`, `repository.py` | 입력(중복 건너뜀)·노선별 집계 교체·검색과 도착 목록용 조회 |
+| `app/modules/congestion/equilibrium.py` | 균형 시뮬레이션 계산(로짓 선택·연속평균법, DB·HTTP 없음) |
+| `scripts/import_ridership.py` | 입력·집계·현황 CLI(기본은 미리 보기, `--execute`로 저장) |
+| `scripts/simulate_equilibrium.py` | 저장된 검색의 순위 후보로 균형 분포를 계산해 지금 분포와 비교(읽기 전용) |

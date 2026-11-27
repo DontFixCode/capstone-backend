@@ -45,6 +45,30 @@ def connection_slack_seconds(
     return (next_arrival_at - base_at).total_seconds() - walk_seconds - buffer_seconds
 
 
+def slack_grade(slack_seconds: float | None, thresholds_seconds: Sequence[float] | None) -> str | None:
+    """환승 여유시간 등급. 여유 m이 0 미만이면 missed, 0 이상 하한 미만 tight, 하한 이상 상한 미만 moderate, 상한 이상
+    comfortable이다. 여유를 계산하지 못했거나 경계(하한, 상한 초) 설정이 없으면 None이다. 경계값을 코드에 두지 않는다.
+    """
+    if slack_seconds is None or not thresholds_seconds:
+        return None
+    lower, upper = thresholds_seconds
+    if slack_seconds < 0:
+        return "missed"
+    if slack_seconds < lower:
+        return "tight"
+    if slack_seconds < upper:
+        return "moderate"
+    return "comfortable"
+
+
+def slack_estimated(slack_seconds: float | None, front_eta: VehicleEta | None,
+                    next_eta: VehicleEta | None) -> bool | None:
+    """여유시간에 제공처 예측이 아닌 ETA(앞차 기반 근사·배차간격 예상 등)가 들어갔는지. 여유를 계산하지 못했으면 None이다."""
+    if slack_seconds is None or front_eta is None or next_eta is None:
+        return None
+    return front_eta.eta_source != "provider" or next_eta.eta_source != "provider"
+
+
 def assess_connection(
     *,
     connection_index: int,

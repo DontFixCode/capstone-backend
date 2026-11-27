@@ -246,3 +246,49 @@ def build_pattern_shape(line: Sequence[Sequence[float]], stops: Sequence[StopPoi
                 "stop_vertex_index": {}, "stop_match": stats}
     return {**base, "status": "available", "geometry": {"type": "LineString", "coordinates": coordinates},
             "reason": None, "stop_vertex_index": index, "stop_match": stats}
+
+
+# ---------------------------------------------------------------- 정류소 순서가 바뀐 패턴의 재대응
+
+def source_line(entry: Any) -> list[list[float]] | None:
+    """저장된 패턴 형상에서 제공처가 준 선을 꺼낸다. 쓸 수 있는 형상이 아니면 None.
+
+    정류소 투영점으로 끼워 넣은 꼭짓점(stop_vertex_index)은 뺀다. 다시 대응시킬 때마다 꼭짓점이 쌓이지 않게 한다.
+    """
+    if not isinstance(entry, dict) or entry.get("status") != "available" or not _valid_geometry(entry.get("geometry")):
+        return None
+    inserted = {value for value in (entry.get("stop_vertex_index") or {}).values() if isinstance(value, int)}
+    line = [[point[0], point[1]] for position, point in enumerate(_flat(entry["geometry"]))
+            if position not in inserted]
+    return line if len(line) >= 2 else None
+
+
+def remap_patterns(stored: dict[str, Any], current: dict[str, Sequence[StopPoint]], *,
+                   remapped_at: str) -> tuple[dict[str, Any], list[str]]:
+    """현재 패턴 가운데 형상이 없는 것을 같은 노선의 저장된 선에 다시 대응시킨다. (현재 패턴의 형상 항목, 다시 대응시킨 키).
+
+    형상은 패턴 키(정류소 순서의 서명)별로 저장하므로, 정적 갱신으로 정류소가 하나만 늘거나 바뀌어도 키가 달라져 저장해 둔
+    형상을 찾지 못한다. 노선의 도로 형상은 그대로인 경우가 대부분이라, 예전 키에 남은 선에 현재 정류소를 같은 기준
+    (build_pattern_shape: 정류소별 거리 한도·대응 비율)으로 다시 투영한다. 기준을 넘지 못하면(노선 경로가 실제로 바뀜)
+    만들지 않고 미확보로 남긴다. 제공처 조회 시각(fetched_at)은 원래 값을 유지하고 remapped_from·remapped_at을 남긴다.
+    """
+    sources = sorted(((key, entry, line) for key, entry in stored.items() if (line := source_line(entry)) is not None),
+                     key=lambda item: (str(item[1].get("fetched_at") or ""), item[0]), reverse=True)
+    entries: dict[str, Any] = {}
+    remapped: list[str] = []
+    for key, stops in current.items():
+        existing = stored.get(key)
+        if isinstance(existing, dict) and existing.get("status") == "available":
+            entries[key] = existing
+            continue
+        for old_key, old, line in sources:
+            candidate = build_pattern_shape(line, stops, source=old.get("source"),
+                                            source_route_id=old.get("source_route_id"), fetched_at=old.get("fetched_at"))
+            if candidate["status"] == "available":
+                entries[key] = {**candidate, "remapped_from": old_key, "remapped_at": remapped_at}
+                remapped.append(key)
+                break
+        else:
+            if isinstance(existing, dict):
+                entries[key] = existing
+    return entries, remapped

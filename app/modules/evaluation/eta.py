@@ -386,6 +386,31 @@ def headway_legs(
     if reference is None:
         return []
     board_ref, alight_ref, collected_at, source_ref = reference
+    return headway_legs_after(
+        ride, board_ref=board_ref, alight_ref=alight_ref, collected_at=collected_at, source_ref=source_ref,
+        evaluated_at=evaluated_at, headway_seconds=headway_seconds, counts=range(1, HEADWAY_MAX_VEHICLES + 1),
+        first_rank=first_rank, horizon_end_at=horizon_end_at)
+
+
+def headway_legs_after(
+    ride: StaticRide,
+    *,
+    board_ref: datetime,
+    alight_ref: datetime | None,
+    collected_at: datetime,
+    source_ref: str | None,
+    evaluated_at: datetime,
+    headway_seconds: float,
+    counts: Iterable[int],
+    first_rank: int,
+    horizon_end_at: datetime,
+    extra_reasons: tuple[str, ...] = (),
+) -> list[TimedLeg]:
+    """기준 차량(승차 정류소 시각 board_ref, 하차 정류소 시각 alight_ref) 뒤 k번째 차량의 예상 옵션. k는 counts다.
+
+    k번째 예상 = 기준 차량 시각 + k × 배차간격. 평가 시각보다 이르거나 검색 범위를 넘는 예상은 만들지 않는다.
+    하차 기준 시각이 없거나 승차 기준 시각보다 늦지 않으면 하차 예상은 비운다.
+    """
     if alight_ref is not None and alight_ref <= board_ref:
         alight_ref = None
 
@@ -399,7 +424,7 @@ def headway_legs(
         )
 
     result: list[TimedLeg] = []
-    for count in range(1, HEADWAY_MAX_VEHICLES + 1):
+    for count in counts:
         shift = timedelta(seconds=headway_seconds * count)
         board_at = board_ref + shift
         if board_at < evaluated_at:
@@ -415,8 +440,10 @@ def headway_legs(
             board_position=ride.board_position, alight_stop_id=ride.alight_stop_id,
             alight_position=ride.alight_position, board_eta=board_eta, alight_eta=alight_eta,
             ride_seconds=None if alight_ref is None else (alight_ref - board_ref).total_seconds(),
-            reason_codes=((BOARD_ETA_BY_HEADWAY_ESTIMATE, HEADWAY_REFERENCE_ALIGHT_ABSENT) if alight_eta is None
-                          else (ALIGHT_ETA_BY_HEADWAY_ESTIMATE, BOARD_ETA_BY_HEADWAY_ESTIMATE)),
+            reason_codes=tuple(sorted({
+                *((BOARD_ETA_BY_HEADWAY_ESTIMATE, HEADWAY_REFERENCE_ALIGHT_ABSENT) if alight_eta is None
+                  else (ALIGHT_ETA_BY_HEADWAY_ESTIMATE, BOARD_ETA_BY_HEADWAY_ESTIMATE)),
+                *extra_reasons})),
         ))
     return result
 
