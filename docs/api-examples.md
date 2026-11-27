@@ -222,7 +222,8 @@ journeyId = 7-1 값. 헤더 칸 `Idempotency-Key`에 아래 키를, `stateVersio
 | ⑥ 도착 | `done-1` | `{"eventType": "completed", "stateVersion": 4, "payload": {}}` | 200, 이동 종료 |
 
 오류 확인: `stateVersion`을 틀리게 → 409 `STATE_VERSION_CONFLICT`, 탑승 중 다시 `board` → 409 `INVALID_TRANSITION`,
-`{"eventType": "missed_bus", "stateVersion": 1, "payload": {}}` → 422 `UNSUPPORTED_EVENT_TYPE`(Phase 5), 종료 뒤 `board` → 409 `JOURNEY_ENDED`.
+`{"eventType": "missed_bus", "stateVersion": 1, "payload": {}}` → 422 `INVALID_PAYLOAD`(`legIndex` 필수. Phase 5 이벤트
+`missed_bus`·`destination_changed`·`route_accepted`·`route_rejected`는 처리한다), 종료 뒤 `board` → 409 `JOURNEY_ENDED`.
 
 #### 환승 결과 (Phase 6) — 환승이 있는 경로로 시작한 이동
 

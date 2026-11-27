@@ -485,8 +485,8 @@ docker run --rm -v ${PWD}:/work -w /work ghcr.io/osgeo/gdal:ubuntu-small-3.10.3 
 
 ## 기록 관리·회원탈퇴 (Phase 6 선행 개발)
 
-Phase 5(이동 중 재평가·대안 추천) 없이 동작하는 범위만 구현했다. `proposedRoute`는 대안이 없으므로 항상 `null`이고, 대안 수락·거절
-이벤트는 계속 422다. 현장·배포 검증 절차는 [docs/phase6-manual-verification.md](../docs/phase6-manual-verification.md), 호출 예시는
+Phase 5(이동 중 재평가·대안 추천)보다 먼저 개발했고, 지금은 Phase 5와 함께 동작한다. `proposedRoute`와 대안 수락·거절 이벤트는
+위 Phase 5 설명을 따른다. 현장·배포 검증 절차는 [docs/phase6-manual-verification.md](../docs/phase6-manual-verification.md), 호출 예시는
 [docs/api-examples.md](../docs/api-examples.md) 7-4·7-6·10.
 
 | 위치 | 책임 |
